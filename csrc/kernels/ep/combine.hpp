@@ -75,8 +75,8 @@ static void* launch_combine(void* x,
                                 num_topk,
                                 num_qps, num_timeout_cycles);
     } else {
-        header_name = "hybrid_combine";
-        func_name = std::format("hybrid_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+        header_name = "hybrid_combine_unordered";
+        func_name = std::format("hybrid_unordered_combine_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                 use_expanded_layout, allow_multiple_reduction,
                                 num_sms,
                                 num_scaleup_warps, num_forward_warps,

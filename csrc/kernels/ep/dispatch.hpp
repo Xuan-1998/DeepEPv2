@@ -100,8 +100,8 @@ static void launch_dispatch(void* x, void* sf,
             num_experts, num_topk, expert_alignment,
             num_qps, num_timeout_cycles);
     } else {
-        header_name = "hybrid_dispatch";
-        func_name = std::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+        header_name = "hybrid_dispatch_unordered";
+        func_name = std::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
             do_cpu_sync,
             reuse_slot_indices,
             num_sms,

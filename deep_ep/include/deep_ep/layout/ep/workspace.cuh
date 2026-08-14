@@ -10,6 +10,7 @@ struct alignas(kNumRDMAAlignmentBytes) EPSignals {
     static constexpr int kNumMaxExperts = 2048;
     static constexpr int kNumMaxExpertsPerRank = 512;
     static constexpr int kNumMaxChannels = 1280;
+    static constexpr int kNumMaxParts = 64;
 
     BarrierSignals barrier_signals;
     int64_t notify_reduction[kNumMaxRanks + kNumMaxExperts];

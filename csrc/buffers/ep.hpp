@@ -6,6 +6,7 @@
 #include <vector>
 #include <pybind11/functional.h>
 
+#include <deep_ep/comm/gin_resource_alloc.cuh>
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/layout/ep/token.cuh>
 #include <deep_ep/layout/ep/workspace.cuh>
@@ -74,7 +75,9 @@ public:
             nccl_comm, symmetric::shared_comm_t{}, num_ranks, rank_idx,
             num_workspace_bytes, num_buffer_bytes + num_lb_buffer_bytes, 0, true,
             allow_hybrid_mode, sl_idx, num_allocated_qps,
-            0, num_cpu_timeout_secs, num_gpu_timeout_secs);
+            0, num_cpu_timeout_secs, num_gpu_timeout_secs,
+            /* enable_lsa_multimem */ false, /* main_context */ nullptr,
+            /* use_unordered_gin_layout */ allow_hybrid_mode);
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_barrier_signals(&workspace.barrier_signals);

@@ -82,7 +82,8 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
                  const std::optional<int>& sl_idx, const int& num_allocated_qps, const int& qp_depth,
                  const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
                  const bool& enable_lsa_multimem,
-                 const std::shared_ptr<Context>& main_context):
+                 const std::shared_ptr<Context>& main_context,
+                 const bool& use_unordered_gin_layout):
     rank_idx(rank_idx), num_ranks(num_ranks),
     gin_min_stride(1),
     num_allocated_qps(num_allocated_qps),
@@ -92,7 +93,8 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
     num_rdma_storage_bytes(num_rdma_storage_bytes),
     use_cpu_rdma_storage(use_cpu_rdma_storage) {
     EP_HOST_ASSERT(num_ranks > 0 and num_ranks <= kNumMaxRanks);
-    EP_HOST_ASSERT(num_allocated_qps > 0 and num_allocated_qps <= kNumMaxQPs);
+    // The unordered EP layout resolves `num_allocated_qps == 0` below
+    EP_HOST_ASSERT((num_allocated_qps > 0 or use_unordered_gin_layout) and num_allocated_qps <= kNumMaxQPs);
     EP_HOST_ASSERT(num_workspace_bytes > 0 and num_workspace_bytes % kNumAllocationAlignmentBytes == 0);
     EP_HOST_ASSERT(num_gpu_buffer_bytes >= 0 and num_gpu_buffer_bytes % kNumAllocationAlignmentBytes == 0);
     EP_HOST_ASSERT(num_rdma_storage_bytes >= 0 and num_rdma_storage_bytes % kNumAllocationAlignmentBytes == 0);
@@ -141,12 +143,67 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
 
         gin_min_stride = props.ginMinStride;
         reqs.ginType = gin_type;
-        reqs.ginContextCount = num_allocated_qps;
-        reqs.ginExclusiveContexts = true;
         reqs.ginQueueDepth = qp_depth > 0 ? qp_depth : kDefaultQPDepth;
 
-        // Customized RDMA barrier needs extra signals
-        reqs.ginSignalCount = num_ranks + 2 * 2;
+        if (use_unordered_gin_layout) {
+            // The unordered EP hybrid kernels share GIN contexts across SMs and synchronize
+            // through counting (indexed) signals only. One GIN context supplies one QP, and
+            // the context count sets the per-context indexed-signal budget that bounds the
+            // per-channel part count and the scale-out rank count.
+            const int num_rdma_ranks = ncclTeamRail(comm).nRanks;
+            EP_HOST_ASSERT(num_ranks == ncclTeamLsa(comm).nRanks * num_rdma_ranks);
+            const bool scaleout_active = num_rdma_ranks > 1;
+
+            const auto resolve_gin_context_cnt = [&]() -> int {
+                const int ctx = (this->num_allocated_qps == 0)
+                    ? gin_alloc::kDefaultGinContextCnt
+                    : this->num_allocated_qps;
+                EP_HOST_ASSERT(ctx >= gin_alloc::kMinGinContextCnt and
+                               ctx <= gin_alloc::kMaxGinContextCnt and
+                               "num_allocated_qps must be 0 (auto -> kDefaultGinContextCnt) or within "
+                               "[kMinGinContextCnt, kMaxGinContextCnt]: one GIN context supplies one QP");
+                return ctx;
+            };
+
+            if (scaleout_active) {
+                gin_config = gin_alloc::make_gin_resources(resolve_gin_context_cnt());
+            } else {
+                gin_config.gin_context_cnt = this->num_allocated_qps;
+                gin_config.gin_indexed_signals_cnt = 0;
+            }
+
+            EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rdma_ranks - 1) and
+                           "GIN indexed-signal budget cannot give each peer rail team a dedicated "
+                           "signal; reduce num_allocated_qps to raise the per-context signal count");
+
+            if (scaleout_active)
+                this->num_allocated_qps = gin_config.gin_context_cnt;
+
+            if (get_env<int>("EP_BUFFER_DEBUG"))
+                printf("GIN layout: gin_context_cnt=%d, gin_indexed_signals_cnt=%d, num_qp=%d\n",
+                       gin_config.gin_context_cnt,
+                       gin_config.gin_indexed_signals_cnt,
+                       this->num_allocated_qps);
+
+            reqs.ginExclusiveContexts = false;
+            if (scaleout_active) {
+                reqs.ginContextCount = gin_config.gin_context_cnt;
+                reqs.ginSignalCount = gin_config.gin_indexed_signals_cnt;
+            } else if (gin_config.gin_context_cnt > 0) {
+                reqs.ginContextCount = gin_config.gin_context_cnt;
+            }
+
+            // VA and strong signals are not required by the unordered kernels
+            reqs.ginVaSignalsRequired = false;
+            reqs.ginStrongSignalsRequired = false;
+        } else {
+            // The upstream GIN requirements, unchanged
+            reqs.ginContextCount = num_allocated_qps;
+            reqs.ginExclusiveContexts = true;
+
+            // Customized RDMA barrier needs extra signals
+            reqs.ginSignalCount = num_ranks + 2 * 2;
+        }
         if (allow_hybrid_mode and num_rdma_storage_bytes > 0) {
             reqs.ginCustomStride = gin_min_stride;
             reqs.ginConnectionType = NCCL_GIN_CONNECTION_CUSTOM_STRIDE;
