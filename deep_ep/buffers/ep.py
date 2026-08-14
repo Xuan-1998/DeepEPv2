@@ -349,9 +349,14 @@ class EPBuffer(BufferBase):
         check_nvlink_connections(group)
 
         # Automatic QP count
-        if num_allocated_qps == 0 and not self.allow_hybrid_mode:
-            # Hybrid mode resolves the QP count in C++ from the GIN signal budget.
-            num_allocated_qps = 17
+        if num_allocated_qps == 0 and (not self.allow_hybrid_mode or os.environ.get('EP_HYBRID_KERNEL', 'unordered') == 'ordered'):
+            # Hybrid mode will consume more QPs; the extra QP is for notify warps.
+            # The unordered hybrid kernels (`EP_HYBRID_KERNEL=unordered`) instead
+            # resolve the QP count in C++ from the GIN signal budget.
+            if self.allow_hybrid_mode:
+                num_allocated_qps = 65 if check_fast_rdma_atomic_support() else 129
+            else:
+                num_allocated_qps = 17
 
         # Create CPP handle
         super().__init__(explicitly_destroy)

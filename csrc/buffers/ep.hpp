@@ -16,6 +16,7 @@
 #include "base.hpp"
 #include "../comm/api.hpp"
 #include "../kernels/ep/api.hpp"
+#include "../kernels/ep/kernel_select.hpp"
 #include "../runtime/jit.hpp"
 #include "../utils/event.hpp"
 #include "../utils/tensor.hpp"
@@ -80,7 +81,7 @@ public:
             allow_hybrid_mode, sl_idx, num_allocated_qps,
             0, num_cpu_timeout_secs, num_gpu_timeout_secs,
             /* enable_lsa_multimem */ false, /* main_context */ nullptr,
-            /* use_unordered_gin_layout */ allow_hybrid_mode);
+            /* use_unordered_gin_layout */ allow_hybrid_mode and not use_ordered_hybrid_kernel());
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_barrier_signals(&workspace.barrier_signals);
@@ -203,13 +204,25 @@ public:
             return send_buffer_layout.get_num_bytes() + recv_buffer_layout.get_num_bytes();
         } else {
             // Hybrid dispatch
+            const auto scaleup_recv_buffer = layout::BufferLayout<false>(
+                token_layout, num_scaleup_ranks, num_scaleout_ranks * num_max_tokens_per_rank);
+            if (use_ordered_hybrid_kernel()) {
+                // The ordered kernel keeps upstream's send/recv shapes: a single token-indexed
+                // send buffer and header-less recv slots.
+                const auto scaleout_send_buffer = layout::BufferLayout<false>(
+                    token_layout, 1, num_max_tokens_per_rank);
+                const auto scaleout_recv_buffer = layout::BufferLayout<false>(
+                    token_layout, num_scaleout_ranks,
+                    /* kNumChannels * kNumMaxTokensPerChannel */ num_max_tokens_per_rank + kNumMaxChannels);
+                return scaleup_recv_buffer.get_num_bytes() +
+                       scaleout_send_buffer.get_num_bytes() +
+                       scaleout_recv_buffer.get_num_bytes();
+            }
             const auto scaleout_token_layout = layout::TokenLayout(
                 hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true,
                 nullptr, /*with_scaleout_hdr=*/true);
             const int scaleout_slots =
                 num_max_tokens_per_rank + kNumMaxChannels * comm::gin_alloc::kScaleoutSlotRoundingReserve;
-            const auto scaleup_recv_buffer = layout::BufferLayout<false>(
-                token_layout, num_scaleup_ranks, num_scaleout_ranks * num_max_tokens_per_rank);
             const auto scaleout_send_buffer = layout::BufferLayout<false>(
                 scaleout_token_layout, num_scaleout_ranks, scaleout_slots);
             const auto scaleout_recv_buffer = layout::BufferLayout<false>(
@@ -243,6 +256,19 @@ public:
             const int num_tokens_in_scaleup_layout = allow_multiple_reduction ? std::min(num_scaleup_ranks, num_topk) : num_topk;
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_scaleup_layout, num_scaleout_ranks * num_max_tokens_per_rank);
+            if (use_ordered_hybrid_kernel()) {
+                // The ordered kernel keeps upstream's token-indexed return layout.
+                const int num_tokens_in_scaleout_layout = allow_multiple_reduction ? std::min(num_scaleout_ranks, num_topk) : num_topk;
+                const auto scaleout_recv_buffer = layout::BufferLayout<false>(
+                    token_layout, num_tokens_in_scaleout_layout, num_max_tokens_per_rank);
+                const auto scaleout_send_buffer = layout::BufferLayout<false>(
+                    token_layout, allow_multiple_reduction ? 1 : num_topk,
+                    /* kNumChannels * num_scaleout_ranks * kNumMaxTokensPerChannel */
+                    num_scaleout_ranks * (num_max_tokens_per_rank + kNumMaxChannels));
+                return scaleup_recv_buffer.get_num_bytes() +
+                       scaleout_send_buffer.get_num_bytes() +
+                       scaleout_recv_buffer.get_num_bytes();
+            }
             const auto scaleout_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_scaleout_ranks,
                 (num_max_tokens_per_rank + kNumMaxChannels) * (allow_multiple_reduction ? 1 : num_topk));
@@ -457,6 +483,14 @@ public:
             num_channels_per_sm = std::min<int>(
                 num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
                 num_channels_per_sm);
+            if (use_ordered_hybrid_kernel()) {
+                // The ordered kernel carves one send + one forward TMA buffer per channel and has
+                // no per-channel signal budget, so keep the upstream channel decision.
+                num_channels_per_sm = std::min<int>(
+                    /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
+                if (not prefer_overlap_with_compute)
+                    num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            } else {
             const int dispatch_buffers_per_channel = prefer_overlap_with_compute
                 ? kNumDispatchSendBuffers + 1
                 : kNumDispatchBuffersPerChannel;
@@ -491,6 +525,7 @@ public:
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
                            "shared memory cannot host a single dispatch channel at this token size");
+            }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
