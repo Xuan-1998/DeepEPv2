@@ -512,6 +512,17 @@ __device__ __forceinline__ void fence_acquire_gpu() {
     asm volatile("fence.acquire.gpu;" ::: "memory");
 }
 
+// Adjust registers
+template <int kNumRegs>
+__device__ __forceinline__ void warpgroup_reg_alloc(){
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" : : "n"(kNumRegs));
+}
+
+template <int kNumRegs>
+__device__ __forceinline__ void warpgroup_reg_dealloc(){
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" : : "n"(kNumRegs));
+}
+
 __device__ __forceinline__ void fence_acq_rel_sys() {
     asm volatile("fence.acq_rel.sys;" ::: "memory");
 }
