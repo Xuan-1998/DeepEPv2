@@ -2,6 +2,7 @@
 #include <torch/python.h>
 
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/comm/gin_resource_alloc.cuh>
 
 #include "buffers/base.hpp"
 #include "buffers/bucket.hpp"
@@ -24,6 +25,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("get_num_allocation_alignment", []() { return deep_ep::kNumAllocationAlignmentBytes; });
     m.def("get_num_tma_alignment", []() { return deep_ep::kNumTMAAlignmentBytes; });
     m.def("get_num_rdma_alignment", []() { return deep_ep::kNumRDMAAlignmentBytes; });
+
+    m.attr("min_unordered_gin_qps") = py::int_(deep_ep::comm::gin_alloc::kMinGinContextCnt);
+    m.attr("max_unordered_gin_qps") = py::int_(deep_ep::comm::gin_alloc::kMaxGinContextCnt);
+    m.attr("default_unordered_gin_qps") = py::int_(deep_ep::comm::gin_alloc::kDefaultGinContextCnt);
 
     // JIT API
     deep_ep::register_apis(m);

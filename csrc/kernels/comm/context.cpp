@@ -155,13 +155,20 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
             const bool scaleout_active = num_rdma_ranks > 1;
 
             const auto resolve_gin_context_cnt = [&]() -> int {
-                const int ctx = (this->num_allocated_qps == 0)
+                const int requested = (this->num_allocated_qps == 0)
                     ? gin_alloc::kDefaultGinContextCnt
                     : this->num_allocated_qps;
-                EP_HOST_ASSERT(ctx >= gin_alloc::kMinGinContextCnt and
-                               ctx <= gin_alloc::kMaxGinContextCnt and
-                               "num_allocated_qps must be 0 (auto -> kDefaultGinContextCnt) or within "
-                               "[kMinGinContextCnt, kMaxGinContextCnt]: one GIN context supplies one QP");
+                int ctx = requested;
+                if (ctx < gin_alloc::kMinGinContextCnt)
+                    ctx = gin_alloc::kMinGinContextCnt;
+                if (ctx > gin_alloc::kMaxGinContextCnt)
+                    ctx = gin_alloc::kMaxGinContextCnt;
+                if (ctx != requested)
+                    printf("[WARN] DeepEP clamped num_allocated_qps from %d to %d: the unordered "
+                           "GIN layout supports [%d, %d] contexts (one GIN context supplies one QP)\n",
+                           requested, ctx,
+                           gin_alloc::kMinGinContextCnt,
+                           gin_alloc::kMaxGinContextCnt);
                 return ctx;
             };
 
