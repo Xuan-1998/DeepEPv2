@@ -168,7 +168,7 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
             if (scaleout_active) {
                 gin_config = gin_alloc::make_gin_resources(resolve_gin_context_cnt());
             } else {
-                gin_config.gin_context_cnt = this->num_allocated_qps;
+                gin_config.gin_context_cnt = resolve_gin_context_cnt();
                 gin_config.gin_indexed_signals_cnt = 0;
             }
 
@@ -176,8 +176,7 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
                            "GIN indexed-signal budget cannot give each peer rail team a dedicated "
                            "signal; reduce num_allocated_qps to raise the per-context signal count");
 
-            if (scaleout_active)
-                this->num_allocated_qps = gin_config.gin_context_cnt;
+            this->num_allocated_qps = gin_config.gin_context_cnt;
 
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("GIN layout: gin_context_cnt=%d, gin_indexed_signals_cnt=%d, num_qp=%d\n",
