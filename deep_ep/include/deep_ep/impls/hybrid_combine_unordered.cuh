@@ -343,7 +343,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     );
 
                     // Reduce into shared memory
-                    constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
+                    constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 8>();
                     combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumRanks)>(
                         lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
                         /* Get source base */ [=](const int& slot_idx) {
@@ -680,7 +680,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 // token has left the buffer.
                 EP_STATIC_ASSERT(kHiddenVec % kNumFwWarpsPerChannel == 0, "Invalid hidden split");
                 constexpr int kVecPerRole = kHiddenVec / kNumFwWarpsPerChannel;
-                constexpr int kUnrollFactor = get_max_unroll_factor<kVecPerRole, kAdjustRegisters ? 8 : 4>();
+                // Cooperative pairs run 25 warps (~80 regs/thread): unroll 7 would spill, and
+                // measurement shows the coop path is not load-latency-bound anyway. The
+                // non-coop instantiations (expanded layout) run 17 warps with headroom,
+                // where the higher cap buys real ILP.
+                constexpr int kUnrollFactor = get_max_unroll_factor<kVecPerRole, (kNumFwWarpsPerChannel > 1) ? (kAdjustRegisters ? 8 : 4) : 8>();
                 const int vec_off = fw_role * kVecPerRole;
                 combine_reduce<kVecPerRole, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumScaleoutRanks)>(
                     lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()) + vec_off,
