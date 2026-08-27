@@ -262,6 +262,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 }
                 token_idx = ptx::exchange(token_idx, dst_scaleup_rank_idx % 32);
 
+                // Non-expanded layout: every token is single-source (no_local_reduce
+                // is identically true) and its load address needs only `token_idx`,
+                // so issue the staging load immediately - the metadata dependency
+                // chain below (several L2 round-trips) then overlaps the TMA flight
+                // instead of preceding it.
+                if constexpr (not kUseExpandedLayout) {
+                    if (ptx::elect_one_sync()) {
+                        ptx::tma_store_wait_read();
+                        ptx::tma_load_1d(tma_buffer.get_base_ptr(),
+                                         math::advance_ptr(x, static_cast<int64_t>(token_idx) * kNumHiddenBytes),
+                                         mbarrier_ptr, kNumHiddenBytes);
+                    }
+                    __syncwarp();
+                }
+
                 // Get source metadata and decide the destination buffer
                 constexpr int kMetadataStride = 2 + kNumTopk;
                 const auto src_global_token_idx = __ldg(src_metadata + token_idx * kMetadataStride + 0);
@@ -302,17 +317,20 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if constexpr (kUseExpandedLayout)
                         token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
-                    // Directly load. Only the staging buffer must be reusable; the
-                    // previous token's visibility at the peer is enforced by the full
-                    // wait inside `update_tails` before its tail is released, so wait
-                    // for the read side only and let the NVLink store fly.
-                    if (ptx::elect_one_sync()) {
-                        const auto load_ptr =
-                            math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
-                        ptx::tma_store_wait_read();
-                        ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                    // Directly load (already issued at the loop top for the
+                    // non-expanded layout). Only the staging buffer must be reusable;
+                    // the previous token's visibility at the peer is enforced by the
+                    // full wait inside `update_tails` before its tail is released, so
+                    // wait for the read side only and let the NVLink store fly.
+                    if constexpr (kUseExpandedLayout) {
+                        if (ptx::elect_one_sync()) {
+                            const auto load_ptr =
+                                math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
+                            ptx::tma_store_wait_read();
+                            ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
+                        }
+                        __syncwarp();
                     }
-                    __syncwarp();
                 } else if constexpr (kAllowMultipleReduction) {
                     // Do local reduction
                     // Sort valid top-k indices to front
