@@ -302,11 +302,14 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if constexpr (kUseExpandedLayout)
                         token_idx_in_tensor = ptx::exchange(stored_topk_slot_idx, ptx::get_master_lane_idx(reduce_valid_mask));
 
-                    // Directly load
+                    // Directly load. Only the staging buffer must be reusable; the
+                    // previous token's visibility at the peer is enforced by the full
+                    // wait inside `update_tails` before its tail is released, so wait
+                    // for the read side only and let the NVLink store fly.
                     if (ptx::elect_one_sync()) {
                         const auto load_ptr =
                             math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
-                        ptx::tma_store_wait();
+                        ptx::tma_store_wait_read();
                         ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
                     }
                     __syncwarp();
@@ -330,7 +333,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                                 x, slot_idx * static_cast<int64_t>(kNumHiddenBytes));
                         },
                         /* Wait buffer release */ [=]() {
-                            ptx::tma_store_wait();
+                            // Read-side wait only: peer visibility is gated by
+                            // `update_tails` (see the direct-load comment)
+                            ptx::tma_store_wait_read();
                             __syncwarp();
                         }
                     );
