@@ -146,9 +146,15 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                 // NVLink-mapped peer memory measured ~56us each (pathological path);
                 // 32 lanes x int4 keeps ~30 independent NVLink reads in flight instead.
                 {
+#ifndef EP_SLIM_WIRE
+#define EP_SLIM_WIRE 0
+#endif
+                    const auto wire_token_layout = layout::TokenLayout(
+                        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true,
+                        nullptr, /*with_scaleout_hdr=*/true, /*with_ll=*/(EP_SLIM_WIRE) == 0);
                     const auto* src_v4 = reinterpret_cast<const int4*>(pull_src);
                     auto* dst_v4 = reinterpret_cast<int4*>(tma_buffer.get_base_ptr());
-                    const int num_v4 = tma_buffer.get_num_bytes<false>() / static_cast<int>(sizeof(int4));
+                    const int num_v4 = wire_token_layout.get_num_bytes<false>() / static_cast<int>(sizeof(int4));
                     for (int v = lane_idx; v < num_v4; v += 32)
                         dst_v4[v] = src_v4[v];
                     __syncwarp();

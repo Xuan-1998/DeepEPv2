@@ -650,7 +650,8 @@ public:
             }
             const auto scaleout_token_layout = layout::TokenLayout(
                 hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true,
-                nullptr, /*with_scaleout_hdr=*/true);
+                nullptr, /*with_scaleout_hdr=*/true,
+                /*with_ll=*/get_env<int>("EP_SLIM_WIRE", 0) == 0);
             const int scaleout_slots =
                 num_max_tokens_per_rank + kNumMaxChannels * elastic::gin_alloc::kScaleoutSlotRoundingReserve;
             const auto scaleout_send_buffer = layout::BufferLayout<false>(

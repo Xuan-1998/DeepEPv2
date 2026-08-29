@@ -95,6 +95,12 @@ __device__ __forceinline__ bool unpack_scaleout_header_prev(const int64_t& heade
 #define EP_FWD_CHUNK 0
 #endif
 
+// Drop the dead linked-list region from the wire (scale-out) token: -32B/token at topk 8.
+// Experimental — cached-expanded correctness still under debug when enabled.
+#ifndef EP_SLIM_WIRE
+#define EP_SLIM_WIRE 0
+#endif
+
 static constexpr int kNumSubPartsDefault = (EP_NUM_SUB_PARTS) > 1 ? (EP_NUM_SUB_PARTS) : 1;
 static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SUB_TOKENS) : 1;
 #ifdef EP_NUM_SUB_PARTS_LAST
@@ -308,7 +314,8 @@ hybrid_unordered_dispatch_impl(
 
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
     const auto scaleout_token_layout = layout::TokenLayout(
-        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true);
+        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr,
+        /*with_scaleout_hdr=*/true, /*with_ll=*/(EP_SLIM_WIRE) == 0);
     constexpr int kNumFwdBuffers = kDoubleBufferForward ? kNumDispatchFwdBuffers : 1;
 #ifdef EP_TAIL_HELPER
     // One extra TMA buffer per channel: the sender warp's tail-helper ping-pong second buffer.
@@ -1008,14 +1015,14 @@ hybrid_unordered_dispatch_impl(
                 auto send_ch = scaleout_send_buffer.get_rank_buffer(stored_dst_scaleout_rank_idx)
                                    .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
                 ptx::tma_store_1d(send_ch.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                                  tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                                  tma_buffer.get_base_ptr(), scaleout_token_layout.get_num_bytes<false>());
             }
             __syncwarp();
 
             // Local rank can be bypassed
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx == scaleout_rank_idx) {
                 ptx::tma_store_1d(scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                                  tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                                  tma_buffer.get_base_ptr(), scaleout_token_layout.get_num_bytes<false>());
             }
             ptx::tma_store_commit();
             ptx::tma_store_wait();
@@ -1107,9 +1114,9 @@ hybrid_unordered_dispatch_impl(
                                         .get_token_buffer(src_slot);
                 if (ptx::elect_one_sync()) {
                     ptx::tma_load_1d(hbufs[b].get_base_ptr(), src_tb.get_base_ptr(),
-                                     hbufs[b].get_mbarrier_ptr(), token_layout.get_num_bytes<false>());
+                                     hbufs[b].get_mbarrier_ptr(), scaleout_token_layout.get_num_bytes<false>());
                     ptx::mbarrier_arrive_and_set_tx(hbufs[b].get_mbarrier_ptr(),
-                                                    token_layout.get_num_bytes<false>());
+                                                    scaleout_token_layout.get_num_bytes<false>());
                 }
                 __syncwarp();
             };
@@ -1644,9 +1651,9 @@ hybrid_unordered_dispatch_impl(
                         const layout::TokenLayout tma_buffer = fwd_buf_at(0);
                         if (ptx::elect_one_sync()) {
                             ptx::tma_load_1d(tma_buffer.get_base_ptr(), recv_tb.get_base_ptr(),
-                                             tma_buffer.get_mbarrier_ptr(), token_layout.get_num_bytes<false>());
+                                             tma_buffer.get_mbarrier_ptr(), scaleout_token_layout.get_num_bytes<false>());
                             ptx::mbarrier_arrive_and_set_tx(tma_buffer.get_mbarrier_ptr(),
-                                                            token_layout.get_num_bytes<false>());
+                                                            scaleout_token_layout.get_num_bytes<false>());
                             ptx::mbarrier_wait_and_flip_phase(tma_buffer.get_mbarrier_ptr(), fwd_phase[0]);
                         }
                         __syncwarp();
@@ -1947,7 +1954,8 @@ hybrid_unordered_dispatch_impl(
 #ifdef EP_PROFILE_QUIET
     // One line per rank per iteration: SM 0 reduces every block's slots after the exit
     // grid+network barrier. Raw %globaltimer ns; the harness computes the segment ledger.
-    if (sm_idx == 0 and thread_idx == 0) {
+    if (sm_idx == 0 and thread_idx == 0 and (dispatch_iteration & 63) == 1) {
+        // 1-in-64 iterations: keeps the printf flush cost out of the steady-state timing
         unsigned long long q_entry = ~0ull, q_put0 = ~0ull;
         unsigned long long q_obs = 0, q_copy = 0, q_fwd = 0, q_snd = 0, q_bar1 = 0, q_tail = 0;
         unsigned long long q_arr[8];

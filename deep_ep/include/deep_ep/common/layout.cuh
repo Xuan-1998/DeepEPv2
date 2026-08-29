@@ -239,6 +239,7 @@ struct TokenLayout {
     bool with_metadata;
     // Per-token scale-out header present iff true. See kHdrBytes note below.
     bool with_scaleout_hdr;
+    bool with_ll;
     int num_topk, num_metadata_bytes;
     void* base;
 
@@ -247,21 +248,29 @@ struct TokenLayout {
     __forceinline__ __device__ __host__
     TokenLayout(const int& num_hidden_bytes, const int& num_sf_bytes,
                 const int& num_topk, const bool& with_metadata,
-                void* base = nullptr, const bool& with_scaleout_hdr = false) :
+                void* base = nullptr, const bool& with_scaleout_hdr = false,
+                const bool& with_ll = true) :
         num_hidden_bytes(num_hidden_bytes),
         num_sf_bytes(num_sf_bytes),
         with_metadata(with_metadata),
         with_scaleout_hdr(with_scaleout_hdr),
+        with_ll(with_ll),
         num_topk(num_topk),
-        num_metadata_bytes((with_scaleout_hdr ? math::align<int>(hdrless_content_bytes(num_topk, with_metadata), sizeof(int64_t)) + kHdrBytes
-                                              : hdrless_content_bytes(num_topk, with_metadata))),
+        num_metadata_bytes((with_scaleout_hdr ? math::align<int>(hdrless_content_bytes(num_topk, with_metadata, with_ll), sizeof(int64_t)) + kHdrBytes
+                                              : hdrless_content_bytes(num_topk, with_metadata, with_ll))),
         base(base) {
         EP_STATIC_ASSERT(sizeof(int) == sizeof(float), "Invalid size assumption");
         EP_UNIFIED_ASSERT(num_hidden_bytes % ptx::kNumTMAAlignBytes == 0);
     }
 
-    __forceinline__ __device__ __host__ static int hdrless_content_bytes(const int& num_topk, const bool& with_metadata) {
-        return num_topk * (sizeof(int) + sizeof(float)) + (with_metadata ? (1 + num_topk) * sizeof(int) : 0);
+    __forceinline__ __device__ __host__ static int hdrless_content_bytes(const int& num_topk, const bool& with_metadata,
+                                                                         const bool& with_ll = true) {
+        // Metadata = topk idx + topk weights + src token idx + (optionally) the linked-list
+        // patch region. The wire (scale-out) token drops the ll region: it is only ever
+        // WRITTEN at forward time into the scale-up token, so carrying it over RDMA is dead
+        // weight (32B/token at topk 8 — one full 32B alignment step).
+        return num_topk * (sizeof(int) + sizeof(float)) +
+               (with_metadata ? (1 + (with_ll ? num_topk : 0)) * static_cast<int>(sizeof(int)) : 0);
     }
 
     template <bool kWithMBarrier, typename dtype_t = int>
@@ -310,7 +319,7 @@ struct TokenLayout {
     }
 
     __forceinline__ __device__ __host__ int64_t* get_hdr_ptr() const {
-        const int hdr_offset = math::align<int>(hdrless_content_bytes(num_topk, with_metadata), sizeof(int64_t));
+        const int hdr_offset = math::align<int>(hdrless_content_bytes(num_topk, with_metadata, with_ll), sizeof(int64_t));
         return static_cast<int64_t*>(static_cast<void*>(
             math::advance_ptr<int8_t>(get_metadata_ptr(), hdr_offset)));
     }
@@ -379,7 +388,7 @@ struct BufferLayout {
         EP_UNIFIED_ASSERT(num_ranks == 1 or global);
         return TokenLayout(token_layout.num_hidden_bytes, token_layout.num_sf_bytes, token_layout.num_topk, token_layout.with_metadata,
                            static_cast<int8_t*>(base) + token_layout.get_num_bytes<kWithMBarrier, int64_t>() * token_idx,
-                           token_layout.with_scaleout_hdr);
+                           token_layout.with_scaleout_hdr, token_layout.with_ll);
     }
 };
 

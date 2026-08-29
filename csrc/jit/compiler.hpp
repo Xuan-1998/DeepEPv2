@@ -82,7 +82,7 @@ public:
                                  "EP_NUM_SUB_PARTS_FIRST", "EP_SUB_TOKENS_TARGET",
                                  "EP_SM100_MIN_SUB_TOKENS", "EP_LAST_SUB_TOKENS_TARGET",
                                  "EP_NUM_FWD_BUFFERS", "EP_CONSUME_CEILING", "EP_TAIL_HELPER",
-                                 "EP_PULL_FORWARD", "EP_WARM_PUT", "EP_FWD_CHUNK"}) {
+                                 "EP_PULL_FORWARD", "EP_WARM_PUT", "EP_FWD_CHUNK", "EP_SLIM_WIRE"}) {
             if (int value = get_env(name, 0); value != 0)
                 flags += fmt::format(" -D{}={}", name, value);
         }
