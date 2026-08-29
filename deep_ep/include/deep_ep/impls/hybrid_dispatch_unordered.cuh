@@ -101,6 +101,12 @@ __device__ __forceinline__ bool unpack_scaleout_header_prev(const int64_t& heade
 #define EP_SLIM_WIRE 0
 #endif
 
+// Store topk indices as i16 in the wire and scale-up tokens (lossless: experts <= 2048).
+// At topk 8 this crosses another 32B alignment step on both fabrics.
+#ifndef EP_COMPRESS_META
+#define EP_COMPRESS_META 0
+#endif
+
 static constexpr int kNumSubPartsDefault = (EP_NUM_SUB_PARTS) > 1 ? (EP_NUM_SUB_PARTS) : 1;
 static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SUB_TOKENS) : 1;
 #ifdef EP_NUM_SUB_PARTS_LAST
@@ -312,10 +318,11 @@ hybrid_unordered_dispatch_impl(
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
+    const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true,
+                                                  nullptr, false, true, (EP_COMPRESS_META) != 0);
     const auto scaleout_token_layout = layout::TokenLayout(
         kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr,
-        /*with_scaleout_hdr=*/true, /*with_ll=*/(EP_SLIM_WIRE) == 0);
+        /*with_scaleout_hdr=*/true, /*with_ll=*/(EP_SLIM_WIRE) == 0, (EP_COMPRESS_META) != 0);
     constexpr int kNumFwdBuffers = kDoubleBufferForward ? kNumDispatchFwdBuffers : 1;
 #ifdef EP_TAIL_HELPER
     // One extra TMA buffer per channel: the sender warp's tail-helper ping-pong second buffer.
@@ -893,7 +900,11 @@ hybrid_unordered_dispatch_impl(
                 const auto dst_expert_idx = static_cast<int>(uncasted_dst_expert_idx);
                 stored_dst_scaleout_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerScaleout : -1;
                 stored_dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
+#if (EP_COMPRESS_META) != 0
+                tma_buffer.get_topk_i16_ptr()[lane_idx] = static_cast<int16_t>(dst_expert_idx);
+#else
                 tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
+#endif
                 if (topk_weights != nullptr)
                     tma_buffer.get_topk_weights_ptr()[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
                 if (copied_topk_idx != nullptr)
@@ -1445,7 +1456,15 @@ hybrid_unordered_dispatch_impl(
                     int batch_topk = -1, batch_src = -1;
                     if (batch_tok < kPullBatch and batch_start + batch_tok < end_slot_idx) {
                         const auto tb = recv_buffer.get_token_buffer(batch_start + batch_tok);
+#if (EP_COMPRESS_META) != 0
+                        // i16 idx: lanes with batch_k < kNumTopk/2 each load one i32 word
+                        // (two i16); the per-k value is extracted after a shuffle below.
+                        if (batch_k < (kNumTopk + 1) / 2)
+                            batch_topk = ptx::ld_cg(
+                                reinterpret_cast<const int*>(tb.get_topk_i16_ptr()) + batch_k);
+#else
                         batch_topk = ptx::ld_cg(tb.get_topk_idx_ptr() + batch_k);
+#endif
                         if (batch_k == 0)
                             batch_src = ptx::ld_cg(tb.get_src_token_global_idx_ptr());
                     }
@@ -1458,8 +1477,16 @@ hybrid_unordered_dispatch_impl(
 
                     // Routing fields from the batch registers (convergent shuffles)
                     int stored_dst_scaleup_rank_idx = -1;
+#if (EP_COMPRESS_META) != 0
+                    // Word holding lane k's i16 sits at batch lane j*kNumTopk + k/2
+                    const int shuffled_word = __shfl_sync(0xffffffff, batch_topk,
+                                                          (j * kNumTopk + (lane_idx >> 1)) & 31);
+                    const int shuffled_topk = static_cast<int>(static_cast<int16_t>(
+                        (lane_idx & 1) ? (shuffled_word >> 16) : (shuffled_word & 0xffff)));
+#else
                     const int shuffled_topk = __shfl_sync(0xffffffff, batch_topk,
                                                           (j * kNumTopk + lane_idx) & 31);
+#endif
                     const int src_global_idx = __shfl_sync(0xffffffff, batch_src, j * kNumTopk);
                     auto dst_expert_idx = lane_idx < kNumTopk ? shuffled_topk : -1;
                     dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout;
@@ -1505,12 +1532,26 @@ hybrid_unordered_dispatch_impl(
                         reinterpret_cast<const int8_t*>(pull_recv_root_ptr));
                     if (stored_dst_slot_idx >= 0) {
                         const auto dst_tb = scaleup_buffer.get_token_buffer(stored_dst_slot_idx);
+                        auto* src_idx_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
+                            dst_tb.get_src_token_global_idx_ptr(), stored_dst_scaleup_rank_idx);
+#if (EP_COMPRESS_META) != 0
+                        // Compressed slot: ll region is 4B-aligned only (scalar stores);
+                        // the 16B-aligned topk-i16 region carries the source offset.
+                        auto* ll_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
+                            dst_tb.get_linked_list_idx_ptr(), stored_dst_scaleup_rank_idx);
+                        auto* off_dst = reinterpret_cast<int*>(gin.get_sym_ptr<ncclTeamTagLsa>(
+                            dst_tb.get_topk_i16_ptr(), stored_dst_scaleup_rank_idx));
+                        #pragma unroll
+                        for (int k = 0; k < kNumTopk; ++ k)
+                            ptx::st_relaxed_sys(ll_dst + k, ll_all[k]);
+                        ptx::st_relaxed_sys_v4(off_dst,
+                            make_int4(static_cast<int>(desc_off & 0xffffffffll),
+                                      static_cast<int>(desc_off >> 32), 0, 0));
+#else
                         auto* topk_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
                             dst_tb.get_topk_idx_ptr(), stored_dst_scaleup_rank_idx);
                         auto* w_dst = reinterpret_cast<int*>(gin.get_sym_ptr<ncclTeamTagLsa>(
                             dst_tb.get_topk_weights_ptr(), stored_dst_scaleup_rank_idx));
-                        auto* src_idx_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
-                            dst_tb.get_src_token_global_idx_ptr(), stored_dst_scaleup_rank_idx);
                         if constexpr (kNumTopk % 4 == 0) {
                             #pragma unroll
                             for (int k = 0; k < kNumTopk; k += 4)
@@ -1524,6 +1565,7 @@ hybrid_unordered_dispatch_impl(
                         ptx::st_relaxed_sys_v4(w_dst,
                             make_int4(static_cast<int>(desc_off & 0xffffffffll),
                                       static_cast<int>(desc_off >> 32), 0, 0));
+#endif
                         ptx::st_relaxed_sys(src_idx_dst, kPullMarkerBase | scaleup_rank_idx);
                     }
                     __syncwarp();
@@ -1749,7 +1791,12 @@ hybrid_unordered_dispatch_impl(
                 // Read top-k indices
                 EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
                 int stored_dst_scaleup_rank_idx = -1;
+#if (EP_COMPRESS_META) != 0
+                int dst_expert_idx = lane_idx < kNumTopk ?
+                    static_cast<int>(tma_buffer.get_topk_i16_ptr()[lane_idx]) : -1;
+#else
                 auto dst_expert_idx = lane_idx < kNumTopk ? tma_buffer.get_topk_idx_ptr()[lane_idx] : -1;
+#endif
                 dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout;
                 stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
                     dst_expert_idx / kNumExpertsPerRank : -1;

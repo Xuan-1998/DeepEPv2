@@ -19,6 +19,7 @@
 #include <deep_ep/common/gin_resource_alloc.cuh>
 
 #include "../../jit/compiler.hpp"
+#include "../../utils/system.hpp"
 #include "../../jit/launch_runtime.hpp"
 #include "kernel_select.hpp"
 
@@ -199,7 +200,8 @@ static int get_num_notify_smem_bytes(const int& num_ranks, const int& num_expert
 
 static layout::TokenLayout get_dispatch_token_layout(
     const int& hidden, const int& elem_size, const int& num_sf_packs, const int& num_topk) {
-    return layout::TokenLayout(hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
+    return layout::TokenLayout(hidden * elem_size, num_sf_packs * sizeof(sf_pack_t), num_topk, true,
+                               nullptr, false, true, get_env<int>("EP_COMPRESS_META", 0) != 0);
 }
 
 static void launch_dispatch(void* x, void* sf,

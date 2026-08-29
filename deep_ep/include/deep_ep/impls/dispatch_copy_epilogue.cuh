@@ -6,6 +6,13 @@
 #include <deep_ep/common/ptx.cuh>
 
 
+#ifndef EP_SLIM_WIRE
+#define EP_SLIM_WIRE 0
+#endif
+#ifndef EP_COMPRESS_META
+#define EP_COMPRESS_META 0
+#endif
+
 namespace deep_ep::elastic {
 
 template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
@@ -43,7 +50,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
 
     // Buffer layouts
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
-    const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
+    const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true,
+                                                  nullptr, false, true, (EP_COMPRESS_META) != 0);
     const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumWarps, 1, smem)
         .get_rank_buffer(warp_idx).get_token_buffer(0);
     const auto scaleup_buffer = layout::BufferLayout<false>(token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
@@ -133,10 +141,16 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             const int pull_marker = ptx::ld_cg(buffer_token.get_src_token_global_idx_ptr());
             if (pull_marker < 0) {
                 const int pull_src_rank = pull_marker & 0xff;
-                // Descriptor fields via direct L2 reads (44B, no smem bounce)
+                // Descriptor fields via direct L2 reads (no smem bounce)
+#if (EP_COMPRESS_META) != 0
+                const int ll_patch = lane_idx < kNumTopk ?
+                    ptx::ld_cg(buffer_token.get_linked_list_idx_ptr() + lane_idx) : -1;
+                const auto* w_desc = reinterpret_cast<const int*>(buffer_token.get_topk_i16_ptr());
+#else
                 const int ll_patch = lane_idx < kNumTopk ?
                     ptx::ld_cg(buffer_token.get_topk_idx_ptr() + lane_idx) : -1;
                 const auto* w_desc = reinterpret_cast<const int*>(buffer_token.get_topk_weights_ptr());
+#endif
                 const auto off_lo = static_cast<uint32_t>(ptx::ld_cg(w_desc));
                 const auto off_hi = ptx::ld_cg(w_desc + 1);
                 const auto pull_off = (static_cast<uint64_t>(static_cast<uint32_t>(off_hi)) << 32) |
@@ -146,12 +160,10 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                 // NVLink-mapped peer memory measured ~56us each (pathological path);
                 // 32 lanes x int4 keeps ~30 independent NVLink reads in flight instead.
                 {
-#ifndef EP_SLIM_WIRE
-#define EP_SLIM_WIRE 0
-#endif
                     const auto wire_token_layout = layout::TokenLayout(
                         kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true,
-                        nullptr, /*with_scaleout_hdr=*/true, /*with_ll=*/(EP_SLIM_WIRE) == 0);
+                        nullptr, /*with_scaleout_hdr=*/true, /*with_ll=*/(EP_SLIM_WIRE) == 0,
+                        (EP_COMPRESS_META) != 0);
                     const auto* src_v4 = reinterpret_cast<const int4*>(pull_src);
                     auto* dst_v4 = reinterpret_cast<int4*>(tma_buffer.get_base_ptr());
                     const int num_v4 = wire_token_layout.get_num_bytes<false>() / static_cast<int>(sizeof(int4));
@@ -165,11 +177,19 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             }
         }
         if (lane_idx < kNumTopk)
+#if (EP_COMPRESS_META) != 0
+            dst_expert_idx = static_cast<int>(tma_buffer.get_topk_i16_ptr()[lane_idx]);
+#else
             dst_expert_idx = tma_buffer.get_topk_idx_ptr()[lane_idx];
+#endif
         __syncwarp();
 #else
         if (lane_idx < kNumTopk)
+#if (EP_COMPRESS_META) != 0
+            dst_expert_idx = static_cast<int>(buffer_token.get_topk_i16_ptr()[lane_idx]);
+#else
             dst_expert_idx = buffer_token.get_topk_idx_ptr()[lane_idx];
+#endif
         __syncwarp();
 #endif
 

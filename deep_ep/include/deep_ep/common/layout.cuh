@@ -240,6 +240,11 @@ struct TokenLayout {
     // Per-token scale-out header present iff true. See kHdrBytes note below.
     bool with_scaleout_hdr;
     bool with_ll;
+    // Compressed metadata: topk idx stored as i16 (halves the idx region; weights stay
+    // f32 — lossless, and the 32B alignment step is identical to compressing both).
+    // Field order (prefix identical for wire and scale-up views):
+    //   [topk i16: 2*topk][weights f32: 4*topk][src idx: 4][ll: 4*topk (with_ll only)]
+    bool compressed;
     int num_topk, num_metadata_bytes;
     void* base;
 
@@ -249,27 +254,31 @@ struct TokenLayout {
     TokenLayout(const int& num_hidden_bytes, const int& num_sf_bytes,
                 const int& num_topk, const bool& with_metadata,
                 void* base = nullptr, const bool& with_scaleout_hdr = false,
-                const bool& with_ll = true) :
+                const bool& with_ll = true, const bool& compressed = false) :
         num_hidden_bytes(num_hidden_bytes),
         num_sf_bytes(num_sf_bytes),
         with_metadata(with_metadata),
         with_scaleout_hdr(with_scaleout_hdr),
         with_ll(with_ll),
+        compressed(compressed),
         num_topk(num_topk),
-        num_metadata_bytes((with_scaleout_hdr ? math::align<int>(hdrless_content_bytes(num_topk, with_metadata, with_ll), sizeof(int64_t)) + kHdrBytes
-                                              : hdrless_content_bytes(num_topk, with_metadata, with_ll))),
+        num_metadata_bytes((with_scaleout_hdr ? math::align<int>(hdrless_content_bytes(num_topk, with_metadata, with_ll, compressed), sizeof(int64_t)) + kHdrBytes
+                                              : hdrless_content_bytes(num_topk, with_metadata, with_ll, compressed))),
         base(base) {
         EP_STATIC_ASSERT(sizeof(int) == sizeof(float), "Invalid size assumption");
         EP_UNIFIED_ASSERT(num_hidden_bytes % ptx::kNumTMAAlignBytes == 0);
     }
 
     __forceinline__ __device__ __host__ static int hdrless_content_bytes(const int& num_topk, const bool& with_metadata,
-                                                                         const bool& with_ll = true) {
+                                                                         const bool& with_ll = true,
+                                                                         const bool& compressed = false) {
         // Metadata = topk idx + topk weights + src token idx + (optionally) the linked-list
         // patch region. The wire (scale-out) token drops the ll region: it is only ever
         // WRITTEN at forward time into the scale-up token, so carrying it over RDMA is dead
-        // weight (32B/token at topk 8 — one full 32B alignment step).
-        return num_topk * (sizeof(int) + sizeof(float)) +
+        // weight (32B/token at topk 8 — one full 32B alignment step). Compressed mode packs
+        // topk as i16 and weights as bf16 (another full alignment step at topk 8).
+        const int idx_bytes = compressed ? static_cast<int>(sizeof(int16_t)) : static_cast<int>(sizeof(int));
+        return num_topk * (idx_bytes + static_cast<int>(sizeof(float))) +
                (with_metadata ? (1 + (with_ll ? num_topk : 0)) * static_cast<int>(sizeof(int)) : 0);
     }
 
@@ -307,7 +316,13 @@ struct TokenLayout {
     }
 
     __forceinline__ __device__ __host__ float* get_topk_weights_ptr() const {
-        return math::advance_ptr<float>(get_topk_idx_ptr(), num_topk * sizeof(int));
+        return math::advance_ptr<float>(get_topk_idx_ptr(),
+                                        num_topk * (compressed ? sizeof(int16_t) : sizeof(int)));
+    }
+
+    // Compressed-mode accessor (valid iff `compressed`)
+    __forceinline__ __device__ __host__ int16_t* get_topk_i16_ptr() const {
+        return static_cast<int16_t*>(static_cast<void*>(get_metadata_ptr()));
     }
 
     __forceinline__ __device__ __host__ int* get_src_token_global_idx_ptr() const {
@@ -319,7 +334,7 @@ struct TokenLayout {
     }
 
     __forceinline__ __device__ __host__ int64_t* get_hdr_ptr() const {
-        const int hdr_offset = math::align<int>(hdrless_content_bytes(num_topk, with_metadata, with_ll), sizeof(int64_t));
+        const int hdr_offset = math::align<int>(hdrless_content_bytes(num_topk, with_metadata, with_ll, compressed), sizeof(int64_t));
         return static_cast<int64_t*>(static_cast<void*>(
             math::advance_ptr<int8_t>(get_metadata_ptr(), hdr_offset)));
     }
@@ -388,7 +403,7 @@ struct BufferLayout {
         EP_UNIFIED_ASSERT(num_ranks == 1 or global);
         return TokenLayout(token_layout.num_hidden_bytes, token_layout.num_sf_bytes, token_layout.num_topk, token_layout.with_metadata,
                            static_cast<int8_t*>(base) + token_layout.get_num_bytes<kWithMBarrier, int64_t>() * token_idx,
-                           token_layout.with_scaleout_hdr, token_layout.with_ll);
+                           token_layout.with_scaleout_hdr, token_layout.with_ll, token_layout.compressed);
     }
 };
 
