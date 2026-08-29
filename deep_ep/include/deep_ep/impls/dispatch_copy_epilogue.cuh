@@ -115,8 +115,9 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             if (pull_marker < 0) {
                 const int pull_src_rank = pull_marker & 0xff;
                 const int ll_patch = lane_idx < kNumTopk ? tma_buffer.get_topk_idx_ptr()[lane_idx] : -1;
-                const auto off_lo = static_cast<uint32_t>(tma_buffer.get_linked_list_idx_ptr()[0]);
-                const auto off_hi = tma_buffer.get_linked_list_idx_ptr()[1];
+                const auto* w_desc = reinterpret_cast<const int*>(tma_buffer.get_topk_weights_ptr());
+                const auto off_lo = static_cast<uint32_t>(w_desc[0]);
+                const auto off_hi = w_desc[1];
                 const auto pull_off = (static_cast<uint64_t>(static_cast<uint32_t>(off_hi)) << 32) |
                                       static_cast<uint64_t>(off_lo);
                 const auto pull_src = *pull_workspace_layout.get_pull_src_base_ptr(pull_src_rank) + pull_off;

@@ -510,4 +510,10 @@ __forceinline__ __device__ int ld_cg(const int* ptr) {
     return value;
 }
 
+// 16B sys-scope relaxed store (4 ints at once) — descriptor writes over NVLink.
+__forceinline__ __device__ void st_relaxed_sys_v4(void* ptr, const int4& value) {
+    asm volatile("st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};" ::
+                 "l"(ptr), "r"(value.x), "r"(value.y), "r"(value.z), "r"(value.w));
+}
+
 } // namespace deep_ep::elastic::ptx

@@ -88,6 +88,13 @@ __device__ __forceinline__ bool unpack_scaleout_header_prev(const int64_t& heade
 #define EP_SUB_TOKENS_TARGET 0
 #endif
 
+// Forward-warp chunk cap (slots taken per arbitration round). During the wire phase chunks
+// are arrival-paced and stay small regardless; a larger cap mostly amortizes the arbitration
+// poll over the drain, where every remaining slot is already claimable.
+#ifndef EP_FWD_CHUNK
+#define EP_FWD_CHUNK 0
+#endif
+
 static constexpr int kNumSubPartsDefault = (EP_NUM_SUB_PARTS) > 1 ? (EP_NUM_SUB_PARTS) : 1;
 static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SUB_TOKENS) : 1;
 #ifdef EP_NUM_SUB_PARTS_LAST
@@ -225,7 +232,7 @@ template <bool kDoCPUSync,
           int kNumSubPartsMax0 = (kNumSubParts > kNumSubPartsLast ? kNumSubParts : kNumSubPartsLast),
           int kNumSubPartsMax1 = (kNumSubPartsFirst > kNumSubPartsMid ? kNumSubPartsFirst : kNumSubPartsMid),
           int kNumSubPartsMax = (kNumSubPartsMax0 > kNumSubPartsMax1 ? kNumSubPartsMax0 : kNumSubPartsMax1),
-          int kNumSlotsPerForwardChunk = 48,
+          int kNumSlotsPerForwardChunk = ((EP_FWD_CHUNK) > 0 ? (EP_FWD_CHUNK) : 48),
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumScaleoutSendThreads = kNumScaleoutWarps * 32,
@@ -786,10 +793,20 @@ hybrid_unordered_dispatch_impl(
                 if (lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
                     auto send_ch = scaleout_send_buffer.get_rank_buffer(lane_idx)
                                        .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
+#if (EP_WARM_PUT) >= 2
+                    // Warm the counting-signal path too: SignalAdd of 0 is a no-op for the
+                    // receiver's landed-count compare but exercises the signal machinery.
+                    gin.put<ncclTeamTagRail>(
+                        scaleout_recv_buffer.get_token_buffer(kNumSlotsPerChannel - 1).get_base_ptr(),
+                        send_ch.get_token_buffer(kNumSlotsPerChannel - 1).get_base_ptr(),
+                        64, lane_idx, 0,
+                        ncclGin_SignalAdd{part_signal_id(0), 0ull});
+#else
                     gin.put<ncclTeamTagRail>(
                         scaleout_recv_buffer.get_token_buffer(kNumSlotsPerChannel - 1).get_base_ptr(),
                         send_ch.get_token_buffer(kNumSlotsPerChannel - 1).get_base_ptr(),
                         64, lane_idx, 0);
+#endif
                 }
                 __syncwarp();
             }
@@ -1200,8 +1217,14 @@ hybrid_unordered_dispatch_impl(
                     math::unpack2<int, int64_t>(signaled_tail, intended_finish, intended_tail);
                 }
                 const bool is_remote_src = src_valid and not is_local_src;
+                // A finished remote source's headers are final: its contribution to every
+                // part's visible-header count is a known constant (derived from its terminal
+                // position), so skip its ~kNumParts*kNumSubParts acquire-loads per poll and
+                // add the constant instead. `landed >= num_valid` keeps EXACTLY the original
+                // accounting: finished sources appear in both totals.
+                const bool lane_finished_src = is_remote_src and stored_finish_flag != 0;
                 int incremental_tail = stored_scaleout_tail_idx;
-                bool prefix_alive = is_remote_src;
+                bool prefix_alive = is_remote_src and not lane_finished_src;
                 bool my_finished = false;
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
@@ -1210,17 +1233,25 @@ hybrid_unordered_dispatch_impl(
                         - rx_part_base[k];
 
                     const int num_subs = num_subs_of(k);
+                    // Finished sources contribute a fixed number of visible sub-headers to
+                    // part k (all subs up to their terminal position) — no reads needed.
+                    int finished_subs_k = 0;
+                    if (lane_finished_src) {
+                        finished_subs_k = stored_terminal_part > k ? num_subs
+                                        : stored_terminal_part == k ? stored_terminal_sub + 1
+                                                                    : 0;
+                    }
                     int sub_count[kNumSubPartsMax];
                     bool sub_more[kNumSubPartsMax];
                     bool sub_valid[kNumSubPartsMax];
-                    int num_valid = 0;
+                    int num_valid = ptx::reduce_add(finished_subs_k);
                     #pragma unroll
                     for (int s = 0; s < kNumSubPartsMax; ++ s) {
                         sub_count[s] = 0;
                         sub_more[s] = false;
                         sub_valid[s] = false;
                         if (s < num_subs) {
-                            sub_valid[s] = is_remote_src and
+                            sub_valid[s] = is_remote_src and not lane_finished_src and
                                 unpack_scaleout_header(read_batch_header(lane_idx, k, s),
                                                        dispatch_iteration, sub_count[s], sub_more[s]);
 #ifdef EP_CONSUME_CEILING
@@ -1416,8 +1447,9 @@ hybrid_unordered_dispatch_impl(
                     }
                     __syncwarp();
 
-                    // Descriptor: [topk region] = ll patch, [ll words 0,1] = source byte offset
-                    // within the sender's recv-buffer root, [src idx] = marker | my scaleup rank
+                    // Descriptor: [topk region] = ll patch (16B-aligned v4 stores), [weights
+                    // words 0,1] = source byte offset within the sender's recv-buffer root,
+                    // [src idx] = marker | my scaleup rank (the epilogue's detection word)
                     const auto desc_off = static_cast<int64_t>(
                         reinterpret_cast<const int8_t*>(recv_tb.get_base_ptr()) -
                         reinterpret_cast<const int8_t*>(pull_recv_root_ptr));
@@ -1425,15 +1457,23 @@ hybrid_unordered_dispatch_impl(
                         const auto dst_tb = scaleup_buffer.get_token_buffer(stored_dst_slot_idx);
                         auto* topk_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
                             dst_tb.get_topk_idx_ptr(), stored_dst_scaleup_rank_idx);
+                        auto* w_dst = reinterpret_cast<int*>(gin.get_sym_ptr<ncclTeamTagLsa>(
+                            dst_tb.get_topk_weights_ptr(), stored_dst_scaleup_rank_idx));
                         auto* src_idx_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
                             dst_tb.get_src_token_global_idx_ptr(), stored_dst_scaleup_rank_idx);
-                        auto* ll_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
-                            dst_tb.get_linked_list_idx_ptr(), stored_dst_scaleup_rank_idx);
-                        #pragma unroll
-                        for (int k = 0; k < kNumTopk; ++ k)
-                            ptx::st_relaxed_sys(topk_dst + k, ll_all[k]);
-                        ptx::st_relaxed_sys(ll_dst + 0, static_cast<int>(desc_off & 0xffffffffll));
-                        ptx::st_relaxed_sys(ll_dst + 1, static_cast<int>(desc_off >> 32));
+                        if constexpr (kNumTopk % 4 == 0) {
+                            #pragma unroll
+                            for (int k = 0; k < kNumTopk; k += 4)
+                                ptx::st_relaxed_sys_v4(topk_dst + k,
+                                    make_int4(ll_all[k], ll_all[k + 1], ll_all[k + 2], ll_all[k + 3]));
+                        } else {
+                            #pragma unroll
+                            for (int k = 0; k < kNumTopk; ++ k)
+                                ptx::st_relaxed_sys(topk_dst + k, ll_all[k]);
+                        }
+                        ptx::st_relaxed_sys_v4(w_dst,
+                            make_int4(static_cast<int>(desc_off & 0xffffffffll),
+                                      static_cast<int>(desc_off >> 32), 0, 0));
                         ptx::st_relaxed_sys(src_idx_dst, kPullMarkerBase | scaleup_rank_idx);
                     }
                     __syncwarp();
