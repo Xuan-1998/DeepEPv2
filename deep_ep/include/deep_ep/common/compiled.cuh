@@ -96,10 +96,15 @@ constexpr int kGinQPDepth = 1024;
 constexpr int kGinQPFlushDepth = 768;
 
 // Per-channel shared-memory TMA buffer count for the hybrid dispatch kernel:
-// 1 for the scale-out send warp + 2 for the forward warp (double-buffered
-// loads). The host channel budget and the kernel pool must both use this.
+// 1 for the scale-out send warp + kNumDispatchFwdBuffers for the forward warp's
+// load/store ring. The host channel budget and the kernel pool must both use this;
+// the host side reads EP_NUM_FWD_BUFFERS at runtime and the JIT passes the same
+// value as a define, so both sides always agree.
+#ifndef EP_NUM_FWD_BUFFERS
+#define EP_NUM_FWD_BUFFERS 2
+#endif
 constexpr int kNumDispatchSendBuffers = 1;
-constexpr int kNumDispatchFwdBuffers = 2;
+constexpr int kNumDispatchFwdBuffers = (EP_NUM_FWD_BUFFERS) > 2 ? (EP_NUM_FWD_BUFFERS) : 2;
 constexpr int kNumDispatchBuffersPerChannel = kNumDispatchSendBuffers + kNumDispatchFwdBuffers;
 
 } // namespace deep_ep

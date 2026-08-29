@@ -494,4 +494,18 @@ __device__ __forceinline__ void accumulate(float2& a, nv_bfloat162 b) {
 
 #endif
 
+__forceinline__ __device__ unsigned long long globaltimer() {
+    unsigned long long value;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+    return value;
+}
+
+// L2-cached global load that bypasses L1. Coherent with RDMA/TMA writes (which land in L2)
+// unlike __ldg/ld.nc, and pipelines better than ld.volatile.
+__forceinline__ __device__ int ld_cg(const int* ptr) {
+    int value;
+    asm volatile("ld.global.cg.s32 %0, [%1];" : "=r"(value) : "l"(ptr));
+    return value;
+}
+
 } // namespace deep_ep::elastic::ptx

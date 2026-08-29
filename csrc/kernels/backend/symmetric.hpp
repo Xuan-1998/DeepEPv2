@@ -133,7 +133,11 @@ public:
 
     ~GPUSymmetricMemory() override {
         if (ptr != nullptr) {
-            NCCL_CHECK(ncclMemFree(ptr));
+            // Best-effort: never throw from a destructor — a failure here masks the primary
+            // exception (std::terminate during unwinding) and hides the real root cause.
+            if (const auto result = ncclMemFree(ptr); result != ncclSuccess)
+                fprintf(stderr, "DeepEP: ncclMemFree failed in ~GPUSymmetricMemory (ignored): %d\n",
+                        static_cast<int>(result));
             ptr = nullptr;
         }
     }

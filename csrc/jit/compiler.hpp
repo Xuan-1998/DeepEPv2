@@ -70,6 +70,19 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+
+        // Dispatch tail/head experiment knobs. Boolean toggles become bare defines; integer
+        // knobs override the in-header defaults. All participate in the kernel cache key via
+        // `flags`, so switching an env var cannot hit a stale cache entry.
+        for (const auto& name : {"EP_PROFILE_QUIET", "EP_WARM_PUT", "EP_TAIL_ADAPTIVE"}) {
+            if (get_env(name, 0))
+                flags += fmt::format(" -D{}=1", name);
+        }
+        for (const auto& name : {"EP_NUM_SUB_PARTS", "EP_MIN_SUB_TOKENS", "EP_NUM_SUB_PARTS_LAST",
+                                 "EP_NUM_FWD_BUFFERS", "EP_CONSUME_CEILING", "EP_TAIL_HELPER"}) {
+            if (int value = get_env(name, 0); value != 0)
+                flags += fmt::format(" -D{}={}", name, value);
+        }
     }
 
     virtual ~Compiler() = default;

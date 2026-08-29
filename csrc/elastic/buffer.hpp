@@ -915,16 +915,31 @@ public:
                 if (not prefer_overlap_with_compute)
                     num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
             } else {
+            const int fwd_buffers_rt = std::max(get_env<int>("EP_NUM_FWD_BUFFERS", 2), 2);
+            // Sender-warp tail helper: one extra TMA buffer per channel plus the per-channel
+            // job ring behind the pool (must mirror TailRing in hybrid_dispatch_unordered.cuh).
+            const bool tail_helper_rt = get_env<int>("EP_TAIL_HELPER", 0) != 0;
+            const int tail_ring_bytes = tail_helper_rt
+                ? (4 + 16 * (1 + 3 * num_topk)) * static_cast<int>(sizeof(int))
+                : 0;
             const int dispatch_buffers_per_channel = prefer_overlap_with_compute
                 ? kNumDispatchSendBuffers + 1
-                : kNumDispatchBuffersPerChannel;
+                : kNumDispatchSendBuffers + fwd_buffers_rt + (tail_helper_rt ? 1 : 0);
             num_channels_per_sm = std::min<int>(
                 num_channels_per_sm / dispatch_buffers_per_channel, kNumMaxChannelsPerSM);
-            // The dispatch kernel carves (send + forward) TMA buffers per channel out of dynamic
-            // shared memory; the budget above must cover the real pool or the launch fails at
-            // higher channel counts.
+            // The dispatch kernel carves (send + forward [+ helper]) TMA buffers per channel
+            // plus the tail-helper job rings out of dynamic shared memory; the budget above
+            // must cover the real pool or the launch fails at higher channel counts.
+            while (num_channels_per_sm > 1 and
+                   static_cast<int64_t>(dispatch_buffers_per_channel) * num_channels_per_sm *
+                           dispatch_token_layout.get_num_bytes<true>() +
+                       static_cast<int64_t>(tail_ring_bytes) * num_channels_per_sm + 16 +
+                       get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts) >
+                   num_smem_bytes)
+                num_channels_per_sm -= 1;
             EP_HOST_ASSERT(static_cast<int64_t>(dispatch_buffers_per_channel) * num_channels_per_sm *
                                    dispatch_token_layout.get_num_bytes<true>() +
+                               static_cast<int64_t>(tail_ring_bytes) * num_channels_per_sm + 16 +
                                get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts) <=
                            num_smem_bytes and
                            "dispatch TMA pool exceeds the shared-memory budget");
