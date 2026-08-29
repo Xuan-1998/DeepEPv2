@@ -98,6 +98,14 @@ struct WorkspaceLayout {
         // place of the dispatch kernel's exit scale-up barrier.
         num_bytes += kNumMaxRanks * sizeof(int);
 
+        // Epilogue completion counters (EP_FAST_ENTRY): slot j = how many dispatch-copy
+        // epilogues scale-up peer j has completed (monotonic). The barrier-free dispatch
+        // entry waits for all local peers' counts >= iteration-2 before its first put, so
+        // parity-half reuse can never overtake a still-running epilogue's pulls.
+        num_bytes += kNumMaxRanks * sizeof(int);
+        // Epilogue completion grid counter (one word, local)
+        num_bytes += 8;
+
         return num_bytes;
     }
 
@@ -211,6 +219,17 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_pull_src_base_ptr(0), kNumMaxRanks * sizeof(uint64_t));
         return base_ptr + scaleup_rank_idx;
+    }
+
+    // Epilogue completion counters + the grid-completion word (see get_num_bytes).
+    __forceinline__ __device__ __host__ int* get_epilogue_count_ptr(const int& scaleup_rank_idx) const {
+        const auto base_ptr = math::advance_ptr<int>(
+            get_dispatch_done_flag_ptr(0), kNumMaxRanks * sizeof(int));
+        return base_ptr + scaleup_rank_idx;
+    }
+    __forceinline__ __device__ __host__ unsigned* get_epilogue_grid_counter_ptr() const {
+        return math::advance_ptr<unsigned>(
+            get_epilogue_count_ptr(0), kNumMaxRanks * sizeof(int));
     }
 };
 

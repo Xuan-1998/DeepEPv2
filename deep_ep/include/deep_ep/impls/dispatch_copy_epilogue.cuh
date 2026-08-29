@@ -73,8 +73,12 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     {
         const auto async_ws = layout::WorkspaceLayout(
             workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+        // Learn the target epoch from this rank's OWN flag (set by its own dispatch, which
+        // strictly precedes this epilogue in stream order), then wait for every peer.
+        const int async_target = ptx::ld_acquire_sys<int>(
+            async_ws.get_dispatch_done_flag_ptr(scaleup_rank_idx));
         if (thread_idx < kNumScaleupRanks) {
-            while (ptx::ld_acquire_sys<int>(async_ws.get_dispatch_done_flag_ptr(thread_idx)) == 0) {}
+            while (ptx::ld_acquire_sys<int>(async_ws.get_dispatch_done_flag_ptr(thread_idx)) < async_target) {}
         }
         __syncthreads();
     }

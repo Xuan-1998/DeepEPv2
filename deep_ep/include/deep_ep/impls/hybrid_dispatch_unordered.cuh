@@ -450,16 +450,6 @@ hybrid_unordered_dispatch_impl(
     __syncwarp();
 #endif
 
-#ifdef EP_ASYNC_EXIT
-    // Async exit: the kernel will skip the exit scale-up barrier and hand data-readiness to
-    // the epilogue via per-peer done flags. Zero MY OWN flags before the entry barrier: a
-    // peer can only set them after its forwarding completes, which needs this rank's puts,
-    // which come after this rank passes the entry barrier — so pre-barrier zeroing is safe.
-    if (sm_idx == 0 and warp_idx == 0 and lane_idx < kNumScaleupRanks)
-        *workspace_layout.get_dispatch_done_flag_ptr(lane_idx) = 0;
-    __syncwarp();
-#endif
-
 #ifdef EP_PROFILE_QUIET
     EP_STATIC_ASSERT(kNumSMs <= 128, "q_blk has 128 per-block slots");
     EP_STATIC_ASSERT(kNumScaleoutRanks <= 8, "arrival-timeline slots hold 8 sources");
@@ -472,9 +462,24 @@ hybrid_unordered_dispatch_impl(
     __syncthreads();
 #endif
 
+#ifdef EP_FAST_ENTRY
+    // Barrier-free entry. Requires EP_DOUBLE_BUFFER (host) + EP_ASYNC_EXIT. Safety argument:
+    // - RDMA data: iteration N's puts land in parity[N] recv slots; parity[N] was last
+    //   consumed at N-2, and rank skew is bounded below 2 iterations because a peer's N+1
+    //   dispatch starts only after its N epilogue, which polls THIS rank's N done flag.
+    // - Signals: counting with shadow accounting — `landed = arrived_total - consumed_total`
+    //   is exact regardless of when a peer's next-iteration signals arrive.
+    // - Headers: tagged with the dispatch iteration; stale parity contents are rejected.
+    // - NVLink scale-up: peer's N forward-writes need this rank's N puts, which happen
+    //   after this point; the last reader of parity[N] scale-up slots finished at N-2.
+    // The block-local sync below replaces the barrier's ordering of per-block init
+    // (q_blk reset, tail-ring ctrl zero, done-flag zero) against all warps.
+    __syncthreads();
+#else
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+#endif
 
     // Init TMA for scale-out and forward warps
     ptx::arrival_phase phase = 0;
@@ -733,6 +738,15 @@ hybrid_unordered_dispatch_impl(
 #endif
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
+
+#ifdef EP_PREWARM_FLUSH
+        // Cold-put mitigation: flush on an IDLE QP posts nothing and rings nothing — it just
+        // reads the QP/counter state, pulling the SQ bookkeeping cache lines the first real
+        // put will need. (A dummy warm PUT measured worse: it occupies the QP right when the
+        // first real put wants it.)
+        gin.flush();
+        __syncwarp();
+#endif
 
         // Channel metadata maintenance
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid number of scale-out ranks");
@@ -1917,9 +1931,12 @@ hybrid_unordered_dispatch_impl(
     (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
     ptx::fence_acq_rel_sys();
     if (sm_idx == 0 and thread_idx < kNumScaleupRanks) {
+        // Monotonic epoch: write the iteration number. No zeroing anywhere, so a fast
+        // peer's flag for iteration N can never be lost to a late-launching rank's reset
+        // (the race that a zero+set scheme has once the entry barrier is gone).
         const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
             workspace_layout.get_dispatch_done_flag_ptr(scaleup_rank_idx), thread_idx);
-        ptx::st_release_sys(dst_ptr, 1);
+        ptx::st_release_sys(dst_ptr, dispatch_iteration);
     }
 #else
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
