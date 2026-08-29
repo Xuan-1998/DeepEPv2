@@ -71,6 +71,13 @@ public:
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
 
+        // Boolean kernel toggles become bare defines; they participate in the kernel cache
+        // key via `flags`, so switching an env var cannot hit a stale cache entry.
+        for (const auto& name : {"EP_FAST_ENTRY"}) {
+            if (get_env(name, 0))
+                flags += fmt::format(" -D{}=1", name);
+        }
+
         // Sub-put shape knobs. Integer knobs override the in-header defaults and participate
         // in the kernel cache key via `flags`, so switching an env var cannot hit a stale
         // cache entry.

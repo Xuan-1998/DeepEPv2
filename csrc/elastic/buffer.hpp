@@ -36,6 +36,11 @@ class ElasticBuffer {
     int64_t num_gpu_buffer_bytes;
     int64_t num_cpu_buffer_bytes;
     void* buffer;
+    bool double_buffer = false;
+    int64_t buffer_parity_bytes = 0;
+    // Maps a dispatch handle (keyed by its token-map pointer) to the buffer parity the
+    // dispatch used, so the paired combine works in the same parity half.
+    mutable std::unordered_map<const void*, int> handle_parity;
 
     // Destructor settings
     bool explicitly_destroy;
@@ -119,17 +124,25 @@ public:
         const auto num_workspace_bytes = math::align<int64_t>(
             layout::WorkspaceLayout::get_num_bytes(), symmetric::kNumAlignmentBytes);
 
+        // EP_DOUBLE_BUFFER: allocate the hybrid buffer twice and alternate parities per
+        // dispatch so iteration N's RDMA writes can never collide with N-1's consumption.
+        // Required by the kernel-side EP_FAST_ENTRY (barrier-free dispatch entry).
+        double_buffer = get_env<int>("EP_DOUBLE_BUFFER", 0) != 0;
+        buffer_parity_bytes = num_buffer_bytes;
+        const auto num_alloc_buffer_bytes = num_buffer_bytes * (double_buffer ? 2 : 1);
+
         // Create NCCL symmetric memory context
         // Symmetric memory layout: [[[Workspace] GPU buffer] CPU buffer]
         // sym.num_bytes = workspace + buffer, sym.num_cpu_bytes = CPU buffer
-        const auto num_sym_bytes = num_workspace_bytes + num_buffer_bytes;
+        const auto num_sym_bytes = num_workspace_bytes + num_alloc_buffer_bytes;
         this->nccl_context = std::make_shared<nccl::NCCLSymmetricMemoryContext>(
             nccl_comm, cpu_comm, num_ranks, rank_idx,
             num_sym_bytes, num_cpu_buffer_bytes,
             allow_hybrid_mode, sl_idx, num_allocated_qps);
 
         // Verify the symmetric memory layout matches our expectations
-        EP_HOST_ASSERT(num_workspace_bytes + num_gpu_buffer_bytes == nccl_context->num_gpu_bytes);
+        EP_HOST_ASSERT(num_workspace_bytes + num_gpu_buffer_bytes +
+                           (double_buffer ? num_buffer_bytes : 0) == nccl_context->num_gpu_bytes);
         EP_HOST_ASSERT(num_cpu_buffer_bytes == nccl_context->num_cpu_bytes);
 
         // Timeout
@@ -142,6 +155,8 @@ public:
         workspace_layout_wo_expert = std::make_shared<layout::WorkspaceLayout>(
             workspace, nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks, 0);
         buffer = static_cast<uint8_t*>(workspace) + num_workspace_bytes;
+        if (double_buffer)
+            CUDA_RUNTIME_CHECK(cudaMemset(buffer, 0, num_alloc_buffer_bytes));
         CUDA_RUNTIME_CHECK(cudaMemset(workspace, 0, num_workspace_bytes));
 
         // Allocate host workspaces
@@ -1085,6 +1100,13 @@ public:
 
         ++ dispatch_iteration;
 
+        // Buffer parity for this dispatch (EP_DOUBLE_BUFFER); the paired epilogue and
+        // combine must use the same half.
+        const int iter_parity = double_buffer ? (dispatch_iteration & 1) : 0;
+        void* const iter_buffer = static_cast<uint8_t*>(buffer) + iter_parity * buffer_parity_bytes;
+        if (token_map_at_dispatch_ptr != nullptr)
+            handle_parity[token_map_at_dispatch_ptr] = iter_parity;
+
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -1102,7 +1124,7 @@ public:
                         num_sf_packs, sf_token_stride, sf_hidden_stride,
                         num_experts, num_topk, expert_alignment,
                         nccl_context->dev_comm, nccl_context->window,
-                        buffer,
+                        iter_buffer,
                         workspace, mapped_host_workspace,
                         nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
                         nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
@@ -1239,7 +1261,7 @@ public:
 
         // Launch copy kernels with full SMs
         stream_control_before_epilogue(previous_event_before_epilogue);
-        launch_dispatch_copy_epilogue(buffer, workspace,
+        launch_dispatch_copy_epilogue(iter_buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
                                       recv_x.data_ptr(), recv_sf_ptr,
@@ -1409,6 +1431,13 @@ public:
 
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
+                // Use the same buffer parity as the paired dispatch (EP_DOUBLE_BUFFER)
+        const int combine_parity = double_buffer
+            ? (token_map_at_dispatch_ptr != nullptr and handle_parity.count(token_map_at_dispatch_ptr)
+                   ? handle_parity.at(token_map_at_dispatch_ptr)
+                   : (dispatch_iteration & 1))
+            : 0;
+        void* const combine_buffer = static_cast<uint8_t*>(buffer) + combine_parity * buffer_parity_bytes;
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
@@ -1418,7 +1447,7 @@ public:
             channel_linked_list_ptr,
             token_map_at_dispatch_ptr,
             nccl_context->dev_comm, nccl_context->window,
-            buffer, workspace,
+            combine_buffer, workspace,
             num_reduced_tokens, num_combined_tokens,
             num_max_tokens_per_rank,
             hidden, num_experts, num_topk,

@@ -338,9 +338,23 @@ hybrid_unordered_dispatch_impl(
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
+#ifdef EP_FAST_ENTRY
+    // Barrier-free entry. Requires EP_DOUBLE_BUFFER (host). Safety argument:
+    // - RDMA data: iteration N's puts land in parity[N] recv slots; parity[N] was last
+    //   consumed at N-2, and rank skew at entry is bounded below 2 iterations because the
+    //   previous iteration's exit scale-up barrier (retained on this branch) already
+    //   synchronized all ranks at N-1's end.
+    // - Signals: counting with shadow accounting — `landed = arrived_total - consumed_total`
+    //   is exact regardless of when a peer's next-iteration signals arrive.
+    // - Headers: tagged with the dispatch iteration; stale parity contents are rejected.
+    // The block-local sync below replaces the barrier's ordering of per-block init
+    // against all warps.
+    __syncthreads();
+#else
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+#endif
 
     // Init TMA for scale-out and forward warps
     ptx::arrival_phase phase = 0;
@@ -588,6 +602,15 @@ hybrid_unordered_dispatch_impl(
         };
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
+
+#ifdef EP_PREWARM_FLUSH
+        // Cold-put mitigation: flush on an IDLE QP posts nothing and rings nothing — it just
+        // reads the QP/counter state, pulling the SQ bookkeeping cache lines the first real
+        // put will need. (A dummy warm PUT measured worse: it occupies the QP right when the
+        // first real put wants it.)
+        gin.flush();
+        __syncwarp();
+#endif
 
         // Channel metadata maintenance
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid number of scale-out ranks");
