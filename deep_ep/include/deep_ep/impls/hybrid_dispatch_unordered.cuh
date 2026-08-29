@@ -423,6 +423,23 @@ hybrid_unordered_dispatch_impl(
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
+#ifdef EP_PULL_FORWARD
+    // Pull-based forwarding: the forward warp writes 44B descriptors instead of copying
+    // 7+KB payloads; the copy epilogue (with ~30x the warps) pulls payloads over NVLink
+    // straight from the source rank's recv buffer. The epilogue cannot translate peer
+    // addresses itself, so publish this rank's mapped VA of every scale-up peer's recv
+    // buffer base into the (local) workspace. Descriptor visibility for the epilogue is
+    // ordered by the exit grid+network barrier + stream order.
+    static constexpr int kPullMarkerBase = static_cast<int>(0x80000000u | 0x40000000u);
+    const auto pull_recv_root_ptr = scaleout_recv_buffer.get_rank_buffer(0)
+        .get_channel_buffer<kNumSlotsPerChannel>(0).get_token_buffer(0).get_base_ptr();
+    if (sm_idx == 0 and warp_idx == 0 and lane_idx < kNumScaleupRanks) {
+        const auto peer_va = gin.get_sym_ptr<ncclTeamTagLsa>(pull_recv_root_ptr, lane_idx);
+        *workspace_layout.get_pull_src_base_ptr(lane_idx) = reinterpret_cast<uint64_t>(peer_va);
+    }
+    __syncwarp();
+#endif
+
 #ifdef EP_PROFILE_QUIET
     EP_STATIC_ASSERT(kNumSMs <= 128, "q_blk has 128 per-block slots");
     if (thread_idx == 0) {
@@ -1317,6 +1334,146 @@ hybrid_unordered_dispatch_impl(
                 }
                 __syncwarp();
             };
+
+#ifdef EP_PULL_FORWARD
+            // Pull mode: do the order-sensitive bookkeeping and write a 44B descriptor into
+            // the destination slot's int-field region; the copy epilogue pulls the payload
+            // from the source recv buffer over NVLink. EP_PULL_FORWARD=1: every token (turns
+            // the epilogue latency-bound — measured 5x epilogue cost; keep for experiments).
+            // EP_PULL_FORWARD=2: only when ALL sources finished (pure drain window).
+            // EP_PULL_FORWARD>=3: per-source — as soon as THIS chunk's source has finished,
+            // its remaining slots become descriptors (local-source chunks flip early, and
+            // their pulls are cheap local-HBM reads). Precedence over EP_TAIL_HELPER.
+            const bool src_finished = __shfl_sync(0xffffffff,
+                stored_finish_flag, recv_scaleout_rank_idx % 32) != 0;
+            const bool pull_now = (EP_PULL_FORWARD) < 2 or
+                ((EP_PULL_FORWARD) >= 3 ? src_finished
+                                        : __all_sync(0xffffffff, stored_finish_flag != 0));
+            if (pull_now) {
+                // Batched routing reads: 32 lanes fetch topk for 4 tokens at once (8 topk
+                // lanes each), amortizing the L2 read latency that dominates the
+                // descriptor-only drain. Bookkeeping stays strictly per-token in order.
+                EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
+                constexpr int kPullBatch = kNumTopk > 0 ? (32 / kNumTopk > 4 ? 4 : 32 / kNumTopk) : 1;
+                for (int batch_start = start_slot_idx; batch_start < end_slot_idx;
+                     batch_start += kPullBatch) {
+                    // Coalesced batch read: lane l reads token (batch_start + l/kNumTopk),
+                    // k = l % kNumTopk
+                    const int batch_tok = lane_idx / kNumTopk;
+                    const int batch_k = lane_idx % kNumTopk;
+                    int batch_topk = -1, batch_src = -1;
+                    if (batch_tok < kPullBatch and batch_start + batch_tok < end_slot_idx) {
+                        const auto tb = recv_buffer.get_token_buffer(batch_start + batch_tok);
+                        batch_topk = ptx::ld_cg(tb.get_topk_idx_ptr() + batch_k);
+                        if (batch_k == 0)
+                            batch_src = ptx::ld_cg(tb.get_src_token_global_idx_ptr());
+                    }
+                    __syncwarp();
+
+                for (int slot_idx = batch_start;
+                     slot_idx < end_slot_idx and slot_idx < batch_start + kPullBatch; ++ slot_idx) {
+                    const auto recv_tb = recv_buffer.get_token_buffer(slot_idx);
+                    const int j = slot_idx - batch_start;
+
+                    // Routing fields from the batch registers (convergent shuffles)
+                    int stored_dst_scaleup_rank_idx = -1;
+                    const int shuffled_topk = __shfl_sync(0xffffffff, batch_topk,
+                                                          (j * kNumTopk + lane_idx) & 31);
+                    const int src_global_idx = __shfl_sync(0xffffffff, batch_src, j * kNumTopk);
+                    auto dst_expert_idx = lane_idx < kNumTopk ? shuffled_topk : -1;
+                    dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout;
+                    stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
+                        dst_expert_idx / kNumExpertsPerRank : -1;
+
+                    // Linked-list bookkeeping (identical to the push path)
+                    int linked_list_idx = -1;
+                    #pragma unroll
+                    for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                        const auto src_lane_idx = stored_dst_scaleup_rank_idx - j * 32;
+                        const bool valid = 0 <= src_lane_idx and src_lane_idx < 32;
+                        const auto exchanged = ptx::exchange(
+                            stored_scaleup_send_counters[j], valid ? src_lane_idx : 0);
+                        linked_list_idx = valid ? exchanged : linked_list_idx;
+                    }
+                    const int ll_patch_val = (not kReuseSlotIndices and lane_idx < kNumTopk)
+                        ? transform_linked_list_idx(linked_list_idx) : -1;
+                    // All lanes gather every k's patch value (shuffles must stay convergent)
+                    int ll_all[kNumTopk];
+                    #pragma unroll
+                    for (int k = 0; k < kNumTopk; ++ k)
+                        ll_all[k] = __shfl_sync(0xffffffff, ll_patch_val, k);
+
+                    // Deduplicate for scale-up ranks (identical)
+                    int stored_dst_slot_idx = -1;
+                    const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
+                        recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
+                    if constexpr (kReuseSlotIndices) {
+                        if (lane_idx < kNumTopk)
+                            stored_dst_slot_idx = __ldg(dst_slot_idx_ptr + lane_idx);
+                    } else {
+                        if (ptx::deduplicate(stored_dst_scaleup_rank_idx, lane_idx) and stored_dst_scaleup_rank_idx >= 0)
+                            stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_scaleup_rank_idx, 1);
+                    }
+                    __syncwarp();
+
+                    // Descriptor: [topk region] = ll patch, [ll words 0,1] = source byte offset
+                    // within the sender's recv-buffer root, [src idx] = marker | my scaleup rank
+                    const auto desc_off = static_cast<int64_t>(
+                        reinterpret_cast<const int8_t*>(recv_tb.get_base_ptr()) -
+                        reinterpret_cast<const int8_t*>(pull_recv_root_ptr));
+                    if (stored_dst_slot_idx >= 0) {
+                        const auto dst_tb = scaleup_buffer.get_token_buffer(stored_dst_slot_idx);
+                        auto* topk_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
+                            dst_tb.get_topk_idx_ptr(), stored_dst_scaleup_rank_idx);
+                        auto* src_idx_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
+                            dst_tb.get_src_token_global_idx_ptr(), stored_dst_scaleup_rank_idx);
+                        auto* ll_dst = gin.get_sym_ptr<ncclTeamTagLsa>(
+                            dst_tb.get_linked_list_idx_ptr(), stored_dst_scaleup_rank_idx);
+                        #pragma unroll
+                        for (int k = 0; k < kNumTopk; ++ k)
+                            ptx::st_relaxed_sys(topk_dst + k, ll_all[k]);
+                        ptx::st_relaxed_sys(ll_dst + 0, static_cast<int>(desc_off & 0xffffffffll));
+                        ptx::st_relaxed_sys(ll_dst + 1, static_cast<int>(desc_off >> 32));
+                        ptx::st_relaxed_sys(src_idx_dst, kPullMarkerBase | scaleup_rank_idx);
+                    }
+                    __syncwarp();
+
+                    // Per-scale-up counters (identical)
+                    using pull_mask_t = std::conditional_t<kNumScaleupRanks <= 32, unsigned, unsigned long long>;
+                    const auto scaleup_send_mask = ptx::reduce_or(
+                        stored_dst_scaleup_rank_idx >= 0 ?
+                        (pull_mask_t(1) << stored_dst_scaleup_rank_idx) : pull_mask_t(0));
+                    #pragma unroll
+                    for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
+                        stored_scaleup_send_counters[j] += (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
+
+                    // Metadata (identical; src idx from the batch read)
+                    if constexpr (not kReuseSlotIndices) {
+                        const auto metadata_ptr = token_metadata_at_forward +
+                            num_tokens_processed * kNumForwardMetadataDims;
+                        if (ptx::elect_one_sync()) {
+                            metadata_ptr[0] = src_global_idx;
+                            metadata_ptr[1] = slot_idx == (end_slot_idx - 1);
+                        }
+                        if (lane_idx < kNumTopk) {
+                            metadata_ptr[2 + lane_idx] = stored_dst_scaleup_rank_idx;
+                            metadata_ptr[2 + kNumTopk + lane_idx] = stored_dst_slot_idx;
+                            dst_slot_idx_ptr[lane_idx] = stored_dst_slot_idx;
+                        }
+                    }
+                    num_tokens_processed += 1;
+#ifdef EP_PROFILE_QUIET
+                    // In pull mode this slot counts descriptors written (not post-arrival
+                    // tokens) — the number the epilogue will have to pull.
+                    if (ptx::elect_one_sync())
+                        atomicAdd(&q_blk[sm_idx][7], 1ull);
+#endif
+                    __syncwarp();
+                }
+                }
+                continue;   // next arbitration round
+            }
+#endif
 
 #ifdef EP_TAIL_HELPER
             // Once the channel's sender warp has finished its sends it flips `ready`; from the

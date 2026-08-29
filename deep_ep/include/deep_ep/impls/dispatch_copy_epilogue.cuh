@@ -48,6 +48,14 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         .get_rank_buffer(warp_idx).get_token_buffer(0);
     const auto scaleup_buffer = layout::BufferLayout<false>(token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
 
+#ifdef EP_PULL_FORWARD
+    // Pull-based forwarding: slots may hold a 44B descriptor instead of a payload
+    // (src idx word < 0). The dispatch kernel published every scale-up peer's recv-buffer
+    // base VA in the local workspace; pull the payload from there over NVLink.
+    const auto pull_workspace_layout = layout::WorkspaceLayout(
+        workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+#endif
+
     // Init TMA
     ptx::arrival_phase phase = 0;
     const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
@@ -96,9 +104,43 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         // Load target expert indices separately to tolerate TMA load latency
         EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
         int dst_expert_idx = -1;
+#ifdef EP_PULL_FORWARD
+        // Pull mode: the slot may be a descriptor — resolve it (second TMA from the source
+        // rank's recv buffer) before any field is used, so all reads below come from smem.
+        if (ptx::elect_one_sync())
+            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+        __syncwarp();
+        {
+            const int pull_marker = *tma_buffer.get_src_token_global_idx_ptr();
+            if (pull_marker < 0) {
+                const int pull_src_rank = pull_marker & 0xff;
+                const int ll_patch = lane_idx < kNumTopk ? tma_buffer.get_topk_idx_ptr()[lane_idx] : -1;
+                const auto off_lo = static_cast<uint32_t>(tma_buffer.get_linked_list_idx_ptr()[0]);
+                const auto off_hi = tma_buffer.get_linked_list_idx_ptr()[1];
+                const auto pull_off = (static_cast<uint64_t>(static_cast<uint32_t>(off_hi)) << 32) |
+                                      static_cast<uint64_t>(off_lo);
+                const auto pull_src = *pull_workspace_layout.get_pull_src_base_ptr(pull_src_rank) + pull_off;
+                if (ptx::elect_one_sync()) {
+                    ptx::tma_load_1d(tma_buffer.get_base_ptr(),
+                                     reinterpret_cast<const void*>(pull_src),
+                                     mbarrier_ptr, tma_buffer.get_num_bytes<false>());
+                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, tma_buffer.get_num_bytes<false>());
+                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                }
+                __syncwarp();
+                if (not kCachedMode and lane_idx < kNumTopk)
+                    tma_buffer.get_linked_list_idx_ptr()[lane_idx] = ll_patch;
+                __syncwarp();
+            }
+        }
+        if (lane_idx < kNumTopk)
+            dst_expert_idx = tma_buffer.get_topk_idx_ptr()[lane_idx];
+        __syncwarp();
+#else
         if (lane_idx < kNumTopk)
             dst_expert_idx = buffer_token.get_topk_idx_ptr()[lane_idx];
         __syncwarp();
+#endif
 
         // Validate target expert indices and store for non-expand mode
         const auto in_range = expert_start_idx <= dst_expert_idx and dst_expert_idx < expert_end_idx;
@@ -123,9 +165,11 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         __syncwarp();
 
         // Wait for TMA arrival
+#ifndef EP_PULL_FORWARD
         if (ptx::elect_one_sync())
             ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
         __syncwarp();
+#endif
 
         // Maintain linked list
         if constexpr (kDoCreateLinkedList) {

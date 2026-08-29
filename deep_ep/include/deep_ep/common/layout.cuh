@@ -88,6 +88,11 @@ struct WorkspaceLayout {
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
+        // Pull-forward source-base VA table (EP_PULL_FORWARD): NVLink-mapped VAs of every
+        // scale-up peer's scale-out recv buffer, written by the dispatch kernel and read by
+        // the copy epilogue (which has no NCCL handle to translate addresses itself).
+        num_bytes += kNumMaxRanks * sizeof(uint64_t);
+
         return num_bytes;
     }
 
@@ -185,6 +190,14 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    // Pull-forward source-base VA table (see get_num_bytes). Entry j = this rank's mapped VA
+    // of scale-up peer j's scale-out recv-buffer base.
+    __forceinline__ __device__ __host__ uint64_t* get_pull_src_base_ptr(const int& scaleup_rank_idx) const {
+        const auto base_ptr = math::advance_ptr<uint64_t>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int));
+        return base_ptr + scaleup_rank_idx;
     }
 };
 
