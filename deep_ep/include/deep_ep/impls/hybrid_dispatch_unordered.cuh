@@ -62,18 +62,49 @@ __device__ __forceinline__ bool unpack_scaleout_header_prev(const int64_t& heade
 #define EP_MIN_SUB_TOKENS 1
 #endif
 
-// Sub-part count for the LAST part only (tail granularity). Defaults to the uniform
-// EP_NUM_SUB_PARTS. Raising it splits the final part into more puts that share the part's
-// existing counting-signal id, so the receiver's last flush points get finer without any
-// extra signal/QP budget (same soundness argument as uniform sub-part sharing: the gate
-// only compares landed count vs visible headers).
-#ifndef EP_NUM_SUB_PARTS_LAST
-#define EP_NUM_SUB_PARTS_LAST (EP_NUM_SUB_PARTS)
+// Sub-part count for the LAST part only (tail granularity). Default is shape-derived:
+// the p5en sweep put the optimum at ~7-11 tokens per sub-put (target 8) on the last part (2n: 43 tokens
+// -> 6 subs, 1505 -> 1484 us; 4n: 86 -> 8-12 subs, 4041 -> ~3960 us), so the default splits
+// the last part to that target, clamped to [uniform NS, part size]. On SM100 the 15-token
+// arch floor self-clamps the effective count (validated neutral on p6-b200). Sub-puts share
+// the part's existing counting-signal id, so the split is free w.r.t. the signal/QP budget
+// (same soundness argument as uniform sub-part sharing: the gate only compares landed count
+// vs visible headers). Set EP_NUM_SUB_PARTS_LAST explicitly to override.
+#ifndef EP_LAST_SUB_TOKENS_TARGET
+#define EP_LAST_SUB_TOKENS_TARGET 8
+#endif
+
+// Sub-part count for the FIRST part only (head granularity — NCCLOFI-1948 Experiment 1:
+// issue the first put on ~4 tokens instead of the whole first part). Same shared-signal
+// mechanism as the last-part split.
+#ifndef EP_NUM_SUB_PARTS_FIRST
+#define EP_NUM_SUB_PARTS_FIRST (EP_NUM_SUB_PARTS)
+#endif
+
+// Shape-derived split: when > 0, every part p is split into ceil(part_size(p) / TARGET)
+// sub-puts (clamped by the per-arch minimum sub size), overriding the three counts above.
+// The p5en sweep found ~7-11 tokens per sub-put optimal; SM100's 15-token floor self-clamps.
+#ifndef EP_SUB_TOKENS_TARGET
+#define EP_SUB_TOKENS_TARGET 0
 #endif
 
 static constexpr int kNumSubPartsDefault = (EP_NUM_SUB_PARTS) > 1 ? (EP_NUM_SUB_PARTS) : 1;
 static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SUB_TOKENS) : 1;
+#ifdef EP_NUM_SUB_PARTS_LAST
 static constexpr int kNumSubPartsLastDefault = (EP_NUM_SUB_PARTS_LAST) > 1 ? (EP_NUM_SUB_PARTS_LAST) : 1;
+static constexpr bool kDeriveNumSubPartsLast = false;
+#else
+static constexpr int kNumSubPartsLastDefault = kNumSubPartsDefault;
+static constexpr bool kDeriveNumSubPartsLast = true;
+#endif
+static constexpr int kLastSubTokensTarget = (EP_LAST_SUB_TOKENS_TARGET) > 1 ? (EP_LAST_SUB_TOKENS_TARGET) : 1;
+static constexpr int kNumSubPartsFirstDefault = (EP_NUM_SUB_PARTS_FIRST) > 1 ? (EP_NUM_SUB_PARTS_FIRST) : 1;
+static constexpr int kSubTokensTarget = (EP_SUB_TOKENS_TARGET) > 0 ? (EP_SUB_TOKENS_TARGET) : 0;
+
+// Split factor for `part_tokens` under the shape-derived target (0 = disabled).
+__device__ __host__ __forceinline__ constexpr int target_sub_parts(const int& part_tokens) {
+    return kSubTokensTarget > 0 ? (part_tokens + kSubTokensTarget - 1) / kSubTokensTarget : 1;
+}
 
 #ifndef EP_SM100_MIN_SUB_TOKENS
 #define EP_SM100_MIN_SUB_TOKENS 15
@@ -177,8 +208,23 @@ template <bool kDoCPUSync,
           int kPartSize = math::constexpr_ceil_div(kNumMaxTokensPerChannel, kNumParts),
           int kBatchSize = kPartSize,
           int kNumSubParts = kNumSubPartsDefault < kBatchSize ? kNumSubPartsDefault : kBatchSize,
-          int kNumSubPartsLast = kNumSubPartsLastDefault < kBatchSize ? kNumSubPartsLastDefault : kBatchSize,
-          int kNumSubPartsMax = (kNumSubParts > kNumSubPartsLast ? kNumSubParts : kNumSubPartsLast),
+          int kFirstPartSize = (part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0)),
+          int kMidPartSize = (part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(kNumParts >= 3 ? 1 : 0)),
+          int kNumSubPartsLastRaw = (kSubTokensTarget > 0
+              ? target_sub_parts(kBatchSize)
+              : (kDeriveNumSubPartsLast
+                     ? ((kBatchSize + kLastSubTokensTarget - 1) / kLastSubTokensTarget > kNumSubParts
+                            ? (kBatchSize + kLastSubTokensTarget - 1) / kLastSubTokensTarget
+                            : kNumSubParts)
+                     : kNumSubPartsLastDefault)),
+          int kNumSubPartsLast = (kNumSubPartsLastRaw < kBatchSize ? kNumSubPartsLastRaw : kBatchSize),
+          int kNumSubPartsFirstRaw = (kSubTokensTarget > 0 ? target_sub_parts(kFirstPartSize) : kNumSubPartsFirstDefault),
+          int kNumSubPartsFirst = (kNumSubPartsFirstRaw < kFirstPartSize ? kNumSubPartsFirstRaw : kFirstPartSize),
+          int kNumSubPartsMidRaw = (kSubTokensTarget > 0 ? target_sub_parts(kMidPartSize) : kNumSubParts),
+          int kNumSubPartsMid = (kNumSubPartsMidRaw < kMidPartSize ? kNumSubPartsMidRaw : kMidPartSize),
+          int kNumSubPartsMax0 = (kNumSubParts > kNumSubPartsLast ? kNumSubParts : kNumSubPartsLast),
+          int kNumSubPartsMax1 = (kNumSubPartsFirst > kNumSubPartsMid ? kNumSubPartsFirst : kNumSubPartsMid),
+          int kNumSubPartsMax = (kNumSubPartsMax0 > kNumSubPartsMax1 ? kNumSubPartsMax0 : kNumSubPartsMax1),
           int kNumSlotsPerForwardChunk = 48,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
@@ -218,6 +264,8 @@ hybrid_unordered_dispatch_impl(
                      "so its header has its own slot");
     EP_STATIC_ASSERT(kNumSubPartsLast >= 1 and kNumSubPartsLast <= kBatchSize,
                      "Invalid last-part sub-part count");
+    EP_STATIC_ASSERT(kNumSubPartsFirst >= 1 and kNumSubPartsMid >= 1,
+                     "Invalid first/mid-part sub-part count");
     EP_STATIC_ASSERT(gin_alloc::constexpr_channels_per_sm(
                          kNumGinSignals, kNumSMs, kNumQPs, (kNumNotifyWarps > 0), kNumScaleoutWarps)
                          == kNumScaleoutWarps,
@@ -335,16 +383,19 @@ hybrid_unordered_dispatch_impl(
     const auto part_first_slot = [&](const int& part) {
         return part_offset_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(part);
     };
-    // Per-part sub-part shape: the last part may use a finer split (kNumSubPartsLast) than the
-    // mid/first parts (kNumSubParts). All sub-puts of a part share the part's signal id, so the
-    // split factor is free w.r.t. the signal/QP budget.
+    // Per-part sub-part shape: first/mid/last parts may use different split factors (head
+    // granularity / throughput / tail granularity), and EP_SUB_TOKENS_TARGET derives all
+    // three from a per-sub-put token target. All sub-puts of a part share the part's signal
+    // id, so the split factor is free w.r.t. the signal/QP budget.
     const auto num_subs_of = [&](const int& part_idx) {
         return part_idx == kNumParts - 1 ? num_sub_parts_at<kNumSubPartsLast>(part_size(part_idx))
-                                         : num_sub_parts_at<kNumSubParts>(part_size(part_idx));
+             : part_idx == 0             ? num_sub_parts_at<kNumSubPartsFirst>(part_size(part_idx))
+                                         : num_sub_parts_at<kNumSubPartsMid>(part_size(part_idx));
     };
     const auto sub_size_of = [&](const int& part_idx, const int& sub_idx) {
         return part_idx == kNumParts - 1 ? sub_part_size_at<kNumSubPartsLast>(part_size(part_idx), sub_idx)
-                                         : sub_part_size_at<kNumSubParts>(part_size(part_idx), sub_idx);
+             : part_idx == 0             ? sub_part_size_at<kNumSubPartsFirst>(part_size(part_idx), sub_idx)
+                                         : sub_part_size_at<kNumSubPartsMid>(part_size(part_idx), sub_idx);
     };
     // First slot of sub-part `sub_idx` within part `part_idx` (slots inside a sub-part are
     // filled contiguously from here; its in-band header lives in this slot's header word).
@@ -352,7 +403,9 @@ hybrid_unordered_dispatch_impl(
         return part_first_slot(part_idx) +
             (part_idx == kNumParts - 1
                  ? sub_part_offset_at<kNumSubPartsLast>(part_size(part_idx), sub_idx)
-                 : sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx));
+             : part_idx == 0
+                 ? sub_part_offset_at<kNumSubPartsFirst>(part_size(part_idx), sub_idx)
+                 : sub_part_offset_at<kNumSubPartsMid>(part_size(part_idx), sub_idx));
     };
     // Per-(channel, part) counting-signal id, shared by the sender and forward sides of the
     // channel this warp serves (both sides reduce to the same channel warp index).
