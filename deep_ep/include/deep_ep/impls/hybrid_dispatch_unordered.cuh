@@ -190,7 +190,10 @@ __device__ __host__ __forceinline__ constexpr int part_offset_at(const int& part
 // Per-block aggregation slots, reduced by SM 0 after the exit grid+network barrier.
 // Slots: 0 min entry | 1 min put0 | 2 max obs_last | 3 max copy_done | 4 max fwd_done
 //        5 max snd_done | 6 max bar1_in | 7 sum tail_tokens (forwarded after last arrival)
-__device__ unsigned long long q_blk[128][8];
+//        8..15: arrival timeline — max stamp when scale-out source (slot-8) reached its
+//        terminal (all of its data landed), across this block's channels. The spread
+//        max_s - min_s over sources quantifies the arrival skew behind the 4n tail.
+__device__ unsigned long long q_blk[128][16];
 #endif
 
 template <bool kDoCPUSync,
@@ -447,12 +450,23 @@ hybrid_unordered_dispatch_impl(
     __syncwarp();
 #endif
 
+#ifdef EP_ASYNC_EXIT
+    // Async exit: the kernel will skip the exit scale-up barrier and hand data-readiness to
+    // the epilogue via per-peer done flags. Zero MY OWN flags before the entry barrier: a
+    // peer can only set them after its forwarding completes, which needs this rank's puts,
+    // which come after this rank passes the entry barrier — so pre-barrier zeroing is safe.
+    if (sm_idx == 0 and warp_idx == 0 and lane_idx < kNumScaleupRanks)
+        *workspace_layout.get_dispatch_done_flag_ptr(lane_idx) = 0;
+    __syncwarp();
+#endif
+
 #ifdef EP_PROFILE_QUIET
     EP_STATIC_ASSERT(kNumSMs <= 128, "q_blk has 128 per-block slots");
+    EP_STATIC_ASSERT(kNumScaleoutRanks <= 8, "arrival-timeline slots hold 8 sources");
     if (thread_idx == 0) {
         #pragma unroll
-        for (int q = 0; q < 8; ++ q)
-            q_blk[sm_idx][q] = (q <= 1) ? ~0ull : 0ull;   // min slots high, max/sum slots low
+        for (int q = 0; q < 16; ++ q)
+            q_blk[sm_idx][q] = (q <= 1 or q == 13) ? ~0ull : 0ull;   // min slots high, max/sum slots low
         q_blk[sm_idx][0] = ptx::globaltimer();
     }
     __syncthreads();
@@ -1181,6 +1195,7 @@ hybrid_unordered_dispatch_impl(
             fwd_phase[i] = 0;
 #ifdef EP_PROFILE_QUIET
         bool q_obs_seen = false;
+        unsigned long long q_own_terminal = 0;
 #endif
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
@@ -1298,6 +1313,14 @@ hybrid_unordered_dispatch_impl(
                             my_finished = true;
                             stored_terminal_part = k;
                             stored_terminal_sub = s;
+#ifdef EP_PROFILE_QUIET
+                            // Arrival timeline: source `lane_idx` fully landed at this instant
+                            if (lane_idx < kNumScaleoutRanks) {
+                                const auto q_t = ptx::globaltimer();
+                                atomicMax(&q_blk[sm_idx][8 + lane_idx], q_t);
+                                q_own_terminal = q_t > q_own_terminal ? q_t : q_own_terminal;
+                            }
+#endif
                         }
                         prefix_alive = through;
                     }
@@ -1381,6 +1404,12 @@ hybrid_unordered_dispatch_impl(
                 ((EP_PULL_FORWARD) >= 3 ? src_finished
                                         : __all_sync(0xffffffff, stored_finish_flag != 0));
             if (pull_now) {
+#ifdef EP_PROFILE_QUIET
+                // Pull-loop busy time (slot 14, repurposed: sources 6/7 unused at <=6 sources
+                // in these configs... use slot 15 exclusively for busy ns to be safe) —
+                // busy_ns / descriptor count = per-token drain cost.
+                const auto q_pull_t0 = ptx::globaltimer();
+#endif
                 // Batched routing reads: 32 lanes fetch topk for 4 tokens at once (8 topk
                 // lanes each), amortizing the L2 read latency that dominates the
                 // descriptor-only drain. Bookkeeping stays strictly per-token in order.
@@ -1511,6 +1540,11 @@ hybrid_unordered_dispatch_impl(
                     __syncwarp();
                 }
                 }
+#ifdef EP_PROFILE_QUIET
+                if (ptx::elect_one_sync())
+                    atomicAdd(&q_blk[sm_idx][15], ptx::globaltimer() - q_pull_t0);
+                __syncwarp();
+#endif
                 continue;   // next arbitration round
             }
 #endif
@@ -1781,8 +1815,22 @@ hybrid_unordered_dispatch_impl(
         }
 
 #ifdef EP_PROFILE_QUIET
-        if (ptx::elect_one_sync())
-            atomicMax(&q_blk[sm_idx][3], ptx::globaltimer());
+        {
+            // Warp-max of per-lane terminal stamps = this channel's terminal
+            unsigned long long t = q_own_terminal;
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const auto o = __shfl_down_sync(0xffffffff, t, off);
+                t = o > t ? o : t;
+            }
+            if (lane_idx == 0) {
+                const auto q_now = ptx::globaltimer();
+                atomicMax(&q_blk[sm_idx][3], q_now);
+                atomicMin(&q_blk[sm_idx][13], q_now);   // earliest channel wip-exit (slot 13)
+                if (t > 0)
+                    atomicMax(&q_blk[sm_idx][12], q_now - t);   // worst exit-minus-own-terminal
+            }
+        }
         __syncwarp();
 #endif
 
@@ -1857,9 +1905,27 @@ hybrid_unordered_dispatch_impl(
         atomicMax(&q_blk[sm_idx][6], ptx::globaltimer());
     __syncthreads();
 #endif
+#ifdef EP_ASYNC_EXIT
+    // Async exit: no exit barrier, no waiting for slow peers. Drain this rank's own NVLink
+    // TMA stores, grid-sync locally, publish the completion (release) to every scale-up
+    // peer's done flag, and leave. The epilogue polls the 8 flags instead; cross-iteration
+    // safety is carried by stream order plus the next dispatch's entry barrier (which also
+    // flushes QPs, covering the flush the exit barrier used to do).
+    ptx::tma_store_commit();
+    ptx::tma_store_wait();
+    __syncwarp();
+    (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
+    ptx::fence_acq_rel_sys();
+    if (sm_idx == 0 and thread_idx < kNumScaleupRanks) {
+        const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
+            workspace_layout.get_dispatch_done_flag_ptr(scaleup_rank_idx), thread_idx);
+        ptx::st_release_sys(dst_ptr, 1);
+    }
+#else
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
+#endif
 
 #ifdef EP_PROFILE_QUIET
     // One line per rank per iteration: SM 0 reduces every block's slots after the exit
@@ -1867,6 +1933,11 @@ hybrid_unordered_dispatch_impl(
     if (sm_idx == 0 and thread_idx == 0) {
         unsigned long long q_entry = ~0ull, q_put0 = ~0ull;
         unsigned long long q_obs = 0, q_copy = 0, q_fwd = 0, q_snd = 0, q_bar1 = 0, q_tail = 0;
+        unsigned long long q_arr[8];
+        #pragma unroll
+        for (int s = 0; s < 8; ++ s)
+            q_arr[s] = 0;
+        unsigned long long q_copy_min = ~0ull;
         for (int b = 0; b < kNumSMs; ++ b) {
             q_entry = min(q_entry, q_blk[b][0]);
             q_put0 = min(q_put0, q_blk[b][1]);
@@ -1876,12 +1947,20 @@ hybrid_unordered_dispatch_impl(
             q_snd = max(q_snd, q_blk[b][5]);
             q_bar1 = max(q_bar1, q_blk[b][6]);
             q_tail += q_blk[b][7];
+            q_copy_min = min(q_copy_min, q_blk[b][13]);
+            q_arr[5] = max(q_arr[5], q_blk[b][12]);   // slot 12 hijacks arr5 (unused at <=5 sources)
+            #pragma unroll
+            for (int s = 0; s < 8; ++ s)
+                if (s != 5)   // slot 13 aliases arr5's source; arr5 carries slot 12 instead
+                    q_arr[s] = max(q_arr[s], q_blk[b][8 + s]);
         }
         printf("EPQ so=%d su=%d it=%d entry=%llu put0=%llu obslast=%llu copydone=%llu "
-               "fwddone=%llu snddone=%llu bar1i=%llu bar1o=%llu tailtok=%llu\n",
+               "fwddone=%llu snddone=%llu bar1i=%llu bar1o=%llu tailtok=%llu "
+               "arr0=%llu arr1=%llu arr2=%llu arr3=%llu arr4=%llu arr5=%llu cmin=%llu arr7=%llu\n",
                scaleout_rank_idx, scaleup_rank_idx, dispatch_iteration,
                q_entry, q_put0, q_obs, q_copy, q_fwd, q_snd, q_bar1,
-               ptx::globaltimer(), q_tail);
+               ptx::globaltimer(), q_tail,
+               q_arr[0], q_arr[1], q_arr[2], q_arr[3], q_arr[4], q_arr[5], q_copy_min, q_arr[7]);
     }
 #endif
 

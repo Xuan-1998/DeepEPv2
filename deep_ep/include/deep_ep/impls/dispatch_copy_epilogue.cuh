@@ -67,6 +67,19 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // NOTES: PDL is used, please do not use `__ldg`
     cudaGridDependencySynchronize();
 
+#ifdef EP_ASYNC_EXIT
+    // The dispatch kernel exits without its scale-up barrier; per-peer done flags carry
+    // data-readiness instead. Poll all of them (acquire) before consuming anything.
+    {
+        const auto async_ws = layout::WorkspaceLayout(
+            workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+        if (thread_idx < kNumScaleupRanks) {
+            while (ptx::ld_acquire_sys<int>(async_ws.get_dispatch_done_flag_ptr(thread_idx)) == 0) {}
+        }
+        __syncthreads();
+    }
+#endif
+
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
         num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1];
@@ -105,30 +118,37 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
         int dst_expert_idx = -1;
 #ifdef EP_PULL_FORWARD
-        // Pull mode: the slot may be a descriptor — resolve it (second TMA from the source
-        // rank's recv buffer) before any field is used, so all reads below come from smem.
+        // Pull mode: read the marker word directly (ld.cg — L2-coherent with the dispatch
+        // kernel's NVLink descriptor stores, no stale L1) and read descriptor fields from
+        // L2 without the smem bounce; the payload is TMA-pulled once from the source rank's
+        // recv buffer, overwriting the (garbage) smem copy of the descriptor slot.
         if (ptx::elect_one_sync())
             ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
         __syncwarp();
         {
-            const int pull_marker = *tma_buffer.get_src_token_global_idx_ptr();
+            const int pull_marker = ptx::ld_cg(buffer_token.get_src_token_global_idx_ptr());
             if (pull_marker < 0) {
                 const int pull_src_rank = pull_marker & 0xff;
-                const int ll_patch = lane_idx < kNumTopk ? tma_buffer.get_topk_idx_ptr()[lane_idx] : -1;
-                const auto* w_desc = reinterpret_cast<const int*>(tma_buffer.get_topk_weights_ptr());
-                const auto off_lo = static_cast<uint32_t>(w_desc[0]);
-                const auto off_hi = w_desc[1];
+                // Descriptor fields via direct L2 reads (44B, no smem bounce)
+                const int ll_patch = lane_idx < kNumTopk ?
+                    ptx::ld_cg(buffer_token.get_topk_idx_ptr() + lane_idx) : -1;
+                const auto* w_desc = reinterpret_cast<const int*>(buffer_token.get_topk_weights_ptr());
+                const auto off_lo = static_cast<uint32_t>(ptx::ld_cg(w_desc));
+                const auto off_hi = ptx::ld_cg(w_desc + 1);
                 const auto pull_off = (static_cast<uint64_t>(static_cast<uint32_t>(off_hi)) << 32) |
                                       static_cast<uint64_t>(off_lo);
                 const auto pull_src = *pull_workspace_layout.get_pull_src_base_ptr(pull_src_rank) + pull_off;
-                if (ptx::elect_one_sync()) {
-                    ptx::tma_load_1d(tma_buffer.get_base_ptr(),
-                                     reinterpret_cast<const void*>(pull_src),
-                                     mbarrier_ptr, tma_buffer.get_num_bytes<false>());
-                    ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, tma_buffer.get_num_bytes<false>());
-                    ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                // Lane-parallel int4 copy (peer gmem -> smem). TMA bulk loads from
+                // NVLink-mapped peer memory measured ~56us each (pathological path);
+                // 32 lanes x int4 keeps ~30 independent NVLink reads in flight instead.
+                {
+                    const auto* src_v4 = reinterpret_cast<const int4*>(pull_src);
+                    auto* dst_v4 = reinterpret_cast<int4*>(tma_buffer.get_base_ptr());
+                    const int num_v4 = tma_buffer.get_num_bytes<false>() / static_cast<int>(sizeof(int4));
+                    for (int v = lane_idx; v < num_v4; v += 32)
+                        dst_v4[v] = src_v4[v];
+                    __syncwarp();
                 }
-                __syncwarp();
                 if (not kCachedMode and lane_idx < kNumTopk)
                     tma_buffer.get_linked_list_idx_ptr()[lane_idx] = ll_patch;
                 __syncwarp();

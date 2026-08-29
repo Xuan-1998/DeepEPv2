@@ -93,6 +93,11 @@ struct WorkspaceLayout {
         // the copy epilogue (which has no NCCL handle to translate addresses itself).
         num_bytes += kNumMaxRanks * sizeof(uint64_t);
 
+        // Async-exit done flags (EP_ASYNC_EXIT): flag[j] set (NVLink st.release) by scale-up
+        // peer j when its dispatch forwarding is complete; polled by the copy epilogue in
+        // place of the dispatch kernel's exit scale-up barrier.
+        num_bytes += kNumMaxRanks * sizeof(int);
+
         return num_bytes;
     }
 
@@ -197,6 +202,14 @@ struct WorkspaceLayout {
     __forceinline__ __device__ __host__ uint64_t* get_pull_src_base_ptr(const int& scaleup_rank_idx) const {
         const auto base_ptr = math::advance_ptr<uint64_t>(
             get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int));
+        return base_ptr + scaleup_rank_idx;
+    }
+
+    // Async-exit done flags (see get_num_bytes). Zeroed by the owner at dispatch entry,
+    // set by scale-up peer j at its forwarding completion, polled by the copy epilogue.
+    __forceinline__ __device__ __host__ int* get_dispatch_done_flag_ptr(const int& scaleup_rank_idx) const {
+        const auto base_ptr = math::advance_ptr<int>(
+            get_pull_src_base_ptr(0), kNumMaxRanks * sizeof(uint64_t));
         return base_ptr + scaleup_rank_idx;
     }
 };

@@ -74,7 +74,7 @@ public:
         // Dispatch tail/head experiment knobs. Boolean toggles become bare defines; integer
         // knobs override the in-header defaults. All participate in the kernel cache key via
         // `flags`, so switching an env var cannot hit a stale cache entry.
-        for (const auto& name : {"EP_PROFILE_QUIET", "EP_TAIL_ADAPTIVE"}) {
+        for (const auto& name : {"EP_PROFILE_QUIET", "EP_TAIL_ADAPTIVE", "EP_ASYNC_EXIT"}) {
             if (get_env(name, 0))
                 flags += fmt::format(" -D{}=1", name);
         }
