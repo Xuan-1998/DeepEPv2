@@ -455,6 +455,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         int last_src_scaleout_rank_idx = -1;
         int last_slot_written = -1;
+        long long _dbg_loop_end = 0;
+        long long _dbg_t_last_remote = 0, _dbg_t_last_local = 0;
+        int _dbg_seq = 0, _dbg_n_remote = 0, _dbg_n_local = 0,
+            _dbg_pos_last_remote = -1, _dbg_pos_last_local = -1;
+        unsigned _dbg_bits[16] = {};
         const auto flush_last_tma_and_record_batch = [&]() {
             if (last_src_scaleout_rank_idx >= 0 and ptx::elect_one_sync()) {
                 ptx::tma_store_wait();
@@ -623,6 +628,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 ptx::tma_store_fence();
                 __syncwarp(); // Necessary to let the leader lane see the writes
 
+                if (ptx::elect_one_sync()) {
+                    _dbg_seq += 1;
+                    if (src_scaleout_rank_idx == scaleout_rank_idx) {
+                        _dbg_n_local += 1; _dbg_pos_last_local = _dbg_seq; _dbg_t_last_local = clock64();
+                    } else {
+                        _dbg_n_remote += 1; _dbg_pos_last_remote = _dbg_seq; _dbg_t_last_remote = clock64();
+                        if (_dbg_seq - 1 < 512) _dbg_bits[(_dbg_seq - 1) >> 5] |= 1u << ((_dbg_seq - 1) & 31);
+                    }
+                }
                 // Assign send and receive buffers
                 // NOTES: as we only have 1 destination, we will use "send" as "recv" for local transfer
                 const int recv_slot = slot_of_per_channel[src_scaleout_rank_idx];
@@ -650,6 +664,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             }
         }
 
+        _dbg_loop_end = clock64();
         // Issue the last TMA and record operation for last RDMA
         if constexpr (kAllowMultipleReduction)
             flush_last_tma_and_record_batch();
@@ -749,6 +764,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // one lane polls. We poll with a timeout (instead of the blocking
         // `waitSignalMeetShadow`) so a stuck peer surfaces a diagnostic rather than
         // hanging.
+        const auto _dbg_w0 = clock64();
         if (ptx::elect_one_sync()) {
             const auto shadow_ptr = gin.gin.getSignalShadowPtr(signal_id);
             const auto target = (*shadow_ptr += static_cast<uint64_t>(num_expected_arrivals));
@@ -767,6 +783,19 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             });
         }
         __syncwarp();
+        if (ptx::elect_one_sync() and sm_idx == 0)
+            printf("[DBG-EXP] so=%d su=%d ch=%d loop_to_wait=%lld exposure=%lld total=%d nrem=%d nloc=%d posrem=%d posloc=%d runway_rem=%lld runway_loc=%lld\n",
+                   scaleout_rank_idx, scaleup_rank_idx, channel_idx,
+                   _dbg_w0 - _dbg_loop_end, clock64() - _dbg_w0,
+                   _dbg_seq, _dbg_n_remote, _dbg_n_local, _dbg_pos_last_remote, _dbg_pos_last_local,
+                   _dbg_t_last_remote ? _dbg_w0 - _dbg_t_last_remote : -1,
+                   _dbg_t_last_local ? _dbg_w0 - _dbg_t_last_local : -1);
+        if (ptx::elect_one_sync() and lane_idx == 0)
+            printf("[DBG-BITS] so=%d ch=%d n=%d bits=%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x%08x\n",
+                   scaleout_rank_idx, channel_idx, _dbg_seq,
+                   _dbg_bits[11], _dbg_bits[10], _dbg_bits[9], _dbg_bits[8],
+                   _dbg_bits[7], _dbg_bits[6], _dbg_bits[5], _dbg_bits[4],
+                   _dbg_bits[3], _dbg_bits[2], _dbg_bits[1], _dbg_bits[0]);
     } else {
         // Proxy warp loop shape: arch-selected at JIT compile time.
         //   SM100+ (B200) -> sequential single-lane sweeper.
