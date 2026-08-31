@@ -928,6 +928,8 @@ public:
                                get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts) <=
                            num_smem_bytes and
                            "dispatch TMA pool exceeds the shared-memory budget");
+            if (not prefer_overlap_with_compute)
+                num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
             // Reduce the channel count to fit this launch's GIN indexed-signal budget.
             // `with_notify` is pinned (not `not cached_mode`) so a cached dispatch derives the
             // same count the handle was shaped with.
