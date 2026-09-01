@@ -945,7 +945,8 @@ public:
                    static_cast<int64_t>(2 * num_channels_per_sm) *
                            combine_token_layout.get_num_bytes<true, int64_t>() +
                        elastic::ProxyRingLayout::get_num_bytes(num_channels_per_sm,
-                                                               elastic::kProxyRingDepthDefault) >
+                                                               elastic::kProxyRingDepthDefault) +
+                       /* cooperative-forward pair counters */ 2 * num_channels_per_sm * static_cast<int64_t>(sizeof(int)) >
                    num_smem_bytes)
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
@@ -1429,6 +1430,7 @@ public:
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
+            prefer_overlap_with_compute,
             comm_stream);
 
         // Allocate output tensors

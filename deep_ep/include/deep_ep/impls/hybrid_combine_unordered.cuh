@@ -28,6 +28,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
           int kNumQPs, int64_t kNumTimeoutCycles,
+          int kNumFwWarpsPerChannel = 1,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumScaleupUpdateInterval = 3,
           int kBatchSize = 12,
@@ -36,7 +37,8 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumChannels = kNumChannelsPerSM * kNumSMs,
           int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank, kNumChannels),
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
-          int kNumDataWarps = kNumScaleupWarps + kNumForwardWarps,
+          int kNumTmaWarps = kNumScaleupWarps + kNumForwardWarps,
+          int kNumDataWarps = kNumScaleupWarps + kNumForwardWarps * kNumFwWarpsPerChannel,
           int kProxyWarpIdx = kNumDataWarps,
           int kNumWarps = kNumDataWarps + 1,
           int kNumThreads = kNumWarps * 32,
@@ -78,20 +80,30 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // Token layouts
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
 
-    // TMA buffers — one per DATA warp only (scale-up + forward).
+    // TMA buffers — one per scale-up warp and one per forward CHANNEL (a cooperative
+    // forward pair shares its channel's buffer: role 0 fills the lower half of every
+    // token, role 1 the upper half).
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
-    const auto tma_buffer_layout = layout::BufferLayout<true>(token_layout, kNumDataWarps, 1, smem);
-    // The proxy warp never touches `tma_buffer`, clamp its index to 0.
+    const auto tma_buffer_layout = layout::BufferLayout<true>(token_layout, kNumTmaWarps, 1, smem);
+    // Map each warp to its buffer; the proxy warp never touches `tma_buffer`, clamp to 0.
+    const auto tma_buffer_idx = warp_idx < kNumScaleupWarps ?
+        warp_idx :
+        (warp_idx < kNumDataWarps ?
+             kNumScaleupWarps + (warp_idx - kNumScaleupWarps) / kNumFwWarpsPerChannel : 0);
     const auto tma_buffer = tma_buffer_layout
-        .get_rank_buffer(warp_idx < kNumDataWarps ? warp_idx : 0).get_token_buffer(0);
+        .get_rank_buffer(tma_buffer_idx).get_token_buffer(0);
 
     // Proxy warp hand-off rings — placed in `smem[]` right after the TMA buffers.
     const auto proxy_ring_layout = ProxyRingLayout(
         kNumForwardWarps, kProxyRingDepth, tma_buffer_layout.get_buffer_end_ptr());
+    auto* const pair_free_seq = reinterpret_cast<int*>(proxy_ring_layout.get_end_ptr());
+    auto* const pair_half_done_seq = pair_free_seq + kNumForwardWarps;
     for (int f = thread_idx; f < kNumForwardWarps; f += kNumThreads) {
         *proxy_ring_layout.get_head(f) = 0;
         *proxy_ring_layout.get_tail(f) = 0;
         *proxy_ring_layout.get_done(f) = 0;
+        pair_free_seq[f] = 0;
+        pair_half_done_seq[f] = 0;
     }
     __syncthreads();
 
@@ -111,15 +123,20 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // Init TMA for scale-up and forward warps
     ptx::arrival_phase phase = 0;
     const auto mbarrier_ptr = tma_buffer.get_mbarrier_ptr();
-    if (ptx::elect_one_sync())
+    const bool owns_tma_buffer = warp_idx < kNumScaleupWarps or
+        (warp_idx < kNumDataWarps and (warp_idx - kNumScaleupWarps) % kNumFwWarpsPerChannel == 0);
+    if (owns_tma_buffer and ptx::elect_one_sync())
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
     __syncwarp();
 
     // NCCL Gin handle
-    // For data warp, each warp is a channel, for proxy warp each lane is a channel.
-    const auto gin_channel_in_sm = warp_idx < kNumDataWarps ?
+    // For data warp, each warp is a channel (a cooperative forward pair maps to the
+    // same channel), for proxy warp each lane is a channel.
+    const auto gin_channel_in_sm = warp_idx < kNumScaleupWarps ?
         (warp_idx % kNumChannelsPerSM) :
-        (lane_idx < kNumForwardWarps ? lane_idx : 0);
+        (warp_idx < kNumDataWarps ?
+             ((warp_idx - kNumScaleupWarps) / kNumFwWarpsPerChannel) % kNumChannelsPerSM :
+             (lane_idx < kNumForwardWarps ? lane_idx : 0));
     const auto [qp_idx, sharing_mode] =
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
@@ -132,7 +149,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
     // Adjust register count at certain cases
     // TODO: support more cases, or try to make channel count more aligned
-    const bool kAdjustRegisters = (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8) and not kUseExpandedLayout;
+    const bool kAdjustRegisters = (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8) and
+                                  not kUseExpandedLayout and kNumFwWarpsPerChannel == 1;
     constexpr int kNumRegistersForScaleupWarps = 40;
     constexpr int kNumRegistersForForwardWarps = 256 - kNumRegistersForScaleupWarps;
 
@@ -397,7 +415,13 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         update_tails(true);
         }
     } else if (warp_idx < kNumDataWarps) {
-        const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
+        EP_STATIC_ASSERT(kNumFwWarpsPerChannel == 1 or
+                         (kAllowMultipleReduction and not kUseExpandedLayout),
+                         "Cooperative forward pairs are only supported on the "
+                         "multiple-reduction, non-expanded path");
+        const auto forward_warp_idx = (warp_idx - kNumScaleupWarps) / kNumFwWarpsPerChannel;
+        const auto fw_role = (warp_idx - kNumScaleupWarps) % kNumFwWarpsPerChannel;
+        const bool is_fw_leader = fw_role == 0;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
 
         // Indexed-signal id owned by this channel within its GIN context. Uses the
@@ -469,6 +493,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         int last_src_scaleout_rank_idx = -1;
         int last_slot_written = -1;
+        int token_seq = 0, tokens_written = 0;
         const auto flush_last_tma_and_record_batch = [&]() {
             if (last_src_scaleout_rank_idx >= 0 and ptx::elect_one_sync()) {
                 ptx::tma_store_wait();
@@ -476,6 +501,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                  // Issue only if not local rank
                 if (last_src_scaleout_rank_idx != scaleout_rank_idx)
                     record_slot_and_maybe_flush(last_src_scaleout_rank_idx, last_slot_written);
+            }
+            if constexpr (kNumFwWarpsPerChannel > 1) {
+                if (ptx::elect_one_sync())
+                    ptx::st_release_cta(pair_free_seq + forward_warp_idx, tokens_written);
             }
             __syncwarp();
         };
@@ -548,6 +577,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
                 stored_num_tokens_recv[j] += static_cast<int>(stored_is_scaleup_rank_needed[j]);
+            token_seq += 1;
             
             if constexpr (not kAllowMultipleReduction) {
                 // Cases where multiple reduction is disabled. We need to forward all data from scaleup peers to scaleout peers
@@ -619,29 +649,59 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     }
                 );
 
-                // Do reduce
-                constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, kAdjustRegisters ? 8 : 4>();
-                combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumScaleoutRanks)>(
-                    lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                // Do reduce. Cooperative pairs split the hidden dim: role r reduces
+                // vecs [r * kVecPerRole, (r + 1) * kVecPerRole) of every token into
+                // its half of the shared TMA buffer. The buffer-release wait is
+                // role-dependent: the leader waits its own outstanding TMA store (and
+                // publishes `free_seq`) and role 1 spins on `free_seq` until the previous
+                // token has left the buffer.
+                EP_STATIC_ASSERT(kHiddenVec % kNumFwWarpsPerChannel == 0, "Invalid hidden split");
+                constexpr int kVecPerRole = kHiddenVec / kNumFwWarpsPerChannel;
+                constexpr int kUnrollFactor = get_max_unroll_factor<kVecPerRole, kAdjustRegisters ? 8 : 4>();
+                const int vec_off = fw_role * kVecPerRole;
+                combine_reduce<kVecPerRole, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumScaleoutRanks)>(
+                    lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()) + vec_off,
                     /* Get source base */ [=](const int& slot_idx) {
-                        return static_cast<combine_vec_t*>(scaleup_buffer.get_token_buffer(slot_idx, true).get_base_ptr());
+                        return static_cast<combine_vec_t*>(scaleup_buffer.get_token_buffer(slot_idx, true).get_base_ptr()) + vec_off;
                     },
-                    /* Wait buffer release */ [=]() {
-                        flush_last_tma_and_record_batch();
+                    /* Wait buffer release */ [&]() {
+                        if (kNumFwWarpsPerChannel == 1 or is_fw_leader) {
+                            flush_last_tma_and_record_batch();
+                        } else {
+                            if (ptx::elect_one_sync())
+                                while (ptx::ld_acquire_cta(pair_free_seq + forward_warp_idx) < token_seq - 1) {}
+                            __syncwarp();
+                        }
                     }
                 );
 
-                // Merge topk weights
+                // Merge topk weights (leader only: the weights region is small and
+                // belongs to the leader's control state)
                 // NOTES: the slot indices must follow the master lane
                 stored_src_buffer_idx = ptx::exchange(
                     stored_src_buffer_idx, ptx::get_master_lane_idx(ptx::match(stored_src_scaleup_rank_idx)));
-                if (stored_src_scaleup_rank_idx >= 0) {
+                if (is_fw_leader and stored_src_scaleup_rank_idx >= 0) {
                     tma_buffer.get_topk_weights_ptr()[lane_idx] =
                         scaleup_buffer.get_token_buffer(stored_src_buffer_idx, true)
                                     .get_topk_weights_ptr()[lane_idx];
                 }
                 ptx::tma_store_fence();
                 __syncwarp(); // Necessary to let the leader lane see the writes
+
+                if constexpr (kNumFwWarpsPerChannel > 1) {
+                    if (not is_fw_leader) {
+                        // Upper half written and fenced: publish and move on.
+                        if (ptx::elect_one_sync())
+                            ptx::st_release_cta(pair_half_done_seq + forward_warp_idx, token_seq);
+                        __syncwarp();
+                        continue;
+                    }
+                    // Leader: wait for role 1's half before storing the whole token.
+                    if (ptx::elect_one_sync())
+                        while (ptx::ld_acquire_cta(pair_half_done_seq + forward_warp_idx) < token_seq) {}
+                    __syncwarp();
+                    ptx::tma_store_fence();
+                }
 
                 // Assign send and receive buffers
                 // NOTES: as we only have 1 destination, we will use "send" as "recv" for local transfer
@@ -663,6 +723,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     ptx::tma_store_commit();
                 }
                 __syncwarp();
+                tokens_written += 1;
 
                 // Record RDMA info to issue later
                 last_src_scaleout_rank_idx = src_scaleout_rank_idx;
@@ -670,7 +731,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             }
         }
 
-        if (replay_pass == 0) {
+        if (replay_pass == 0 and (kNumFwWarpsPerChannel == 1 or is_fw_leader)) {
             flush_last_tma_and_record_batch();
             last_src_scaleout_rank_idx = -1;
             if (ptx::elect_one_sync()) {
@@ -681,6 +742,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             __syncwarp();
         }
         }
+
+        if (kNumFwWarpsPerChannel > 1 and not is_fw_leader)
+            return;
 
         // Issue the last TMA and record operation for last RDMA
         if constexpr (kAllowMultipleReduction)
