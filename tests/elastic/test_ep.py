@@ -66,6 +66,42 @@ def fold_expanded(expanded: Union[Tuple[torch.Tensor], torch.Tensor],
     return folded
 
 
+def dump_forward_order(buffer: deep_ep.ElasticBuffer, handle, num_max_tokens_per_rank: int, num_scaleup_ranks: int):
+    """
+    Print, per channel, the remote/local class of every token in the dispatch forwarder's
+    recorded order (which combine replays), plus a per-rank summary: the remote share in
+    each quarter of the sequence and the number of runs of consecutive same-class tokens.
+    """
+    meta = handle.token_metadata_at_forward
+    if meta is None:
+        return
+    src = meta[:, :, 0].cpu()
+    num_channels = src.size(0)
+    quarters = torch.zeros(4, dtype=torch.float64)
+    total_runs, total_tokens = 0, 0
+    lines = []
+    for ch in range(num_channels):
+        seq = src[ch]
+        n = int((seq < 0).nonzero()[0].item()) if (seq < 0).any() else seq.numel()
+        if n == 0:
+            continue
+        is_remote = (seq[:n] // (num_max_tokens_per_rank * num_scaleup_ranks)) != buffer.scaleout_rank_idx
+        runs = 1 + int((is_remote[1:] != is_remote[:-1]).sum().item())
+        total_runs += runs
+        total_tokens += n
+        for q in range(4):
+            lo, hi = q * n // 4, (q + 1) * n // 4
+            quarters[q] += is_remote[lo:hi].float().mean().item() if hi > lo else 0
+        if ch < 4:
+            lines.append(f'      ch{ch:3}: n={n:4} runs={runs:3} ' + ''.join('R' if r else 'L' for r in is_remote.tolist()))
+    quarters /= max(1, num_channels)
+    print(f'   ~ EP: {buffer.rank_idx:3}/{buffer.num_ranks} | forward order: '
+          f'remote share by quarter: {quarters[0]:.2f} {quarters[1]:.2f} {quarters[2]:.2f} {quarters[3]:.2f} | '
+          f'mean run length: {total_tokens / max(1, total_runs):.1f} tokens', flush=True)
+    for line in lines:
+        print(line, flush=True)
+
+
 # noinspection PyUnboundLocalVariable,PyShadowingNames
 def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespace):
     # Settings
@@ -272,6 +308,9 @@ def test_dispatch_combine(buffer: deep_ep.ElasticBuffer, args: argparse.Namespac
                     f'{num_scaleout_bytes / t / 1e9:.0f} GB/s (SO), '
                     f'{num_scaleup_bytes / t / 1e9:.0f} GB/s (SU), {t * 1e6:.3f} us, {num_scaleup_bytes:.0f} bytes | '
                     f'copy: {2 * num_recv_tokens * num_bytes_per_dispatch_token / copy_t / 1e9:.0f} GB/s, {copy_t * 1e6:.3f} us')
+
+            if args.dump_forward_order and num_scaleout_ranks > 1:
+                dump_forward_order(buffer, buffer.dispatch(**dispatch_args)[3], num_max_tokens_per_rank, num_scaleup_ranks)
 
             # Test expanded dispatch performance
             num_bytes_per_dispatch_token_meta = safe_div(count_bytes(expanded_handle.recv_src_metadata), expanded_handle.recv_src_metadata.size(0))
@@ -621,6 +660,7 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--ignore-local-traffic', action='store_true', help='Whether to ignore local traffic during bandwidth calculation')
+    parser.add_argument('--dump-forward-order', action='store_true', help='Print the remote/local token order recorded by the dispatch forwarder')
     args = parser.parse_args()
     if args.pressure_iterations < 0:
         parser.error("--pressure-iterations must be non-negative")

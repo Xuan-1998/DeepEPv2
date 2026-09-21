@@ -18,7 +18,16 @@
 #include <deep_ep/impls/combine_utils.cuh>
 #include <deep_ep/impls/proxy_ring.cuh>
 
+// Combine replays the dispatch forwarder's token order. With 1 the replay is split into
+// two passes (remote-destined tokens first, local-bypass second) on both the scale-up
+// sweep and the forward replay; with 0 the recorded order is replayed as is.
+#ifndef EP_COMBINE_REMOTE_FIRST
+#define EP_COMBINE_REMOTE_FIRST 1
+#endif
+
 namespace deep_ep::elastic {
+
+static constexpr int kNumCombineReplayPasses = (EP_COMBINE_REMOTE_FIRST) ? 2 : 1;
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
@@ -207,7 +216,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
             stored_token_idx[i] = -1;
         #pragma unroll 1
-        for (int sweep = 0; sweep < 2; ++ sweep) {
+        for (int sweep = 0; sweep < kNumCombineReplayPasses; ++ sweep) {
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
             stored_ll_idx[i] = 0;
@@ -239,7 +248,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                 bool in_sweep = stored_token_idx[j] >= 0;
-                if (in_sweep) {
+                if (kNumCombineReplayPasses > 1 and in_sweep) {
                     const auto src_global = __ldg(src_metadata + stored_token_idx[j] * kSweepMetadataStride);
                     const bool is_local = (src_global / (kNumMaxTokensPerRank * kNumScaleupRanks)) == scaleout_rank_idx;
                     in_sweep = (sweep == 0) != is_local;
@@ -535,7 +544,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Replay the dispatch
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
         #pragma unroll 1
-        for (int replay_pass = 0; replay_pass < 2; ++ replay_pass) {
+        for (int replay_pass = 0; replay_pass < kNumCombineReplayPasses; ++ replay_pass) {
         for (int i = 0; ; ++ i) {
             const auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
@@ -549,7 +558,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 break;
 
             // Two-pass schedule: deferred tokens are revisited by the other pass
-            if ((replay_pass == 0) == (src_scaleout_rank_idx == scaleout_rank_idx))
+            if (kNumCombineReplayPasses > 1 and (replay_pass == 0) == (src_scaleout_rank_idx == scaleout_rank_idx))
                 continue;
 
             // Scaleup rank mask
@@ -758,7 +767,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             }
         }
 
-        if (replay_pass == 0 and (kNumFwWarpsPerChannel == 1 or is_fw_leader)) {
+        if (kNumCombineReplayPasses > 1 and replay_pass == 0 and (kNumFwWarpsPerChannel == 1 or is_fw_leader)) {
             flush_last_tma_and_record_batch();
             last_src_scaleout_rank_idx = -1;
             if (ptx::elect_one_sync()) {

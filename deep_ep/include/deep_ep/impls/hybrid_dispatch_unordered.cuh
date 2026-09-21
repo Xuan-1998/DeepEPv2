@@ -48,8 +48,24 @@ __device__ __forceinline__ bool unpack_scaleout_header(const int64_t& header, co
 #define EP_MIN_SUB_TOKENS 1
 #endif
 
+// Tokens the forwarder takes from one scale-out source per round-robin turn. The local
+// bypass source signals its tail at the same interval, so a source whose data is fully
+// visible and a source whose data is still landing advance at the same per-turn rate and
+// the recorded (and later combine-replayed) order stays interleaved on every rank.
+#ifndef EP_FORWARD_TURN_TOKENS
+#define EP_FORWARD_TURN_TOKENS 24
+#endif
+
+// Interval (in tokens) at which the local bypass source signals its tail; 0 follows
+// EP_FORWARD_TURN_TOKENS.
+#ifndef EP_LOCAL_TAIL_TOKENS
+#define EP_LOCAL_TAIL_TOKENS 0
+#endif
+
 static constexpr int kNumSubPartsDefault = (EP_NUM_SUB_PARTS) > 1 ? (EP_NUM_SUB_PARTS) : 1;
 static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SUB_TOKENS) : 1;
+static constexpr int kForwardTurnTokensDefault = (EP_FORWARD_TURN_TOKENS) > 1 ? (EP_FORWARD_TURN_TOKENS) : 1;
+static constexpr int kLocalTailTokensDefault = (EP_LOCAL_TAIL_TOKENS) > 0 ? (EP_LOCAL_TAIL_TOKENS) : kForwardTurnTokensDefault;
 
 #ifndef EP_SM100_MIN_SUB_TOKENS
 #define EP_SM100_MIN_SUB_TOKENS 15
@@ -146,7 +162,8 @@ template <bool kDoCPUSync,
           int kPartSize = math::constexpr_ceil_div(kNumMaxTokensPerChannel, kNumParts),
           int kBatchSize = kPartSize,
           int kNumSubParts = kNumSubPartsDefault < kBatchSize ? kNumSubPartsDefault : kBatchSize,
-          int kNumSlotsPerForwardChunk = 48,
+          int kNumSlotsPerForwardChunk = kForwardTurnTokensDefault,
+          int kNumLocalTailTokens = kLocalTailTokensDefault,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumScaleoutSendThreads = kNumScaleoutWarps * 32,
@@ -553,7 +570,7 @@ hybrid_unordered_dispatch_impl(
         };
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx == scaleout_rank_idx and
-                (stored_scaleout_tail >= stored_old_scaleout_tail + kBatchSize or finish_flag)) {
+                (stored_scaleout_tail >= stored_old_scaleout_tail + kNumLocalTailTokens or finish_flag)) {
                 const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
                 const auto ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
                 const auto old_signaled_tail = math::pack2<int, int64_t>(0, stored_old_scaleout_tail);
