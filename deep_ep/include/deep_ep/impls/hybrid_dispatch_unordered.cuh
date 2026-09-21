@@ -146,7 +146,7 @@ template <bool kDoCPUSync,
           int kPartSize = math::constexpr_ceil_div(kNumMaxTokensPerChannel, kNumParts),
           int kBatchSize = kPartSize,
           int kNumSubParts = kNumSubPartsDefault < kBatchSize ? kNumSubPartsDefault : kBatchSize,
-          int kNumSlotsPerForwardChunk = 48,
+          int kNumSlotsPerForwardChunk = 24,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
           int kNumScaleoutSendThreads = kNumScaleoutWarps * 32,
@@ -553,7 +553,7 @@ hybrid_unordered_dispatch_impl(
         };
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx == scaleout_rank_idx and
-                (stored_scaleout_tail >= stored_old_scaleout_tail + kBatchSize or finish_flag)) {
+                (stored_scaleout_tail >= stored_old_scaleout_tail + kNumSlotsPerForwardChunk or finish_flag)) {
                 const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
                 const auto ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
                 const auto old_signaled_tail = math::pack2<int, int64_t>(0, stored_old_scaleout_tail);
