@@ -69,8 +69,8 @@ def fold_expanded(expanded: Union[Tuple[torch.Tensor], torch.Tensor],
 def dump_forward_order(buffer: deep_ep.ElasticBuffer, handle, num_max_tokens_per_rank: int, num_scaleup_ranks: int):
     """
     Print, per channel, the remote/local class of every token in the dispatch forwarder's
-    recorded order (which combine replays), plus a per-rank summary: the remote share in
-    each quarter of the sequence and the number of runs of consecutive same-class tokens.
+    recorded order (which combine replays), each line tagged with the rank, plus a per-rank
+    summary: the remote share in each quarter of the sequence and the mean run length.
     """
     meta = handle.token_metadata_at_forward
     if meta is None:
@@ -92,8 +92,7 @@ def dump_forward_order(buffer: deep_ep.ElasticBuffer, handle, num_max_tokens_per
         for q in range(4):
             lo, hi = q * n // 4, (q + 1) * n // 4
             quarters[q] += is_remote[lo:hi].float().mean().item() if hi > lo else 0
-        if ch < 4:
-            lines.append(f'      ch{ch:3}: n={n:4} runs={runs:3} ' + ''.join('R' if r else 'L' for r in is_remote.tolist()))
+        lines.append(f'      ~ EP: {buffer.rank_idx:3}/{buffer.num_ranks} ch{ch:3}: n={n:4} runs={runs:3} ' + ''.join('R' if r else 'L' for r in is_remote.tolist()))
     quarters /= max(1, num_channels)
     print(f'   ~ EP: {buffer.rank_idx:3}/{buffer.num_ranks} | forward order: '
           f'remote share by quarter: {quarters[0]:.2f} {quarters[1]:.2f} {quarters[2]:.2f} {quarters[3]:.2f} | '
