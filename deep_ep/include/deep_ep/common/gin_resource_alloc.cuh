@@ -19,7 +19,13 @@ namespace deep_ep::elastic::gin_alloc {
 
 // NCCL GIN: provider resource budget.
 static constexpr int kTotalQPBudget              = 256;
-static constexpr int kMaxGinContextBudget        = 17;
+// EP_MAX_GIN_CONTEXTS raises the ceiling for the QP-per-channel experiment (one GIN
+// context per scale-out channel plus the notify context). The provider QP budget is
+// unchanged, so each extra context costs indexed signals.
+#ifndef EP_MAX_GIN_CONTEXTS
+#define EP_MAX_GIN_CONTEXTS 17
+#endif
+static constexpr int kMaxGinContextBudget        = EP_MAX_GIN_CONTEXTS;
 
 // Design constant: ScaleOut warps per SM used by the auto-tuner's budget math.
 // Matches the buffer's `!prefer_overlap_with_compute` cap on `num_channels_per_sm`
@@ -36,7 +42,7 @@ static constexpr int kMaxWarpsPerSM              = 4;
 // across all nodes in the rail group, so it is shared rail-wide — the signal
 // count scales with the number of channels (warps), not with the number of
 // nodes.
-static constexpr int kMaxSM           = (kTotalQPBudget - 2*kMaxGinContextBudget)/kMaxWarpsPerSM;
+static constexpr int kMaxSM           = (kTotalQPBudget - 2*17)/kMaxWarpsPerSM;
 static constexpr int kMaxScaleoutWarps           = kMaxSM * kMaxWarpsPerSM;
 
 struct GinResourceConfig {
@@ -75,7 +81,7 @@ __forceinline__ __host__ constexpr bool all_gin_context_counts_cover_warps() {
             return false;
     return true;
 }
-static_assert(all_gin_context_counts_cover_warps(),
+static_assert(EP_MAX_GIN_CONTEXTS != 17 or all_gin_context_counts_cover_warps(),
               "GIN layout cannot give each ScaleOut warp a dedicated signal id "
               "for every legal context count");
 

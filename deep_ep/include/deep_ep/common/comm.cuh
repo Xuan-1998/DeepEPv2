@@ -99,6 +99,10 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
     constexpr int kNumAvailableQPs = kNumQPs - static_cast<int>(kWithNotifyWarps);
     const int qp_idx = channel_to_qp<kNumSMs, kNumQPs, kNumChannelsPerSM, kWithNotifyWarps>(
         sm_idx, channel_in_sm_idx, is_notify_warp);
+    // Every channel owns a QP: a single warp posts to it, so the QP can run in THREAD
+    // sharing (no cross-warp arbitration on the queue).
+    if constexpr (kNumSMs * kNumChannelsPerSM <= kNumAvailableQPs)
+        return {qp_idx, NCCL_GIN_RESOURCE_SHARING_THREAD};
     if constexpr (kNumSMs <= kNumAvailableQPs)
         return {qp_idx, kSharingCTA};
     else

@@ -166,6 +166,11 @@ if __name__ == '__main__':
         nvcc_flags.append(f'-DEP_NUM_TOPK_IDX_BITS={num_topk_idx_bits}')
 
     # Put them together
+    if 'EP_MAX_GIN_CONTEXTS' in os.environ:
+        max_gin_contexts = int(os.environ['EP_MAX_GIN_CONTEXTS'])
+        cxx_flags.append(f'-DEP_MAX_GIN_CONTEXTS={max_gin_contexts}')
+        nvcc_flags.append(f'-DEP_MAX_GIN_CONTEXTS={max_gin_contexts}')
+
     extra_compile_args = {
         'cxx': cxx_flags,
         'nvcc': nvcc_flags,

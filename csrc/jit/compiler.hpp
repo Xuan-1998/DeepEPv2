@@ -70,6 +70,10 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+        if (int max_gin_contexts = get_env("EP_MAX_GIN_CONTEXTS", 0); max_gin_contexts > 0)
+            flags += fmt::format(" -DEP_MAX_GIN_CONTEXTS={}", max_gin_contexts);
+        if (const auto extra = get_env<std::string>("EP_JIT_EXTRA_FLAGS"); not extra.empty())
+            flags += " " + extra;
     }
 
     virtual ~Compiler() = default;
