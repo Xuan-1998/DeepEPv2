@@ -910,7 +910,8 @@ hybrid_unordered_dispatch_impl(
                             sub_valid[s] = is_header_src and
                                 unpack_scaleout_header(read_batch_header(lane_idx, k, s),
                                                        dispatch_iteration, sub_count[s], sub_more[s]);
-                            num_valid += __popc(ptx::gather(sub_valid[s]));
+                            // The part signal counts NIC-landed sub-parts from remote sources only
+                            num_valid += __popc(ptx::gather(sub_valid[s] and not is_local_src));
                         }
                     }
                     const bool part_landed = (kLocalTailHeader and is_local_src) or landed >= static_cast<int64_t>(num_valid);
