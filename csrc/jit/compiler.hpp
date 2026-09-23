@@ -74,6 +74,8 @@ public:
             flags += fmt::format(" -DEP_FORWARD_TURN_TOKENS={}", forward_turn_tokens);
         if (int local_tail_tokens = get_env("EP_LOCAL_TAIL_TOKENS", 0); local_tail_tokens > 0)
             flags += fmt::format(" -DEP_LOCAL_TAIL_TOKENS={}", local_tail_tokens);
+        if (int local_tail_header = get_env("EP_LOCAL_TAIL_HEADER", -1); local_tail_header >= 0)
+            flags += fmt::format(" -DEP_LOCAL_TAIL_HEADER={}", local_tail_header != 0 ? 1 : 0);
         if (int combine_remote_first = get_env("EP_COMBINE_REMOTE_FIRST", -1); combine_remote_first >= 0)
             flags += fmt::format(" -DEP_COMBINE_REMOTE_FIRST={}", combine_remote_first != 0 ? 1 : 0);
     }

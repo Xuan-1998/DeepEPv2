@@ -67,6 +67,15 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 static constexpr int kForwardTurnTokensDefault = (EP_FORWARD_TURN_TOKENS) > 1 ? (EP_FORWARD_TURN_TOKENS) : 1;
 static constexpr int kLocalTailTokensDefault = (EP_LOCAL_TAIL_TOKENS) > 0 ? (EP_LOCAL_TAIL_TOKENS) : kForwardTurnTokensDefault;
 
+// With 1 the local bypass source publishes its progress the same way remote sources do:
+// an in-band header per sub-part written into the local recv slot with a release store.
+// The signaled-tail counter (`update_scaleout_tail`, one system-scope atomic per
+// kNumLocalTailTokens) is not used. With 0 the counter path is kept.
+#ifndef EP_LOCAL_TAIL_HEADER
+#define EP_LOCAL_TAIL_HEADER 0
+#endif
+static constexpr bool kLocalTailHeader = (EP_LOCAL_TAIL_HEADER) != 0;
+
 #ifndef EP_SM100_MIN_SUB_TOKENS
 #define EP_SM100_MIN_SUB_TOKENS 15
 #endif
@@ -525,6 +534,12 @@ hybrid_unordered_dispatch_impl(
         };
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
         scaleout_recv_buffer = scaleout_recv_buffer.get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
+        if constexpr (kLocalTailHeader) {
+            if (ptx::elect_one_sync())
+                *tma_buffer.get_hdr_ptr() = 0;
+            ptx::tma_store_fence();
+            __syncwarp();
+        }
 
         // Channel metadata maintenance
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid number of scale-out ranks");
@@ -544,12 +559,20 @@ hybrid_unordered_dispatch_impl(
                 num_sub_parts_at<kNumSubParts>(part_size(kNumParts - 1));
         };
         const auto flush_part = [&](const int& up_to, const bool& is_final) {
-            if (lane_idx >= kNumScaleoutRanks or lane_idx == scaleout_rank_idx)
+            if (lane_idx >= kNumScaleoutRanks)
+                return;
+            if (not kLocalTailHeader and lane_idx == scaleout_rank_idx)
                 return;
             const int part_idx = stored_flushed_parts;
             const int sub_idx = stored_flushed_subs;
             const int count = up_to - coalesce_flushed;
             const int slot = sub_slot(part_idx, sub_idx);
+            if (kLocalTailHeader and lane_idx == scaleout_rank_idx) {
+                // Local bypass: the tokens are already in the recv slots (TMA stores, waited);
+                // publish the sub-part with a release store of its header, no put, no signal.
+                ptx::st_release_sys<int64_t>(scaleout_recv_buffer.get_token_buffer(slot).get_hdr_ptr(),
+                                             pack_scaleout_header(dispatch_iteration, count, not is_final));
+            } else {
             auto send_ch = scaleout_send_buffer.get_rank_buffer(lane_idx)
                                .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
             stage_part_header(send_ch, slot, count, /*more=*/not is_final);
@@ -560,6 +583,7 @@ hybrid_unordered_dispatch_impl(
                 scaleout_token_layout.get_num_bytes<false>() * num_put_tokens,
                 lane_idx, 0,
                 ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
+            }
             coalesce_flushed = up_to;
             if (sub_idx + 1 >= num_sub_parts_at<kNumSubParts>(part_size(part_idx))) {
                 stored_flushed_subs = 0;
@@ -569,6 +593,8 @@ hybrid_unordered_dispatch_impl(
             }
         };
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
+            if (kLocalTailHeader)
+                return;
             if (lane_idx == scaleout_rank_idx and
                 (stored_scaleout_tail >= stored_old_scaleout_tail + kNumLocalTailTokens or finish_flag)) {
                 const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
@@ -854,15 +880,15 @@ hybrid_unordered_dispatch_impl(
 
                 const bool src_valid = lane_idx < kNumScaleoutRanks;
                 const bool is_local_src = (lane_idx == scaleout_rank_idx);
+                const bool is_header_src = src_valid and (not is_local_src or kLocalTailHeader);
                 int intended_finish = 0, intended_tail = 0;
-                if (is_local_src) {
+                if (is_local_src and not kLocalTailHeader) {
                     const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
                         workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx));
                     math::unpack2<int, int64_t>(signaled_tail, intended_finish, intended_tail);
                 }
-                const bool is_remote_src = src_valid and not is_local_src;
                 int incremental_tail = stored_scaleout_tail_idx;
-                bool prefix_alive = is_remote_src;
+                bool prefix_alive = is_header_src;
                 bool my_finished = false;
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
@@ -881,13 +907,13 @@ hybrid_unordered_dispatch_impl(
                         sub_more[s] = false;
                         sub_valid[s] = false;
                         if (s < num_subs) {
-                            sub_valid[s] = is_remote_src and
+                            sub_valid[s] = is_header_src and
                                 unpack_scaleout_header(read_batch_header(lane_idx, k, s),
                                                        dispatch_iteration, sub_count[s], sub_more[s]);
                             num_valid += __popc(ptx::gather(sub_valid[s]));
                         }
                     }
-                    const bool part_landed = landed >= static_cast<int64_t>(num_valid);
+                    const bool part_landed = (kLocalTailHeader and is_local_src) or landed >= static_cast<int64_t>(num_valid);
 
                     #pragma unroll
                     for (int s = 0; s < kNumSubParts; ++ s) {
@@ -904,7 +930,7 @@ hybrid_unordered_dispatch_impl(
                         prefix_alive = through;
                     }
                 }
-                if (is_local_src) {
+                if (is_local_src and not kLocalTailHeader) {
                     stored_finish_flag       = intended_finish;
                     stored_scaleout_tail_idx = intended_tail;
                 } else if (src_valid) {
@@ -1078,7 +1104,8 @@ hybrid_unordered_dispatch_impl(
         #pragma unroll
         for (int k = 0; k < kNumParts; ++ k) {
             const int num_subs_k = num_sub_parts_at<kNumSubParts>(part_size(k));
-            const int my_subs_k = stored_terminal_part > k  ? num_subs_k
+            const int my_subs_k = lane_idx == scaleout_rank_idx ? 0
+                                : stored_terminal_part > k  ? num_subs_k
                                 : stored_terminal_part == k ? stored_terminal_sub + 1
                                                             : 0;
             const int expected_k = ptx::reduce_add(my_subs_k);
