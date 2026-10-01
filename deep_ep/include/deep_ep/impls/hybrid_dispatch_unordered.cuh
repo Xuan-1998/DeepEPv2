@@ -41,7 +41,7 @@ __device__ __forceinline__ bool unpack_scaleout_header(const int64_t& header, co
 }
 
 #ifndef EP_NUM_SUB_PARTS
-#define EP_NUM_SUB_PARTS 2
+#define EP_NUM_SUB_PARTS 4
 #endif
 
 #ifndef EP_MIN_SUB_TOKENS
