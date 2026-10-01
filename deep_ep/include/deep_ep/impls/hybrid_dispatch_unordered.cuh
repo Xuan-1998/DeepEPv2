@@ -810,6 +810,9 @@ hybrid_unordered_dispatch_impl(
         int stored_terminal_part = -1;
         int stored_terminal_sub = -1;
         uint32_t wip_mask;
+        
+        // Track remote forwarding progress for adaptive local chunk sizing
+        int remote_tokens_forwarded_last_turn = 0;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
             // Pick next rank in round-robin
             const auto offset = (recv_scaleout_rank_idx + 1) % kNumScaleoutRanks;
@@ -902,12 +905,23 @@ hybrid_unordered_dispatch_impl(
 
             // Process one chunk from the current rank
             const auto start_slot_idx = ptx::exchange(stored_scaleout_old_tail_idx, recv_scaleout_rank_idx);
+            
+            // Adaptive chunk sizing: clamp local chunks based on recent remote progress
+            const int max_chunk_size = (recv_scaleout_rank_idx == scaleout_rank_idx) 
+                ? max(4, min(kNumSlotsPerForwardChunk, remote_tokens_forwarded_last_turn))
+                : kNumSlotsPerForwardChunk;
+                
             const auto end_slot_idx = std::min(
                 ptx::exchange(stored_scaleout_tail_idx, recv_scaleout_rank_idx),
-                start_slot_idx + kNumSlotsPerForwardChunk
+                start_slot_idx + max_chunk_size
             );
             if (lane_idx == recv_scaleout_rank_idx)
                 stored_scaleout_old_tail_idx = end_slot_idx;
+                
+            // Update remote progress tracking for next local turn
+            if (recv_scaleout_rank_idx != scaleout_rank_idx) {
+                remote_tokens_forwarded_last_turn = end_slot_idx - start_slot_idx;
+            }
 
             const auto recv_buffer = scaleout_recv_buffer.get_rank_buffer(recv_scaleout_rank_idx);
 
