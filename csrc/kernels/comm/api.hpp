@@ -28,6 +28,9 @@ std::tuple<int, int> get_logical_domain_size(const int64_t& nccl_comm, const boo
 
 std::tuple<int, int> get_gin_min_stride(const int64_t& nccl_comm);
 
+// The GIN backend the device communicator of `nccl_comm` will use
+ncclGinType_t get_gin_type(const int64_t& nccl_comm, const bool& allow_hybrid_mode);
+
 class Context {
     void* raw_window_ptr;
     std::shared_ptr<symmetric::SymmetricMemory> symmetric_memory;
