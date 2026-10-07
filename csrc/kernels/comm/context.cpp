@@ -122,16 +122,25 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
     ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     reqs.lsaMultimem = enable_lsa_multimem;
     if (get_env("EP_DISABLE_GIN", 0) == 0) {
+        const auto available_gin_type = allow_hybrid_mode ? props.railedGinType : props.ginType;
         EP_HOST_ASSERT(
-            (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
+            available_gin_type != NCCL_GIN_TYPE_NONE and
             "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
             "such as `allow_hybrid_mode=0` (disable direct RDMA kernels) in multi-plane network.");
-        EP_HOST_ASSERT(
-            props.ginSupport[NCCL_GIN_TYPE_GDAKI] and
-            "NCCL GDAKI is unavailable for this communicator.");
+
+        // Prefer GDAKI when the communicator offers it; otherwise follow the backend NCCL
+        // selected (`NCCL_GIN_TYPE` or the platform default, e.g. EFA GDA on AWS).
+        // `EP_GIN_TYPE` forces a specific `ncclGinType_t` value.
+        auto gin_type = props.ginSupport[NCCL_GIN_TYPE_GDAKI] ? NCCL_GIN_TYPE_GDAKI : available_gin_type;
+        if (std::getenv("EP_GIN_TYPE") != nullptr)
+            gin_type = static_cast<ncclGinType_t>(get_env<int>("EP_GIN_TYPE"));
+        EP_HOST_ASSERT(gin_type > NCCL_GIN_TYPE_NONE and gin_type < NCCL_GIN_MAX_TYPES and props.ginSupport[gin_type] and
+                       "The requested NCCL GIN backend is unavailable for this communicator.");
+        if (get_env<int>("EP_BUFFER_DEBUG"))
+            printf("EP NCCL GIN backend type: %d\n", static_cast<int>(gin_type));
 
         gin_min_stride = props.ginMinStride;
-        reqs.ginType = NCCL_GIN_TYPE_GDAKI;
+        reqs.ginType = gin_type;
         reqs.ginContextCount = num_allocated_qps;
         reqs.ginExclusiveContexts = true;
         reqs.ginQueueDepth = qp_depth > 0 ? qp_depth : kDefaultQPDepth;
