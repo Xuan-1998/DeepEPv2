@@ -406,6 +406,7 @@ Set runtime variables before importing `deep_ep` and creating buffers. Flags use
 | `EP_DISABLE_GIN` | `0` | Skip Gin initialization for NVLink-only use. RDMA operations require Gin; this flag does not select another RDMA backend. |
 | `EP_GIN_TYPE` | Unset | Force the NCCL GIN backend by its `ncclGinType_t` value (for example `3` for GDAKI, `5` for EFA GDA). When unset, use GDAKI if the communicator supports it, otherwise use the backend NCCL selected for the communicator. |
 | `EP_GIN_PROXY_ENABLE` | `0` | Set to `1` to also compile the NCCL GIN proxy backend into the JIT kernels. GDAKI and EFA GDA are always compiled in. |
+| `EP_HYBRID_KERNEL` | `auto` | Select the hybrid (scale-out) dispatch/combine kernel pair: `ordered` is the default pair, `unordered` the pair for GIN backends without ordered delivery or strong/VA signals, and `auto` picks `ordered` on GDAKI and the CPU proxy and `unordered` on any other backend. Read once per process; direct mode is not affected (see [Hybrid kernel variants](#hybrid-kernel-variants)). |
 | `EP_NUM_MAX_LOCAL_RANKS` | `16` | Engram only: estimate registered storage for `NCCL_WIN_STRIDE` sizing in hybrid mode. This is a sizing estimate, not a rank-count limit. |
 
 **JIT compilation**
@@ -448,6 +449,15 @@ These flags affect `bench_kineto` in [deep_ep/utils/testing.py](deep_ep/utils/te
 | --- | --- | --- |
 | `EP_USE_NVIDIA_TOOLS` | `0` | Skip the internal profiler when using Nsight or Compute Sanitizer. Reported internal timings are placeholders while this is enabled. |
 | `EP_DISABLE_BARRIER_PROFILING` | `0` | Disable the barrier and delay inserted before each profiled iteration. |
+
+## Hybrid kernel variants
+
+The hybrid (scale-out) dispatch and combine kernels exist in two variants, selected per process through `EP_HYBRID_KERNEL`. Both share the scale-up path, the direct kernels, the Python API and the handle format, and the JIT cache keeps their kernels apart.
+
+- `ordered` (the default kernels): the sender publishes a tail through a trailing signal and the receiver assumes that all data written before the tail has landed. This needs a GIN backend with ordered delivery and [strong and VA signals](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/device_gin.html#signals-and-counters), which GDAKI and the CPU proxy provide.
+- `unordered`: the sender splits each channel's tokens into a few batched puts, each with an in-band header and a counting signal. The receiver treats the signal as a completion count and validates every batch through its header, so it makes no assumption about the order in which puts land. GIN contexts are shared across SMs and only counting (indexed) signals are requested. The default context count is 11, which gives 21 signals per context, and an explicit `num_allocated_qps` is clamped into [2, 17].
+
+With `EP_HYBRID_KERNEL=auto`, the unordered pair is used on every backend other than GDAKI and the CPU proxy. The variant interface lives in `csrc/kernels/ep/hybrid_kernel.hpp`, and the unordered pair in `csrc/kernels/ep/hybrid_unordered.hpp` and `deep_ep/include/deep_ep/impls/ep/unordered/`.
 
 ## Network configurations
 

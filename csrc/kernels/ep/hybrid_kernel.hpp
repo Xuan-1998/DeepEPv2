@@ -111,10 +111,11 @@ public:
 
     virtual const char* name() const = 0;
 
-    // GIN requirements of the device communicator. `num_allocated_qps` is the caller's
-    // request with 0 meaning automatic; the returned `context_count` is the resolved QP count.
+    // GIN requirements of the device communicator, resolved once before it is created.
+    // `num_allocated_qps` is the caller's request with 0 meaning automatic; the returned
+    // `context_count` is the resolved QP count.
     virtual comm::GinRequirements get_gin_requirements(const int& num_allocated_qps,
-                                                       const int& num_rdma_ranks) const = 0;
+                                                       const int& num_rdma_ranks) = 0;
 
     // Scale-out buffer bytes (the scale-up receive buffer is shared and sized by the caller)
     virtual int64_t get_dispatch_scaleout_buffer_size(const layout::TokenLayout& token_layout,
@@ -158,8 +159,6 @@ public:
 // Pick the variant for a communicator, or nullptr for the default kernels. Direct mode
 // (`allow_hybrid_mode == false`) never uses a variant.
 static std::shared_ptr<HybridKernelVariant> select_hybrid_kernel_variant(const int64_t& nccl_comm,
-                                                                         const bool& allow_hybrid_mode) {
-    return nullptr;
-}
+                                                                         const bool& allow_hybrid_mode);
 
 } // namespace deep_ep::ep

@@ -4,5 +4,6 @@
 
 #include "dispatch.hpp"
 #include "combine.hpp"
+#include "hybrid_unordered.hpp"
 #include "prefetch_weights.hpp"
 #include "reduce_grads.hpp"
