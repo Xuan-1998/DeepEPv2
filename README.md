@@ -54,7 +54,7 @@ DeepEP (DeepEveryParallel) is a high-performance communication library for machi
 - NVLink for intranode communication
 - RDMA network for internode communication
 
-Installation builds the host C++ extension against the CUDA and NCCL libraries. GPU kernels are compiled by DeepJIT for the current device at runtime, so installation does not require a visible GPU or `TORCH_CUDA_ARCH_LIST`. Keep the CUDA toolkit and host compiler available at runtime. Automatic bandwidth detection uses `nvidia-smi` and `ibstat`; `BucketBuffer` currently requires both NVLink and RDMA bandwidth to be detectable, even for a group using only one transport.
+Installation builds the host C++ extension against the CUDA and NCCL libraries. The host build also needs the elfutils development headers (`libdw-dev` on Debian and Ubuntu, `elfutils-devel` on RHEL-like systems) because DeepJIT's exception helper includes `<elfutils/libdwfl.h>`. GPU kernels are compiled by DeepJIT for the current device at runtime, so installation does not require a visible GPU or `TORCH_CUDA_ARCH_LIST`. Keep the CUDA toolkit and host compiler available at runtime. Automatic bandwidth detection uses `nvidia-smi` and the RDMA link rate from sysfs (`ibstat` as a fallback, see `EP_NIC_NAME`); `BucketBuffer` currently requires both NVLink and RDMA bandwidth to be detectable, even for a group using only one transport.
 
 ### Install NCCL dependency
 
@@ -406,6 +406,7 @@ Set runtime variables before importing `deep_ep` and creating buffers. Flags use
 | `EP_DISABLE_GIN` | `0` | Skip Gin initialization for NVLink-only use. RDMA operations require Gin; this flag does not select another RDMA backend. |
 | `EP_GIN_TYPE` | Unset | Force the NCCL GIN backend by its `ncclGinType_t` value (for example `3` for GDAKI, `5` for EFA GDA). When unset, use GDAKI if the communicator supports it, otherwise use the backend NCCL selected for the communicator. |
 | `EP_GIN_PROXY_ENABLE` | `0` | Set to `1` to also compile the NCCL GIN proxy backend into the JIT kernels. GDAKI and EFA GDA are always compiled in. |
+| `EP_NIC_NAME` | `mlx5_0` | The RDMA device whose link rate is read from `/sys/class/infiniband/<name>/ports/*/rate` (with `ibstat` as a fallback) for the analytical SM count. When unset and the default device is absent, the fastest device under `/sys/class/infiniband` is used, including EFA devices named `rdmap*`. |
 | `EP_HYBRID_KERNEL` | `auto` | Select the hybrid (scale-out) dispatch/combine kernel pair: `ordered` is the default pair, `unordered` the pair for GIN backends without ordered delivery or strong/VA signals, and `auto` picks `ordered` on GDAKI and the CPU proxy and `unordered` on any other backend. Read once per process; direct mode is not affected (see [Hybrid kernel variants](#hybrid-kernel-variants)). |
 | `EP_NUM_MAX_LOCAL_RANKS` | `16` | Engram only: estimate registered storage for `NCCL_WIN_STRIDE` sizing in hybrid mode. This is a sizing estimate, not a rank-count limit. |
 
@@ -458,6 +459,16 @@ The hybrid (scale-out) dispatch and combine kernels exist in two variants, selec
 - `unordered`: the sender splits each channel's tokens into a few batched puts, each with an in-band header and a counting signal. The receiver treats the signal as a completion count and validates every batch through its header, so it makes no assumption about the order in which puts land. GIN contexts are shared across SMs and only counting (indexed) signals are requested. The default context count is 11, which gives 21 signals per context, and an explicit `num_allocated_qps` is clamped into [2, 17].
 
 With `EP_HYBRID_KERNEL=auto`, the unordered pair is used on every backend other than GDAKI and the CPU proxy. The variant interface lives in `csrc/kernels/ep/hybrid_kernel.hpp`, and the unordered pair in `csrc/kernels/ep/hybrid_unordered.hpp` and `deep_ep/include/deep_ep/impls/ep/unordered/`.
+
+## Running on AWS EFA
+
+On EFA the traffic is carried by an NCCL GIN backend provided by the [aws-ofi-nccl](https://github.com/aws/aws-ofi-nccl) plugin. Two backends are available: EFA GDA, where the NIC work queues are mapped into GPU memory and the kernels post RDMA operations themselves, and the CPU proxy, where the GPU hands work descriptors to a proxy thread. Enabling them has its own requirements, see the plugin's [GIN getting started guide](https://github.com/aws/aws-ofi-nccl/blob/master/doc/gin-getting-started.md).
+
+With NCCL 2.32.3, the minimum for V2.5, EFA GDA negotiates device backend version 2 and needs an aws-ofi-nccl build that exports the GIN v14 plugin table. The aws-ofi-nccl 1.21.1 plugin shipped with EFA installer 1.50.0 exports only the v11 and v13 tables; NCCL then falls back to v13, which does not carry the backend version, so the device code and the plugin would disagree on the queue layout. Use a plugin built from `master` at or after the commit that adds backend version 2.
+
+Set `NCCL_GIN_TYPE=5` and `NCCL_SYM_GIN_KERNELS_ENABLE=0`. The communicator then offers no GDAKI backend, DeepEP selects EFA GDA for its device communicator (see `EP_GIN_TYPE`), and `EP_HYBRID_KERNEL=auto` picks the unordered hybrid kernels because EFA GDA provides neither ordered delivery nor strong/VA signals. The default hybrid kernels, the PP buffer and the bucket collectives request VA and strong signals, so their device communicator creation fails on EFA GDA. Engram uses GIN gets and has not been tested on EFA.
+
+A ready-to-run setup (install script, reference Dockerfile and Slurm launchers for intra-node and inter-node `test_ep.py` runs) is maintained in the awsome-distributed-ai repository: [DeepEP V2 Benchmark (NCCL GIN / EFA-GDA)](https://github.com/awslabs/awsome-distributed-ai/blob/main/micro-benchmarks/expert-parallelism/deepep-v2-benchmark/README.md).
 
 ## Network configurations
 
