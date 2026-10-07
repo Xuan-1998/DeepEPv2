@@ -54,7 +54,7 @@ DeepEP (DeepEveryParallel) is a high-performance communication library for machi
 - NVLink for intranode communication
 - RDMA network for internode communication
 
-Installation builds the host C++ extension against the CUDA and NCCL libraries. GPU kernels are compiled by DeepJIT for the current device at runtime, so installation does not require a visible GPU or `TORCH_CUDA_ARCH_LIST`. Keep the CUDA toolkit and host compiler available at runtime. Automatic bandwidth detection uses `nvidia-smi` and `ibstat`; `BucketBuffer` currently requires both NVLink and RDMA bandwidth to be detectable, even for a group using only one transport.
+Installation builds the host C++ extension against the CUDA and NCCL libraries. The host extension build also requires the elfutils development headers because DeepJIT's exception helper includes `<elfutils/libdwfl.h>`. Install `libdw-dev` on Debian or Ubuntu, or `elfutils-devel` on RHEL-like systems. The library is loaded at run time only when a backtrace is printed. GPU kernels are compiled by DeepJIT for the current device at runtime, so installation does not require a visible GPU or `TORCH_CUDA_ARCH_LIST`. Keep the CUDA toolkit and host compiler available at runtime. Automatic bandwidth detection uses `nvidia-smi` and `ibstat`; `BucketBuffer` currently requires both NVLink and RDMA bandwidth to be detectable, even for a group using only one transport.
 
 ### Install NCCL dependency
 
@@ -498,6 +498,8 @@ On EFA the traffic is carried by an NCCL GIN backend provided by the [aws-ofi-nc
 - **CPU proxy**. The GPU hands work descriptors to a CPU proxy thread that posts the RDMA operations.
 
 Enabling NCCL GIN backends on AWS has different requirements, see details in this [document](https://github.com/aws/aws-ofi-nccl/blob/master/doc/gin-getting-started.md).
+
+With NCCL 2.32.3, the minimum for V2.5, EFA GDA negotiates device backend version 2 and requires an aws-ofi-nccl build that exports the GIN v14 plugin table (`master` at or after "Add backendVersion 2 support"). The aws-ofi-nccl 1.21.1 plugin shipped with EFA installer 1.50.0 exports only the v11 and v13 tables. NCCL 2.32.3 falls back to v13, which does not carry the backend version, so the device code and the plugin would disagree on the queue layout. That combination is untested and should be avoided. Set `NCCL_GIN_TYPE=5` and `NCCL_SYM_GIN_KERNELS_ENABLE=0` as before, and DeepEP then selects EFA GDA for its device communicator because the communicator offers no GDAKI backend (see `EP_GIN_TYPE`). Keep `EP_HYBRID_KERNEL=unordered`, the default. The upstream ordered kernels, the PP buffer and the bucket collectives request VA and strong GIN signals that EFA GDA does not provide, so their device communicator creation fails on EFA. Engram uses GIN gets and has not been tested on EFA yet.
 
 ### Benchmarking on EFA
 
