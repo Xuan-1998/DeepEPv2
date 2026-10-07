@@ -37,6 +37,9 @@ class EPBuffer: public BufferBase {
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
 
+    // The hybrid kernel variant in use, or nullptr for the default kernels
+    std::shared_ptr<HybridKernelVariant> variant;
+
     // Some EP hybrid mode settings
     static constexpr int kNumMaxChannelsPerSM = 8;
     static constexpr int kNumMaxSMs = 160;
@@ -70,11 +73,22 @@ public:
         const auto num_workspace_bytes = math::align<int64_t>(
             layout::EPWorkspaceLayout::get_num_bytes(), kNumAllocationAlignmentBytes);
 
+        // A hybrid kernel variant resolves the QP count and the GIN requirements itself
+        variant = select_hybrid_kernel_variant(nccl_comm, allow_hybrid_mode);
+        std::optional<comm::GinRequirements> gin_requirements;
+        int num_resolved_qps = num_allocated_qps;
+        if (variant != nullptr) {
+            const auto [num_rdma_ranks, num_nvl_ranks] = comm::get_physical_domain_size(nccl_comm);
+            gin_requirements = variant->get_gin_requirements(num_allocated_qps, num_rdma_ranks);
+            num_resolved_qps = gin_requirements->context_count;
+        }
+
         context = std::make_shared<comm::Context>(
             nccl_comm, symmetric::shared_comm_t{}, num_ranks, rank_idx,
             num_workspace_bytes, num_buffer_bytes + num_lb_buffer_bytes, 0, true,
-            allow_hybrid_mode, sl_idx, num_allocated_qps,
-            0, num_cpu_timeout_secs, num_gpu_timeout_secs);
+            allow_hybrid_mode, sl_idx, num_resolved_qps,
+            0, num_cpu_timeout_secs, num_gpu_timeout_secs,
+            false, nullptr, gin_requirements);
         main_context = context;
         auto& workspace = *static_cast<layout::EPSignals*>(context->workspace);
         context->set_barrier_signals(&workspace.barrier_signals);
@@ -184,7 +198,8 @@ public:
                                             const int& hidden, const int& num_sf_packs, const int& num_topk,
                                             const int& elem_size,
                                             const int& num_scaleout_ranks, const int& num_scaleup_ranks,
-                                            const bool& is_scaleup_nvlink) {
+                                            const bool& is_scaleup_nvlink,
+                                            const HybridKernelVariant* variant = nullptr) {
         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
         const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
 
@@ -199,6 +214,9 @@ public:
             // Hybrid dispatch
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_scaleup_ranks, num_scaleout_ranks * num_max_tokens_per_rank);
+            if (variant != nullptr)
+                return scaleup_recv_buffer.get_num_bytes() + variant->get_dispatch_scaleout_buffer_size(
+                    token_layout, num_max_tokens_per_rank, num_scaleout_ranks, kNumMaxChannels);
             const auto scaleout_send_buffer = layout::BufferLayout<false>(
                 token_layout, 1, num_max_tokens_per_rank);
             const auto scaleout_recv_buffer = layout::BufferLayout<false>(
@@ -213,7 +231,8 @@ public:
     static int64_t get_combine_buffer_size(const int& num_max_tokens_per_rank, const int& hidden, const int& num_topk,
                                            const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                                            const bool& is_scaleup_nvlink,
-                                           const bool& allow_multiple_reduction) {
+                                           const bool& allow_multiple_reduction,
+                                           const HybridKernelVariant* variant = nullptr) {
         const auto num_ranks = num_scaleup_ranks * num_scaleout_ranks;
         const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
 
@@ -234,6 +253,9 @@ public:
             const int num_tokens_in_scaleout_layout = allow_multiple_reduction ? std::min(num_scaleout_ranks, num_topk) : num_topk;
             const auto scaleup_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_scaleup_layout, num_scaleout_ranks * num_max_tokens_per_rank);
+            if (variant != nullptr)
+                return scaleup_recv_buffer.get_num_bytes() + variant->get_combine_scaleout_buffer_size(
+                    token_layout, num_max_tokens_per_rank, num_topk, num_scaleout_ranks, kNumMaxChannels, allow_multiple_reduction);
             const auto scaleout_recv_buffer = layout::BufferLayout<false>(
                 token_layout, num_tokens_in_scaleout_layout, num_max_tokens_per_rank);
             const auto scaleout_send_buffer = layout::BufferLayout<false>(
@@ -265,18 +287,19 @@ public:
         const auto is_scaleup_nvlink = num_scaleup_ranks == num_nvl_ranks;
 
         // Dispatch size
+        const auto variant = select_hybrid_kernel_variant(nccl_comm, allow_hybrid_mode);
         const auto elem_size = use_fp8_dispatch ? sizeof(__nv_fp8_e4m3) : sizeof(nv_bfloat16);
         const auto num_sf_packs = use_fp8_dispatch ? math::ceil_div(hidden, 32) : 0; // An approximation for number of SF packs
         const auto num_dispatch_bytes = get_dispatch_buffer_size(
             num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
             num_scaleout_ranks, num_scaleup_ranks,
-            is_scaleup_nvlink);
+            is_scaleup_nvlink, variant.get());
 
         // Combine layout
         const auto num_combine_bytes = get_combine_buffer_size(
             num_max_tokens_per_rank, hidden, num_topk,
             num_scaleout_ranks, num_scaleup_ranks,
-            is_scaleup_nvlink, allow_multiple_reduction);
+            is_scaleup_nvlink, allow_multiple_reduction, variant.get());
 
         // Return the maximum of those layouts, aligned to 2 MB
         return math::align<int64_t>(std::max(num_dispatch_bytes, num_combine_bytes), kNumAllocationAlignmentBytes);
@@ -298,6 +321,7 @@ public:
              const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
              const std::optional<torch::Tensor>& cached_recv_src_metadata,
              const std::optional<torch::Tensor>& cached_channel_linked_list,
+             const std::optional<torch::Tensor>& cached_hybrid_kernel_handle,
              const int& num_max_tokens_per_rank,
              const int& num_experts, const int& expert_alignment,
              const int& num_sms, const int& num_qps,
@@ -450,6 +474,11 @@ public:
                 /* 2 kinds of warps */ num_channels_per_sm / 2, kNumMaxChannelsPerSM);
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            if (variant != nullptr)
+                num_channels_per_sm = variant->get_num_channels_per_sm(
+                    num_channels_per_sm, num_sms, num_qps, num_smem_bytes,
+                    get_num_notify_smem_bytes(context->num_ranks, num_experts),
+                    dispatch_token_layout, combine_token_layout, prefer_overlap_with_compute);
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))
                 printf("Elastic buffer uses %d channels per SM\n", num_channels_per_sm);
@@ -471,8 +500,8 @@ public:
         }
 
         // Hybrid mode handles
-        std::optional<torch::Tensor> token_metadata_at_forward, channel_linked_list;
-        int *token_metadata_at_forward_ptr = nullptr, *channel_linked_list_ptr = nullptr;
+        std::optional<torch::Tensor> token_metadata_at_forward, channel_linked_list, hybrid_kernel_handle;
+        int *token_metadata_at_forward_ptr = nullptr, *channel_linked_list_ptr = nullptr, *hybrid_kernel_handle_ptr = nullptr;
         if (context->num_scaleout_ranks > 1) {
             // The token destination slot idx during forward
             // `[i, j, k, l]` means: from channel i from scale-out peer k, the j-th token's index in the l-th rank buffer
@@ -538,13 +567,24 @@ public:
                 );
             }
             channel_linked_list_ptr = channel_linked_list->data_ptr<int>();
+
+            // The variant's own per-dispatch handle
+            if (variant != nullptr and variant->has_dispatch_handle()) {
+                if (cached_mode) {
+                    hybrid_kernel_handle = cached_hybrid_kernel_handle;
+                    variant->check_dispatch_handle(hybrid_kernel_handle.value(), num_max_tokens_per_rank, num_topk);
+                } else {
+                    hybrid_kernel_handle = variant->make_dispatch_handle(num_max_tokens_per_rank, num_topk);
+                }
+                hybrid_kernel_handle_ptr = hybrid_kernel_handle->data_ptr<int>();
+            }
         }
 
         // Check buffer size
         EP_HOST_ASSERT(get_dispatch_buffer_size(
                        num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
                        context->num_scaleout_ranks, context->num_scaleup_ranks,
-                       context->is_scaleup_nvlink) <= num_buffer_bytes);
+                       context->is_scaleup_nvlink, variant.get()) <= num_buffer_bytes);
 
         // Ready and clean host workspace for this round
         const auto host_workspace_layout = layout::EPWorkspaceLayout(
@@ -579,7 +619,8 @@ public:
                         num_smem_bytes,
                         num_qps, context->num_gpu_timeout_cycles,
                         cached_mode, do_cpu_sync,
-                        comm_stream);
+                        comm_stream,
+                        variant.get(), {hybrid_kernel_handle_ptr, do_expand, allow_multiple_reduction, prefer_overlap_with_compute});
 
         // For tensor recording
         tensor_list_t tensors_to_record = {
@@ -590,7 +631,8 @@ public:
             num_unaligned_recv_tokens_per_expert,
             dst_buffer_slot_idx,
             token_metadata_at_forward,
-            channel_linked_list};
+            channel_linked_list,
+            hybrid_kernel_handle};
 
         // Epilogue can be deferred, so it is a lambda
         auto epilogue = [=, this](const at::cuda::CUDAStream& stream,
@@ -753,7 +795,8 @@ public:
                 recv_src_metadata,
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
-                channel_linked_list);
+                channel_linked_list,
+                hybrid_kernel_handle);
 
             // For non-deferring tensor recording
             if (tensors_to_record_opt.has_value()) {
@@ -796,6 +839,7 @@ public:
             const torch::Tensor& psum_num_recv_tokens_per_scaleup_rank,
             const std::optional<torch::Tensor>& token_metadata_at_forward,
             const std::optional<torch::Tensor>& channel_linked_list,
+            const std::optional<torch::Tensor>& hybrid_kernel_handle,
             const int& num_experts,
             const int& num_max_tokens_per_rank,
             const int& num_sms, const int& num_qps,
@@ -865,12 +909,14 @@ public:
         // Check buffer size
         EP_HOST_ASSERT(get_combine_buffer_size(num_max_tokens_per_rank, hidden, num_topk,
                                                context->num_scaleout_ranks, context->num_scaleup_ranks,
-                                               context->is_scaleup_nvlink, allow_multiple_reduction) <= num_buffer_bytes);
+                                               context->is_scaleup_nvlink, allow_multiple_reduction,
+                                               variant.get()) <= num_buffer_bytes);
 
         // Optional configs and metadata for hybrid combine
         int num_channels = 1;
         int* token_metadata_at_forward_ptr = nullptr;
         int* channel_linked_list_ptr = nullptr;
+        int* hybrid_kernel_handle_ptr = nullptr;
         if (context->num_scaleout_ranks > 1) {
             // The token metadata during forward
             const auto [num_channels_, d1, d2] = get_shape<3>(token_metadata_at_forward.value());
@@ -890,6 +936,12 @@ public:
             EP_HOST_ASSERT(d2_ == context->num_scaleup_ranks);
             EP_HOST_ASSERT(channel_linked_list->is_cuda() and channel_linked_list->is_contiguous());
             EP_HOST_ASSERT(channel_linked_list->scalar_type() == torch::kInt);
+
+            // The variant's own per-dispatch handle
+            if (variant != nullptr and variant->has_dispatch_handle()) {
+                variant->check_dispatch_handle(hybrid_kernel_handle.value(), num_max_tokens_per_rank, num_topk);
+                hybrid_kernel_handle_ptr = hybrid_kernel_handle->data_ptr<int>();
+            }
         }
 
         // Push data into remote buffers
@@ -912,14 +964,16 @@ public:
             num_sms, jit->device.get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
-            comm_stream);
+            comm_stream,
+            variant.get(), {hybrid_kernel_handle_ptr, num_combined_tokens});
 
         // For tensor recording
         tensor_list_t tensors_to_record = {
             x, topk_weights, bias_0, bias_1,
             src_metadata, combined_topk_idx,
             psum_num_recv_tokens_per_scaleup_rank,
-            token_metadata_at_forward, channel_linked_list};
+            token_metadata_at_forward, channel_linked_list,
+            hybrid_kernel_handle};
 
         // Epilogue can be deferred, so it is a lambda
         auto epilogue = [=, this](const at::cuda::CUDAStream& stream,
@@ -953,7 +1007,8 @@ public:
                                            jit->device.get_num_sms(),
                                            jit->device.get_num_smem_bytes(),
                                            use_expanded_layout, allow_multiple_reduction,
-                                           stream);
+                                           stream,
+                                           variant.get(), {hybrid_kernel_handle_ptr, num_channels});
 
             if (tensors_to_record_opt.has_value()) {
                 auto& tensors = tensors_to_record_opt->get();
@@ -1091,6 +1146,10 @@ static void register_apis(pybind11::module_& m) {
         .def("lb_prefetch_weights", &EPBuffer::lb_prefetch_weights)
         .def("lb_reduce_grads", &EPBuffer::lb_reduce_grads);
     m.def("calculate_ep_buffer_size", &EPBuffer::calculate_buffer_size);
+    m.def("get_ep_hybrid_kernel_name", [](const int64_t& nccl_comm, const bool& allow_hybrid_mode) {
+        const auto variant = select_hybrid_kernel_variant(nccl_comm, allow_hybrid_mode);
+        return std::string(variant != nullptr ? variant->name() : "");
+    });
     m.def("get_ep_buffer_alignment", [=]() {
         return kNumAllocationAlignmentBytes;
     });

@@ -108,7 +108,8 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
                  const std::optional<int>& sl_idx, const int& num_allocated_qps, const int& qp_depth,
                  const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
                  const bool& enable_lsa_multimem,
-                 const std::shared_ptr<Context>& main_context):
+                 const std::shared_ptr<Context>& main_context,
+                 const std::optional<GinRequirements>& gin_requirements):
     rank_idx(rank_idx), num_ranks(num_ranks),
     gin_min_stride(1),
     num_allocated_qps(num_allocated_qps),
@@ -160,6 +161,14 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
 
         // Customized RDMA barrier needs extra signals
         reqs.ginSignalCount = num_ranks + 2 * 2;
+
+        if (gin_requirements.has_value()) {
+            EP_HOST_ASSERT(gin_requirements->context_count == num_allocated_qps);
+            reqs.ginSignalCount = gin_requirements->signal_count;
+            reqs.ginExclusiveContexts = gin_requirements->exclusive_contexts;
+            reqs.ginStrongSignalsRequired = gin_requirements->strong_signals_required;
+            reqs.ginVaSignalsRequired = gin_requirements->va_signals_required;
+        }
         if (allow_hybrid_mode and num_rdma_storage_bytes > 0) {
             reqs.ginCustomStride = gin_min_stride;
             reqs.ginConnectionType = NCCL_GIN_CONNECTION_CUSTOM_STRIDE;

@@ -31,6 +31,15 @@ std::tuple<int, int> get_gin_min_stride(const int64_t& nccl_comm);
 // The GIN backend the device communicator of `nccl_comm` will use
 ncclGinType_t get_gin_type(const int64_t& nccl_comm, const bool& allow_hybrid_mode);
 
+// GIN fields of the device communicator requirements that a kernel variant may override
+struct GinRequirements {
+    int context_count;
+    int signal_count;
+    bool exclusive_contexts;
+    bool strong_signals_required;
+    bool va_signals_required;
+};
+
 class Context {
     void* raw_window_ptr;
     std::shared_ptr<symmetric::SymmetricMemory> symmetric_memory;
@@ -75,7 +84,8 @@ public:
             const std::optional<int>& sl_idx, const int& num_allocated_qps, const int& qp_depth,
             const int& num_cpu_timeout_secs, const int& num_gpu_timeout_secs,
             const bool& enable_lsa_multimem = false,
-            const std::shared_ptr<Context>& main_context = nullptr);
+            const std::shared_ptr<Context>& main_context = nullptr,
+            const std::optional<GinRequirements>& gin_requirements = std::nullopt);
 
     std::tuple<int, int> get_physical_domain_size() const;
 

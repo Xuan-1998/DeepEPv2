@@ -13,6 +13,7 @@
 #include <deep_ep/layout/ep/token.cuh>
 
 #include "../../runtime/jit.hpp"
+#include "hybrid_kernel.hpp"
 
 namespace deep_ep::ep {
 
@@ -39,7 +40,30 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
-                            const at::cuda::CUDAStream& stream) {
+                            const at::cuda::CUDAStream& stream,
+                            const HybridKernelVariant* variant = nullptr,
+                            const HybridCombineExtras& extras = {}) {
+    // Hybrid kernel variants own the whole scale-out launch
+    if (variant != nullptr) {
+        EP_HOST_ASSERT(num_scaleout_ranks > 1);
+        return variant->launch_combine({
+            .x = x, .topk_weights = topk_weights,
+            .src_metadata = src_metadata,
+            .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
+            .token_metadata_at_forward = token_metadata_at_forward,
+            .channel_linked_list = channel_linked_list,
+            .nccl_dev_comm = nccl_dev_comm, .nccl_window = nccl_window,
+            .buffer = buffer, .workspace = workspace,
+            .num_reduced_tokens = num_reduced_tokens, .num_max_tokens_per_rank = num_max_tokens_per_rank,
+            .hidden = hidden, .num_experts = num_experts, .num_topk = num_topk,
+            .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+            .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
+            .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+            .num_sms = num_sms, .num_smem_bytes = num_smem_bytes, .num_channels = num_channels,
+            .use_expanded_layout = use_expanded_layout, .allow_multiple_reduction = allow_multiple_reduction,
+        }, extras, stream);
+    }
+
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
     auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
@@ -157,7 +181,25 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                            const int& num_sms, const int& num_smem_bytes,
                                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
-                                           const at::cuda::CUDAStream& stream) {
+                                           const at::cuda::CUDAStream& stream,
+                                           const HybridKernelVariant* variant = nullptr,
+                                           const HybridCombineReduceEpilogueExtras& extras = {}) {
+    // Hybrid kernel variants lay out their received partials differently
+    if (variant != nullptr) {
+        EP_HOST_ASSERT(num_scaleout_ranks > 1);
+        return variant->launch_combine_reduce_epilogue({
+            .combined_x = combined_x, .combined_topk_weights = combined_topk_weights, .combined_topk_idx = combined_topk_idx,
+            .num_combined_tokens = num_combined_tokens, .num_max_tokens_per_rank = num_max_tokens_per_rank,
+            .hidden = hidden, .num_experts = num_experts, .num_topk = num_topk,
+            .reduce_buffer = reduce_buffer,
+            .bias_0 = bias_0, .bias_1 = bias_1,
+            .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
+            .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+            .num_sms = num_sms, .num_smem_bytes = num_smem_bytes,
+            .use_expanded_layout = use_expanded_layout, .allow_multiple_reduction = allow_multiple_reduction,
+        }, extras, stream);
+    }
+
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
     const auto token_layout = layout::TokenLayout(hidden * sizeof(nv_bfloat16), 0, 0, false);

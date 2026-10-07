@@ -14,6 +14,7 @@
 #include <deep_ep/layout/ep/token.cuh>
 
 #include "../../runtime/jit.hpp"
+#include "hybrid_kernel.hpp"
 
 namespace deep_ep::ep {
 
@@ -51,10 +52,37 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
                             const bool& do_cpu_sync,
-                            const at::cuda::CUDAStream& stream) {
+                            const at::cuda::CUDAStream& stream,
+                            const HybridKernelVariant* variant = nullptr,
+                            const HybridDispatchExtras& extras = {}) {
     // Cached mode does not support expert token counting
     if (cached_mode)
         EP_HOST_ASSERT(cumulative_local_expert_recv_stats == nullptr);
+
+    // Hybrid kernel variants own the whole scale-out launch
+    if (variant != nullptr) {
+        EP_HOST_ASSERT(num_scaleout_ranks > 1);
+        return variant->launch_dispatch({
+            .x = x, .sf = sf, .topk_idx = topk_idx, .topk_weights = topk_weights,
+            .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats,
+            .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
+            .psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert,
+            .num_unaligned_recv_tokens_per_expert = num_unaligned_recv_tokens_per_expert,
+            .dst_buffer_slot_idx = dst_buffer_slot_idx,
+            .token_metadata_at_forward = token_metadata_at_forward,
+            .num_tokens = num_tokens, .num_max_tokens_per_rank = num_max_tokens_per_rank,
+            .hidden = hidden, .elem_size = elem_size,
+            .num_sf_packs = num_sf_packs, .sf_token_stride = sf_token_stride, .sf_hidden_stride = sf_hidden_stride,
+            .num_experts = num_experts, .num_topk = num_topk, .expert_alignment = expert_alignment,
+            .nccl_dev_comm = nccl_dev_comm, .nccl_window = nccl_window,
+            .buffer = buffer, .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
+            .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+            .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
+            .num_sms = num_sms, .num_channels_per_sm = num_channels_per_sm, .num_smem_bytes = num_smem_bytes,
+            .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+            .cached_mode = cached_mode, .do_cpu_sync = do_cpu_sync,
+        }, extras, stream);
+    }
 
     // Utils
     const auto num_ranks = num_scaleout_ranks * num_scaleup_ranks;
