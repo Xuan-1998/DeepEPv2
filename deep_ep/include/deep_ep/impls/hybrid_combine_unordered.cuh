@@ -21,13 +21,35 @@
 
 namespace deep_ep::elastic {
 
+// Small batch: tokens per scale-out put batch. The receiver derives its expected signal count
+// from the same constant. Small batches let the puts start while the forwarders are still
+// reducing; each put costs the proxy warp about 12 us, so 2 is the measured optimum at 128
+// tokens (1 floods the proxies, 12 posts everything at the end).
+#ifndef EP_SB_BATCH_SIZE
+#define EP_SB_BATCH_SIZE 2
+#endif
+#ifndef EP_SB_PROBE_EVERY
+#define EP_SB_PROBE_EVERY 64
+#endif
+#ifdef EP_SB_PROBE
+// Small-batch combine timeline probes (raw %globaltimer ns, per block), printed by SM 0 for
+// two of every EP_SB_PROBE_EVERY iterations. Slots: 0 entry | 1 max scale-up warps done |
+// 2 max first tail wait satisfied (forwarders) | 3 max last reduce handed to proxy | 4 max
+// proxy put issued | 5 max inbound signal wait satisfied | 6 max proxy warp exit | 7 max tokens
+// per scale-up warp | 8 earliest put (inverted) | 9 puts | 10 sum put issue ns | 11 sum pending
+// per put | 14 max forward warp exit
+__device__ unsigned long long sbc_probe[128][16];
+#endif
+
 // Small-batch mode (`kSmallBatch`): the decode-sized variant, paired with the small-batch
 // dispatch. No entry barrier: the host alternates the combine buffer between two parity
 // halves per combine call (independent of the dispatch halves) and the per-channel scale-up
 // tails and inbound signals are parity-indexed, so a peer one call ahead cannot collide with
-// this rank's consumption or resets. The proxy warp issues the SM's puts in one convergent
-// sweep once every forward warp has handed over its (single) batch, so the lanes of a QP
-// coalesce into one GIN post. The HT variant (`kSmallBatch == false`) is unchanged.
+// this rank's consumption or resets. Each channel runs several scale-up warps (the peers are
+// split between them, see `kNumScaleupWarpsPerChannel`) because one warp pushes about 14 KB
+// per 3 us over NVLink, and one proxy warp per channel that posts the channel's scale-out
+// batches (`EP_SB_BATCH_SIZE` tokens) as soon as they are handed over, so the RDMA overlaps
+// the reduce phase. The HT variant (`kSmallBatch == false`) is unchanged.
 template <bool kSmallBatch, int kNumGinSignals,
           bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
@@ -38,8 +60,8 @@ template <bool kSmallBatch, int kNumGinSignals,
           int kNumExperts, int kNumTopk,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
-          int kNumScaleupUpdateInterval = 3,
-          int kBatchSize = 12,
+          int kNumScaleupUpdateInterval = kSmallBatch ? 1 : 3,
+          int kBatchSize = kSmallBatch ? EP_SB_BATCH_SIZE : 12,
           int kProxyRingDepth = kProxyRingDepthDefault,
           int kNumChannelsPerSM = kNumForwardWarps,
           int kNumChannels = kNumChannelsPerSM * kNumSMs,
@@ -47,7 +69,10 @@ template <bool kSmallBatch, int kNumGinSignals,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumDataWarps = kNumScaleupWarps + kNumForwardWarps,
           int kProxyWarpIdx = kNumDataWarps,
-          int kNumWarps = kNumDataWarps + 1,
+          // Small batch: one proxy warp per channel, so the puts of a channel are posted while
+          // the others are still reducing (one post takes about 12 us)
+          int kNumProxyWarps = kSmallBatch ? kNumForwardWarps : 1,
+          int kNumWarps = kNumDataWarps + kNumProxyWarps,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           bool kUseScaleoutRankLayout = use_rank_layout<kAllowMultipleReduction, kNumScaleoutRanks, kNumTopk>(),
@@ -126,12 +151,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         *proxy_ring_layout.get_tail(f) = 0;
         *proxy_ring_layout.get_done(f) = 0;
     }
+#ifdef EP_SB_PROBE
+    if (thread_idx == 0) {
+        #pragma unroll
+        for (int q = 1; q < 16; ++ q)
+            sbc_probe[sm_idx][q] = 0ull;
+        sbc_probe[sm_idx][0] = ptx::globaltimer();
+    }
+#endif
     __syncthreads();
 
     // All the buffer layouts
-    auto scaleup_buffer = layout::BufferLayout<false>(
+    const auto scaleup_buffer_root = layout::BufferLayout<false>(
         token_layout, kNumTokensInScaleupLayout, kNumScaleoutRanks * kNumMaxTokensPerRank,
         buffer);
+    auto scaleup_buffer = scaleup_buffer_root;
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         token_layout, kNumScaleoutRanks,
         kNumChannels * (kNumMaxTokensPerChannel * (kAllowMultipleReduction ? 1 : kNumTopk)),
@@ -152,7 +186,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // For data warp, each warp is a channel, for proxy warp each lane is a channel.
     const auto gin_channel_in_sm = warp_idx < kNumDataWarps ?
         (warp_idx % kNumChannelsPerSM) :
-        (lane_idx < kNumForwardWarps ? lane_idx : 0);
+        (kSmallBatch ? (warp_idx - kNumDataWarps) : (lane_idx < kNumForwardWarps ? lane_idx : 0));
     const auto [qp_idx, sharing_mode] =
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
@@ -170,23 +204,26 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
     // Adjust register count at certain cases
     // TODO: support more cases, or try to make channel count more aligned
-    const bool kAdjustRegisters = (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8) and not kUseExpandedLayout;
+    // The register moves are per warpgroup, so both roles must fill whole warpgroups
+    const bool kAdjustRegisters = (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8) and
+                                  kNumScaleupWarps % 4 == 0 and not kUseExpandedLayout;
     constexpr int kNumRegistersForScaleupWarps = 40;
     constexpr int kNumRegistersForWarpPair = (kNumChannelsPerSM == 8) ? 192 : 256;
     constexpr int kNumRegistersForForwardWarps =
         kNumRegistersForWarpPair - kNumRegistersForScaleupWarps;
 
-    // Different warp roles
-    if (warp_idx < kNumScaleupWarps) {
-        const auto channel_idx = sm_idx * kNumChannelsPerSM + warp_idx;
-
-        // Adjust registers
-        if constexpr (kAdjustRegisters)
-            ptx::warpgroup_reg_dealloc<kNumRegistersForScaleupWarps>();
-
+    // Scale-up send: push this channel's expert outputs (partials) to the scale-up peers in
+    // `dst_mask` over NVLink, run by the scale-up warp of each channel
+    EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up ranks for 64-bit mask");
+    using scaleup_mask_t = std::conditional_t<(kNumScaleupRanks <= 32), uint32_t, uint64_t>;
+    const auto send_partials = [&](const int& channel_idx, const scaleup_mask_t& dst_mask) {
         // Shift into the right buffer if using rank layout
-        if constexpr (kUseScaleupRankLayout)
-            scaleup_buffer = scaleup_buffer.get_rank_buffer(scaleup_rank_idx);
+        auto scaleup_buffer = [&]() {
+            if constexpr (kUseScaleupRankLayout)
+                return scaleup_buffer_root.get_rank_buffer(scaleup_rank_idx);
+            else
+                return scaleup_buffer_root;
+        }();
 
         // Expanding send mode must not be backward
         if constexpr (kDoExpandedSend)
@@ -228,15 +265,28 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
             stored_token_idx[i] = -1;
+        constexpr int kMetadataStride = 2 + kNumTopk;
+        int prefetched_src_global_token_idx[kNumScaleupRanksPerLane] = {};
+        int prefetched_src_metadata_1[kNumScaleupRanksPerLane] = {};
         while (true) {
             // Load token indices in the list
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
                 const auto j = i * 32 + lane_idx;
-                stored_token_idx[i] = i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks ?
+                const bool owned = (i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks) and
+                                   ((dst_mask >> (j % kNumScaleupRanks)) & 1);
+                stored_token_idx[i] = owned ?
                     __ldg(channel_linked_list +
                           channel_idx * (kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumScaleupRanks +
                           stored_ll_idx[i] * kNumScaleupRanks + j) : -1;
+                // Small batch: fetch this step's source metadata lane-parallel, one latency for
+                // all peers instead of one per token inside the loop below
+                if constexpr (kSmallBatch) {
+                    prefetched_src_global_token_idx[i] = stored_token_idx[i] >= 0 ?
+                        __ldg(src_metadata + stored_token_idx[i] * kMetadataStride + 0) : -1;
+                    prefetched_src_metadata_1[i] = stored_token_idx[i] >= 0 ?
+                        __ldg(src_metadata + stored_token_idx[i] * kMetadataStride + 1) : -1;
+                }
             }
             __syncwarp();
 
@@ -249,8 +299,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 break;
 
             // Process tokens for all ranks together using bitmask to skip inactive ranks
-            EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up ranks for 64-bit mask");
-            using mask_t = std::conditional_t<(kNumScaleupRanks <= 32), uint32_t, uint64_t>;
+            using mask_t = scaleup_mask_t;
             mask_t wip_mask = 0;
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
@@ -262,26 +311,34 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 dst_scaleup_rank_idx = hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(wip_mask);
                 wip_mask ^= static_cast<mask_t>(1) << dst_scaleup_rank_idx;
 
-                // Exchange token index from the owning lane using static partition iteration
-                int token_idx = -1;
+                // Exchange token index (and prefetched metadata) from the owning lane using static partition iteration
+                int token_idx = -1, pf_src_global_token_idx = -1, pf_src_metadata_1 = -1;
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                     const auto src_lane_idx = dst_scaleup_rank_idx - j * 32;
                     token_idx = src_lane_idx == lane_idx ? stored_token_idx[j] : token_idx;
+                    if constexpr (kSmallBatch) {
+                        pf_src_global_token_idx = src_lane_idx == lane_idx ? prefetched_src_global_token_idx[j] : pf_src_global_token_idx;
+                        pf_src_metadata_1 = src_lane_idx == lane_idx ? prefetched_src_metadata_1[j] : pf_src_metadata_1;
+                    }
                 }
                 token_idx = ptx::exchange(token_idx, dst_scaleup_rank_idx % 32);
 
                 // Get source metadata and decide the destination buffer
-                constexpr int kMetadataStride = 2 + kNumTopk;
-                const auto src_global_token_idx = __ldg(src_metadata + token_idx * kMetadataStride + 0);
+                const auto src_global_token_idx = kSmallBatch ?
+                    ptx::exchange(pf_src_global_token_idx, dst_scaleup_rank_idx % 32) :
+                    __ldg(src_metadata + token_idx * kMetadataStride + 0);
+                const auto src_metadata_1 = kSmallBatch ?
+                    ptx::exchange(pf_src_metadata_1, dst_scaleup_rank_idx % 32) :
+                    __ldg(src_metadata + token_idx * kMetadataStride + 1);
                 const auto src_token_idx = src_global_token_idx % kNumMaxTokensPerRank;
                 const auto src_scaleout_rank_idx = src_global_token_idx / (kNumMaxTokensPerRank * kNumScaleupRanks);
                 auto token_buffer = [&]() {
                     if constexpr (kUseScaleupRankLayout) {
-                        const auto src_slot_idx = __ldg(src_metadata + token_idx * kMetadataStride + 1) / kNumTopk;
+                        const auto src_slot_idx = src_metadata_1 / kNumTopk;
                         return scaleup_buffer.get_token_buffer(src_slot_idx);
                     } else {
-                        const auto master_topk_idx = __ldg(src_metadata + token_idx * kMetadataStride + 1) % kNumTopk;
+                        const auto master_topk_idx = src_metadata_1 % kNumTopk;
                         return scaleup_buffer
                             .get_rank_buffer(master_topk_idx)
                             .get_token_buffer(src_scaleout_rank_idx * kNumMaxTokensPerRank + src_token_idx);
@@ -315,7 +372,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if (ptx::elect_one_sync()) {
                         const auto load_ptr =
                             math::advance_ptr(x, static_cast<int64_t>(token_idx_in_tensor) * kNumHiddenBytes);
-                        ptx::tma_store_wait();
+                        // Reusing the staging buffer only needs the previous store to have read it
+                        if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
                         ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
                     }
                     __syncwarp();
@@ -339,7 +397,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                                 x, slot_idx * static_cast<int64_t>(kNumHiddenBytes));
                         },
                         /* Wait buffer release */ [=]() {
-                            ptx::tma_store_wait();
+                            if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
                             __syncwarp();
                         }
                     );
@@ -356,7 +414,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         if (ptx::elect_one_sync()) {
                             // Load
                             const auto load_ptr = math::advance_ptr(x, static_cast<int64_t>(kDoExpandedSend ? topk_slot_idx : token_idx) * kNumHiddenBytes);
-                            ptx::tma_store_wait();
+                            if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
                             ptx::tma_load_1d(tma_buffer.get_base_ptr(), load_ptr, mbarrier_ptr, kNumHiddenBytes);
                             ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, kNumHiddenBytes);
                             ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
@@ -422,6 +480,45 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Update for the unissued ones
         update_tails(true);
+#ifdef EP_SB_PROBE
+        {
+            int sent = 0;
+            #pragma unroll
+            for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
+                sent += stored_num_tokens_sent[j];
+            sent = ptx::reduce_add(sent);
+            if (lane_idx == 0) {
+                atomicMax(&sbc_probe[sm_idx][1], ptx::globaltimer());
+                atomicMax(&sbc_probe[sm_idx][7], static_cast<unsigned long long>(sent));
+            }
+        }
+#endif
+    };
+
+    // Scale-up warps per channel: one normally; the small batch may run several, each sending
+    // to the peers `p` with `p % kNumScaleupWarpsPerChannel == subset`. One warp moves about
+    // 14 KB per 3 us (one bulk store to a peer at a time), so at decode sizes the send phase is
+    // bounded by the longest per-warp chain and splitting a channel's peers over warps shortens it.
+    EP_STATIC_ASSERT(kNumScaleupWarps % kNumChannelsPerSM == 0, "Scale-up warps must be a multiple of the channels");
+    constexpr int kNumScaleupWarpsPerChannel = kNumScaleupWarps / kNumChannelsPerSM;
+    EP_STATIC_ASSERT(kSmallBatch or kNumScaleupWarpsPerChannel == 1, "Only the small batch runs several scale-up warps per channel");
+    const auto scaleup_subset_mask = [&](const int& subset) {
+        scaleup_mask_t mask = 0;
+        #pragma unroll
+        for (int p = 0; p < kNumScaleupRanks; ++ p)
+            mask |= static_cast<scaleup_mask_t>(p % kNumScaleupWarpsPerChannel == subset) << p;
+        return mask;
+    };
+
+    // Different warp roles
+    if (warp_idx < kNumScaleupWarps) {
+        const auto channel_idx = sm_idx * kNumChannelsPerSM + warp_idx % kNumChannelsPerSM;
+
+        // Adjust registers
+        if constexpr (kAdjustRegisters)
+            ptx::warpgroup_reg_dealloc<kNumRegistersForScaleupWarps>();
+
+        send_partials(channel_idx, scaleup_subset_mask(warp_idx / kNumChannelsPerSM));
     } else if (warp_idx < kNumDataWarps) {
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
@@ -459,6 +556,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         const auto issue_batched_rdma = [&](const int& dst) {
             if (batch_count[dst] == 0)
                 return;
+            // Small batch: the per-token waits below only cover the smem read, so the puts
+            // need the stores fully completed here
+            if constexpr (kSmallBatch)
+                ptx::tma_store_wait();
             const auto send_ptr = scaleout_send_buffer
                 .get_rank_buffer(dst)
                 .get_token_buffer(batch_start_slot[dst])
@@ -496,7 +597,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         int last_slot_written = -1;
         const auto flush_last_tma_and_record_batch = [&]() {
             if (last_src_scaleout_rank_idx >= 0 and ptx::elect_one_sync()) {
-                ptx::tma_store_wait();
+                if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
 
                  // Issue only if not local rank
                 if (last_src_scaleout_rank_idx != scaleout_rank_idx)
@@ -563,6 +664,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 return false;
             });
 
+#ifdef EP_SB_PROBE
+            if (i == 0 and lane_idx == 0)
+                atomicMax(&sbc_probe[sm_idx][2], ptx::globaltimer());
+#endif
             // Increase received count
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
@@ -604,7 +709,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         ++ packed_offset_in_entry;
                         ptx::tma_store_1d(send_buffer_ptr, tma_buffer.get_base_ptr(), token_layout.get_num_bytes<false>());
                         ptx::tma_store_commit();
-                        ptx::tma_store_wait();
+                        if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
 
                         topk_valid_mask ^= 1u << k;
                         if (src_scaleout_rank_idx != scaleout_rank_idx)
@@ -695,11 +800,18 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Issue the last RDMA per channel/scaleout-warp
         if (ptx::elect_one_sync()) {
+            // Small batch: complete every outstanding store (the per-token waits only covered
+            // the smem reads), including the local-bypass ones the reduce epilogue reads
+            if constexpr (kSmallBatch)
+                ptx::tma_store_wait();
             #pragma unroll
             for (int dst = 0; dst < kNumScaleoutRanks; ++ dst)
                 issue_batched_rdma(dst);
 
             ptx::st_release_cta(proxy_ring_layout.get_done(forward_warp_idx), 1);
+#ifdef EP_SB_PROBE
+            atomicMax(&sbc_probe[sm_idx][3], ptx::globaltimer());
+#endif
         }
         __syncwarp();
 
@@ -804,47 +916,63 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 }
                 return false;
             });
+#ifdef EP_SB_PROBE
+            atomicMax(&sbc_probe[sm_idx][5], ptx::globaltimer());
+#endif
         }
         __syncwarp();
+#ifdef EP_SB_PROBE
+        if (lane_idx == 0)
+            atomicMax(&sbc_probe[sm_idx][14], ptx::globaltimer());   // slot 14: forward warp exit
+#endif
     } else if constexpr (kSmallBatch) {
-        // Small-batch proxy: lane i drains forward warp i's ring. Puts are issued in lockstep
-        // sweeps so the lanes on one QP coalesce into a single GIN post. A sweep runs when
-        // every ring is closed (the common case: each forward warp hands over one batch per
-        // remote peer at its end) or when any ring is half full (no deadlock on long
-        // channels, at the price of an uncoalesced sweep).
-        if (lane_idx < kNumForwardWarps) {
-            constexpr unsigned kActiveMask = (kNumForwardWarps >= 32) ? 0xffffffffu : ((1u << kNumForwardWarps) - 1u);
-            const auto signal_id = channel_signal_id(lane_idx);
-            ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
+        // Small-batch proxy, one warp per channel: drains its forward warp's ring and posts each
+        // batch as soon as it is handed over, so the scale-out puts overlap the reduce phase
+        const int ring_idx = warp_idx - kNumDataWarps;
+        if (ptx::elect_one_sync()) {
+            const auto signal_id = channel_signal_id(ring_idx);
+            ProxyPutDesc* const ring = proxy_ring_layout.get_ring(ring_idx);
             unsigned tail = 0;
             while (true) {
-                const bool done = ptx::ld_acquire_cta(proxy_ring_layout.get_done(lane_idx)) != 0;
-                const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx));
-                const unsigned num_pending = head - tail;
-                const bool all_done = __all_sync(kActiveMask, done);
-                const bool pressure = __any_sync(kActiveMask, num_pending >= static_cast<unsigned>(kProxyRingDepth / 2));
-                if (not all_done and not pressure)
+                const bool done = ptx::ld_acquire_cta(proxy_ring_layout.get_done(ring_idx)) != 0;
+                const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(ring_idx));
+                if (head == tail) {
+                    if (done)
+                        break;
                     continue;
-                const unsigned max_pending = __reduce_max_sync(kActiveMask, num_pending);
-                for (unsigned i = 0; i < max_pending; ++ i) {
-                    if (i < num_pending) {
-                        const auto& desc = ring[(tail + i) % static_cast<unsigned>(kProxyRingDepth)];
-                        gin.put<ncclTeamTagRail>(
-                            desc.recv_ptr, desc.send_ptr,
-                            desc.num_bytes,
-                            desc.dst,
-                            0, /*flags=0*/
-                            ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
-                        );
-                    }
                 }
-                tail = head;
-                ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail);
-                if (all_done)
-                    break;
+#ifdef EP_SB_PROBE
+                const auto sweep_t0 = ptx::globaltimer();
+                const unsigned max_pending = head - tail;
+#endif
+                for (; tail != head; ++ tail) {
+                    const auto& desc = ring[tail % static_cast<unsigned>(kProxyRingDepth)];
+                    gin.put<ncclTeamTagRail>(
+                        desc.recv_ptr, desc.send_ptr,
+                        desc.num_bytes,
+                        desc.dst,
+                        0, /*flags=0*/
+                        ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
+                    );
+                }
+                ptx::st_release_cta(proxy_ring_layout.get_tail(ring_idx), tail);
+#ifdef EP_SB_PROBE
+                {
+                    const auto t = ptx::globaltimer();
+                    atomicMax(&sbc_probe[sm_idx][4], t);
+                    atomicMax(&sbc_probe[sm_idx][8], ~0ull - sweep_t0);
+                    atomicAdd(&sbc_probe[sm_idx][9], 1ull);
+                    atomicAdd(&sbc_probe[sm_idx][10], t - sweep_t0);
+                    atomicAdd(&sbc_probe[sm_idx][11], max_pending);
+                }
+#endif
             }
         }
         __syncwarp();
+#ifdef EP_SB_PROBE
+        if (lane_idx == 0)
+            atomicMax(&sbc_probe[sm_idx][6], ptx::globaltimer());
+#endif
     } else {
         // Proxy warp loop shape: arch-selected at JIT compile time.
         //   SM100+ (B200) -> sequential single-lane sweeper.
@@ -965,6 +1093,34 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     }
 
     // No barrier at epilogue
+#ifdef EP_SB_PROBE
+    if constexpr (kSmallBatch) {
+        __syncthreads();
+        if (sm_idx == 0 and thread_idx == 0 and (combine_iteration & (EP_SB_PROBE_EVERY - 1)) <= 1) {
+            // Give the other blocks a moment to land their stamps (no grid sync here by design)
+            const auto t_wait = ptx::globaltimer();
+            while (ptx::globaltimer() - t_wait < 20000ull) {}
+            unsigned long long q[16] = {~0ull, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            for (int b = 0; b < kNumSMs; ++ b) {
+                q[0] = min(q[0], sbc_probe[b][0]);
+                #pragma unroll
+                for (int i = 1; i < 6; ++ i)
+                    q[i] = max(q[i], sbc_probe[b][i]);
+                q[6] = max(q[6], sbc_probe[b][6]);
+                q[7] = max(q[7], sbc_probe[b][7]);
+                #pragma unroll
+                for (int i = 8; i < 16; ++ i)
+                    q[i] = (i == 14 or i == 8) ? max(q[i], sbc_probe[b][i]) : q[i] + sbc_probe[b][i];
+            }
+            printf("SBC ex=%d so=%d su=%d it=%d entry=%llu sudone=%llu firsttail=%llu reduced=%llu issued=%llu inbound=%llu "
+                   "proxyexit=%llu max_su_tokens=%llu firstsweep=%llu sweeps=%llu sweep_ns=%llu puts=%llu "
+                   "period_ns=%llu split_ns=%llu exit=%llu bodies=%llu\n",
+                   static_cast<int>(kUseExpandedLayout), scaleout_rank_idx, scaleup_rank_idx, combine_iteration,
+                   q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], ~0ull - q[8], q[9], q[10], q[11],
+                   q[12], q[13], q[14], q[15]);
+        }
+    }
+#endif
 }
 
 }  // namespace deep_ep::elastic

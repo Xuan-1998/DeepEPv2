@@ -152,6 +152,28 @@ static layout::TokenLayout get_combine_token_layout(
     return layout::TokenLayout(hidden * elem_size, 0, num_topk, false);
 }
 
+// Small-batch combine: scale-up warps per channel. One warp pushes about 14 KB per 3 us to the
+// peers (one bulk store at a time), so the send phase of a decode-sized combine is bounded by
+// the longest per-warp chain; every channel gets as many sending warps as the shared memory
+// (one staging buffer per data warp plus the proxy rings) and the block size allow, up to 4.
+static int get_small_batch_scaleup_warps_per_channel(const layout::TokenLayout& token_layout,
+                                                    const int& num_channels_per_sm,
+                                                    const int& num_smem_bytes,
+                                                    const int& num_proxy_warps) {
+    constexpr int kMaxScaleupWarpsPerChannel = 4;
+    const auto token_bytes = token_layout.get_num_bytes<true, int64_t>();
+    const auto ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
+        num_channels_per_sm, deep_ep::elastic::kProxyRingDepthDefault);
+    const auto max_data_warps = static_cast<int>((num_smem_bytes - ring_bytes) / token_bytes);
+    int per_channel = std::min(kMaxScaleupWarpsPerChannel, max_data_warps / num_channels_per_sm - 1);
+    // Scale-up warps, forward warps and the proxy warps must fit into one block
+    while (per_channel > 1 and (per_channel + 1) * num_channels_per_sm + num_proxy_warps > 32)
+        -- per_channel;
+    if (const auto forced = get_env<int>("EP_SB_SCALEUP_WARPS", 0); forced > 0)
+        per_channel = forced;
+    return std::max(per_channel, 1);
+}
+
 static void* launch_combine(void* x,
                             void* topk_weights,
                             int* src_metadata,
@@ -188,6 +210,10 @@ static void* launch_combine(void* x,
         EP_HOST_ASSERT(num_channels / num_sms <= 16);
 
         num_scaleup_warps = num_forward_warps = num_channels / num_sms;
+        // Small batch runs one proxy warp per channel (see the kernel's `kNumProxyWarps`)
+        const int num_proxy_warps = small_batch ? num_forward_warps : 1;
+        if (small_batch and not use_ordered_kernel)
+            num_scaleup_warps *= get_small_batch_scaleup_warps_per_channel(token_layout, num_forward_warps, num_smem_bytes, num_proxy_warps);
 
         if (use_ordered_kernel) {
             // The ordered kernel has no proxy warp and only carves TMA buffers out of shmem.
@@ -196,7 +222,7 @@ static void* launch_combine(void* x,
                            "Invalid combine SM count, please try to match your dispatch config");
         } else {
             const auto num_data_warps = num_scaleup_warps + num_forward_warps;
-            num_warps = num_data_warps + 1;
+            num_warps = num_data_warps + num_proxy_warps;
             EP_HOST_ASSERT(num_warps * 32 <= 1024 and
                            "combine warp count (scale-up + forward + proxy) exceeds the "
                            "1024-thread block limit; use at least num_channels / 15 SMs");

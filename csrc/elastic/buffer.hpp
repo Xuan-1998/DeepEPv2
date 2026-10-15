@@ -1035,9 +1035,11 @@ public:
             }
             // The unordered combine also carves the proxy hand-off rings out of the
             // same dynamic shared memory as its TMA buffers; shrink the channel count
-            // until both fit (see the matching assert in `launch_combine`).
+            // until both fit (see the matching assert in `launch_combine`). Small batch
+            // runs at least two scale-up warps per channel, each with its own buffer.
+            const int combine_buffers_per_channel = small_batch.enabled ? 3 : 2;
             while (num_channels_per_sm > 1 and
-                   static_cast<int64_t>(2 * num_channels_per_sm) *
+                   static_cast<int64_t>(combine_buffers_per_channel * num_channels_per_sm) *
                            combine_token_layout.get_num_bytes<true, int64_t>() +
                        elastic::ProxyRingLayout::get_num_bytes(num_channels_per_sm,
                                                                elastic::kProxyRingDepthDefault) >

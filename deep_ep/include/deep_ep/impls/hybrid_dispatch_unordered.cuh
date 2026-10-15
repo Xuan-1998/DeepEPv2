@@ -63,9 +63,11 @@ static constexpr int kMinTokensPerPart = (EP_MIN_TOKENS_PER_PART) > 1 ? (EP_MIN_
 
 // Small-batch mode: maximum sub-parts (= puts) per channel and peer. Every sub-part is one
 // put, all issued together in one coalesced post per SM; more sub-parts let the receiver
-// forward the first tokens while the rest are still in flight.
+// forward the first tokens while the rest are still in flight. 8 (about one token per put at
+// 128 tokens) measured best on SM90; `num_sub_parts_at` still applies the per-arch minimum
+// tokens per sub-part.
 #ifndef EP_SB_SUB_PARTS
-#define EP_SB_SUB_PARTS 1
+#define EP_SB_SUB_PARTS 8
 #endif
 static constexpr int kSBSubPartsDefault = (EP_SB_SUB_PARTS) > 1 ? (EP_SB_SUB_PARTS) : 1;
 
@@ -842,7 +844,9 @@ hybrid_unordered_dispatch_impl(
                                   tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
             }
             ptx::tma_store_commit();
-            ptx::tma_store_wait();
+            // Small batch: the staging buffer is reused as soon as the store has read it; the
+            // stores are completed in full before the headers / local tail are published
+            if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
             __syncwarp();
 
             // Preload the next token (overlapping with the scale-out put issues)
@@ -856,8 +860,10 @@ hybrid_unordered_dispatch_impl(
                 __syncwarp();
             }
 
-            // Issue scale-out tail update
-            update_scaleout_tail();
+            // Issue scale-out tail update (small batch: only the final one, after the full
+            // store wait below, since the per-token waits only cover the smem read)
+            if constexpr (not kSmallBatch)
+                update_scaleout_tail();
         }
 
         if constexpr (kSmallBatch) {
@@ -873,6 +879,8 @@ hybrid_unordered_dispatch_impl(
             const auto sb_sub_size = [&](const int& sub_idx) {
                 return sub_part_size_at<kNumSubParts>(part_size(0), sub_idx);
             };
+            ptx::tma_store_wait();
+            __syncwarp();
             if (lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
                 auto send_ch = scaleout_send_buffer.get_rank_buffer(lane_idx)
                                    .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
@@ -1142,7 +1150,7 @@ hybrid_unordered_dispatch_impl(
             };
 
             if constexpr (kDoubleBufferForward) {
-                ptx::tma_store_wait();
+                if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
                 __syncwarp();
                 if (start_slot_idx < end_slot_idx)
                     issue_fwd_load(0, start_slot_idx);
@@ -1159,13 +1167,13 @@ hybrid_unordered_dispatch_impl(
                     __syncwarp();
 
                     if (slot_idx + 1 < end_slot_idx) {
-                        ptx::tma_store_wait();
+                        if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
                         __syncwarp();
                         issue_fwd_load(cur ^ 1, slot_idx + 1);
                     }
                 } else {
                     // Original single-buffer path: load this slot synchronously.
-                    ptx::tma_store_wait();
+                    if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
                     __syncwarp();
                     issue_fwd_load(0, slot_idx);
                     if (ptx::elect_one_sync())

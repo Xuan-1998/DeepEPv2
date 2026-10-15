@@ -127,6 +127,14 @@ __forceinline__ __device__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(kNumRemainingWaits) : "memory");
 }
 
+// Waits only until the bulk stores have finished reading their shared-memory source, which is
+// all that reusing the source buffer needs; the writes may still be in flight (use
+// `tma_store_wait` before publishing their completion to anyone)
+template <int kNumRemainingWaits = 0>
+__forceinline__ __device__ void tma_store_wait_read() {
+    asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(kNumRemainingWaits) : "memory");
+}
+
 enum TMACacheHint: int64_t {
     kEvictFirst = 0x12f0000000000000ll,
     kEvictNormal = 0x1000000000000000ll
@@ -179,7 +187,8 @@ __forceinline__ __device__ void cp_async_mbarrier_arrive(mbarrier* ptr) {
 /// Timers
 __forceinline__ __device__ unsigned long long globaltimer() {
     unsigned long long value;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+    // The memory clobber pins the read against the surrounding memory operations
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value) : : "memory");
     return value;
 }
 
