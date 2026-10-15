@@ -12,6 +12,7 @@
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <deep_ep/common/comm.cuh>
+#include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
@@ -20,7 +21,15 @@
 
 namespace deep_ep::elastic {
 
-template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
+// Small-batch mode (`kSmallBatch`): the decode-sized variant, paired with the small-batch
+// dispatch. No entry barrier: the host alternates the combine buffer between two parity
+// halves per combine call (independent of the dispatch halves) and the per-channel scale-up
+// tails and inbound signals are parity-indexed, so a peer one call ahead cannot collide with
+// this rank's consumption or resets. The proxy warp issues the SM's puts in one convergent
+// sweep once every forward warp has handed over its (single) batch, so the lanes of a QP
+// coalesce into one GIN post. The HT variant (`kSmallBatch == false`) is unchanged.
+template <bool kSmallBatch, int kNumGinSignals,
+          bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
           int kNumScaleupWarps, int kNumForwardWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -56,7 +65,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window,
                     void* buffer, void* workspace,
                     const int scaleout_rank_idx, const int scaleup_rank_idx,
-                    int num_reduced_tokens, const int num_combined_tokens) {
+                    int num_reduced_tokens, const int num_combined_tokens,
+                    const int combine_iteration) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -64,12 +74,35 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     const auto lane_idx = ptx::get_lane_idx();
     constexpr bool kDoExpandedSend = not kAllowMultipleReduction and kUseExpandedLayout;
 
+    // Small-batch mode: parity of this combine call (buffer half, tail slots, signal ids)
+    const int sb_parity = combine_iteration & 1;
+    // Small-batch signal ids: the dispatch owns [0, 2 * cpc), the combine [2 * cpc, 4 * cpc),
+    // both indexed (channel-in-context, parity). Mirrors `part_signal_id_of` in the dispatch.
+    constexpr int kNumSBChannelsPerContext = gin_alloc::channels_per_context(
+        kNumSMs, kNumQPs - 1, kNumChannelsPerSM);
+    EP_STATIC_ASSERT(not kSmallBatch or 4 * kNumSBChannelsPerContext <= kNumGinSignals,
+                     "GIN signal budget cannot host the small-batch dispatch + combine signals");
+    const auto channel_signal_id = [&](const int& channel_in_sm_idx) {
+        const int qp_signal_id = comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, channel_in_sm_idx);
+        if constexpr (kSmallBatch)
+            return static_cast<ncclGinSignal_t>(2 * kNumSBChannelsPerContext + qp_signal_id * 2 + sb_parity);
+        else
+            return static_cast<ncclGinSignal_t>(qp_signal_id);
+    };
+
     // Combine vector type selection
     using combine_vec_t = typename CombineVecTraits<kNumHiddenBytes>::vec_t;
     constexpr int kHiddenVec = kNumHiddenBytes / sizeof(combine_vec_t);
 
     // Workspaces
     const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+    // Per-channel scale-up tails: parity-indexed in small-batch mode, legacy otherwise
+    const auto scaleup_tail_ptr = [&](const int& channel_idx, const int& scaleup_rank) {
+        if constexpr (kSmallBatch)
+            return workspace_layout.get_sb_combine_tail_ptr(sb_parity, channel_idx, scaleup_rank);
+        else
+            return workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank);
+    };
 
     // We should assign the real number of received tokens if without CPU sync
     if (num_reduced_tokens == kNumMaxTokensPerRank * kNumRanks)
@@ -124,11 +157,16 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
-    // Global parallel barriers for scale-out subteam and scale-up subteam
-    // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    if constexpr (kSmallBatch) {
+        // Barrier-free entry (see the small-batch mode notes above the template); the ring
+        // initialisation above is already ordered by the block sync.
+    } else {
+        // Global parallel barriers for scale-out subteam and scale-up subteam
+        // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
+        comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
+            gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    }
 
     // Adjust register count at certain cases
     // TODO: support more cases, or try to make channel count more aligned
@@ -159,7 +197,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         int update_counter = 0;
         int stored_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         int stored_old_num_tokens_sent[kNumScaleupRanksPerLane] = {};
-        const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
+        const auto tail_ptr = scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
         const auto update_tails = [&](const bool& finish = false) {
             ++ update_counter;
             if (finish or update_counter == kNumScaleupUpdateInterval) {
@@ -392,8 +430,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // companion helper to `get_qp_mode` (called at kernel entry) so the id is
         // unique among all channels sharing this warp's QP, regardless of which of
         // `get_qp_mode`'s branches picked the mapping.
-        const auto signal_id = static_cast<ncclGinSignal_t>(
-            comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
+        const auto signal_id = channel_signal_id(forward_warp_idx);
 
         // Adjust registers
         if constexpr (kAdjustRegisters)
@@ -507,7 +544,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                     const auto k = j * 32 + lane_idx;
                     stored_cached_scaleup_tail[j] = j < (kNumScaleupRanksPerLane - 1) or k < kNumScaleupRanks ?
-                        ptx::ld_acquire_sys(workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, k)) : -1;
+                        ptx::ld_acquire_sys(scaleup_tail_ptr(channel_idx, k)) : -1;
                 }
 
                 // Timeout
@@ -671,7 +708,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
             const auto k = j * 32 + lane_idx;
             if (j < (kNumScaleupRanksPerLane - 1) or k < kNumScaleupRanks)
-                *workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, k) = 0;
+                *scaleup_tail_ptr(channel_idx, k) = 0;
         }
         __syncwarp();
 
@@ -769,6 +806,45 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             });
         }
         __syncwarp();
+    } else if constexpr (kSmallBatch) {
+        // Small-batch proxy: lane i drains forward warp i's ring. Puts are issued in lockstep
+        // sweeps so the lanes on one QP coalesce into a single GIN post. A sweep runs when
+        // every ring is closed (the common case: each forward warp hands over one batch per
+        // remote peer at its end) or when any ring is half full (no deadlock on long
+        // channels, at the price of an uncoalesced sweep).
+        if (lane_idx < kNumForwardWarps) {
+            constexpr unsigned kActiveMask = (kNumForwardWarps >= 32) ? 0xffffffffu : ((1u << kNumForwardWarps) - 1u);
+            const auto signal_id = channel_signal_id(lane_idx);
+            ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
+            unsigned tail = 0;
+            while (true) {
+                const bool done = ptx::ld_acquire_cta(proxy_ring_layout.get_done(lane_idx)) != 0;
+                const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx));
+                const unsigned num_pending = head - tail;
+                const bool all_done = __all_sync(kActiveMask, done);
+                const bool pressure = __any_sync(kActiveMask, num_pending >= static_cast<unsigned>(kProxyRingDepth / 2));
+                if (not all_done and not pressure)
+                    continue;
+                const unsigned max_pending = __reduce_max_sync(kActiveMask, num_pending);
+                for (unsigned i = 0; i < max_pending; ++ i) {
+                    if (i < num_pending) {
+                        const auto& desc = ring[(tail + i) % static_cast<unsigned>(kProxyRingDepth)];
+                        gin.put<ncclTeamTagRail>(
+                            desc.recv_ptr, desc.send_ptr,
+                            desc.num_bytes,
+                            desc.dst,
+                            0, /*flags=0*/
+                            ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
+                        );
+                    }
+                }
+                tail = head;
+                ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail);
+                if (all_done)
+                    break;
+            }
+        }
+        __syncwarp();
     } else {
         // Proxy warp loop shape: arch-selected at JIT compile time.
         //   SM100+ (B200) -> sequential single-lane sweeper.
@@ -803,8 +879,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 auto* const gin_ctx = reinterpret_cast<handle::NCCLGin*>(gin_ctx_storage);
                 #pragma unroll
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
-                    ring_signal_id[forward_warp_idx] = static_cast<ncclGinSignal_t>(
-                        comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
+                    ring_signal_id[forward_warp_idx] = channel_signal_id(forward_warp_idx);
                     const auto [qp, mode] =
                         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
                     new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, mode);
@@ -854,9 +929,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             // and drains its own ring. Warp-lockstep parallelism across up to
             // kNumForwardWarps lanes — best when per-put cost is small (H200 SM90).
             if (lane_idx < kNumForwardWarps) {
-                const auto channel_idx = sm_idx * kNumChannelsPerSM + lane_idx;
-                const auto signal_id = static_cast<ncclGinSignal_t>(
-                    comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, lane_idx));
+                const auto signal_id = channel_signal_id(lane_idx);
 
                 ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
                 unsigned tail = 0;

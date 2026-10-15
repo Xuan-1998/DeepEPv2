@@ -8,7 +8,7 @@
 
 namespace deep_ep::elastic {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+template <bool kSmallBatch, bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -58,6 +58,20 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // Will block until the main dispatch kernel has finished and all data are visible
     // NOTES: PDL is used, please do not use `__ldg`
     cudaGridDependencySynchronize();
+
+    // Small-batch dispatch exits without its scale-up barrier and publishes per-peer done
+    // flags instead (monotonic dispatch iterations). This rank's own flag was written by its
+    // own dispatch (stream order), so it names the iteration to wait for on every peer.
+    int sb_parity = 0;
+    if constexpr (kSmallBatch) {
+        const auto sb_workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+        const int target = ptx::ld_acquire_sys<int>(sb_workspace_layout.get_sb_dispatch_done_flag_ptr(scaleup_rank_idx));
+        if (thread_idx < kNumScaleupRanks) {
+            while (ptx::ld_acquire_sys<int>(sb_workspace_layout.get_sb_dispatch_done_flag_ptr(thread_idx)) < target) {}
+        }
+        __syncthreads();
+        sb_parity = target & 1;
+    }
 
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
@@ -216,12 +230,20 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                 if (const auto k = j * 32 + lane_idx; j < (kNumScaleupRanksPerLane - 1) or k < kNumScaleupRanks) {
-                    channel_linked_list[
-                        *workspace_layout.get_channel_scaleup_tail_ptr(i, k)
-                    ] = -1;
+                    if constexpr (kSmallBatch) {
+                        // Parity-indexed slot, overwritten (not accumulated) by the next
+                        // dispatch of this parity, so no reset is needed
+                        channel_linked_list[
+                            *workspace_layout.get_sb_dispatch_ll_tail_ptr(sb_parity, i, k)
+                        ] = -1;
+                    } else {
+                        channel_linked_list[
+                            *workspace_layout.get_channel_scaleup_tail_ptr(i, k)
+                        ] = -1;
 
-                    // Clean for combine usages
-                    *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;
+                        // Clean for combine usages
+                        *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;
+                    }
                 }
             }
             __syncwarp();

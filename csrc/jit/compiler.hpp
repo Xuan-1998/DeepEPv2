@@ -70,6 +70,9 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+        // Extra flags (e.g. `-DEP_SB_PROBE=1`); part of the kernel cache key via `flags`
+        if (const auto extra_flags = get_env<std::string>("EP_JIT_EXTRA_FLAGS"); not extra_flags.empty())
+            flags += " " + extra_flags;
     }
 
     virtual ~Compiler() = default;

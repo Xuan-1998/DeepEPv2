@@ -32,6 +32,9 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxExpertsPerRank = 256;
     static constexpr int kNumMaxInflightAGRS = 32;
     static constexpr int kNumMaxParts = 64;
+    // Small-batch kernels index their per-channel tails by scale-up rank, capped at 64
+    // (both hybrid kernels static-assert `kNumScaleupRanks <= 64`).
+    static constexpr int kNumMaxSBScaleupRanks = 64;
 
     static constexpr int64_t kNumBarrierSignalBytes = 16;
 
@@ -87,6 +90,19 @@ struct WorkspaceLayout {
 
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
+
+        // Small-batch hybrid kernels (no entry/exit barriers). Every slot that a peer writes and
+        // the owner later resets exists once per iteration parity, so a peer running one
+        // iteration ahead can never collide with the owner's reset. Dispatch slots alternate with
+        // the dispatch iteration, combine slots with the combine iteration.
+        // Scale-out notify recv counts (rank + expert), 2 parities
+        num_bytes += 2 * (kNumMaxRanks + kNumMaxExperts) * sizeof(int);
+        // Dispatch linked-list tails (forwarder -> peer epilogue), 2 parities
+        num_bytes += 2 * kNumMaxChannels * kNumMaxSBScaleupRanks * sizeof(int);
+        // Combine scale-up tails, 2 parities
+        num_bytes += 2 * kNumMaxChannels * kNumMaxSBScaleupRanks * sizeof(int);
+        // Dispatch done flags (monotonic iteration epochs), one per scale-up peer
+        num_bytes += kNumMaxSBScaleupRanks * sizeof(int);
 
         return num_bytes;
     }
@@ -185,6 +201,45 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    // Small-batch regions (appended after the AGRS signals, see `get_num_bytes`)
+    __forceinline__ __device__ __host__ int* get_sb_scaleout_count_base_ptr(const int& parity) const {
+        const auto base_ptr = math::advance_ptr<int>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int));
+        return base_ptr + parity * (kNumMaxRanks + kNumMaxExperts);
+    }
+
+    // Same indexing as the recv side of `get_scaleout_rank_count_ptr` / `get_scaleout_expert_count_ptr`
+    __forceinline__ __device__ __host__ int* get_sb_scaleout_rank_count_ptr(
+        const int& parity, const int& scaleout_rank_idx = 0, const int& scaleup_rank_idx = 0) const {
+        return get_sb_scaleout_count_base_ptr(parity) + scaleout_rank_idx * num_scaleup_ranks + scaleup_rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ int* get_sb_scaleout_expert_count_ptr(
+        const int& parity, const int& scaleout_rank_idx = 0, const int& expert_idx = 0) const {
+        return get_sb_scaleout_count_base_ptr(parity) + num_ranks +
+            scaleout_rank_idx * (num_scaleup_ranks * num_experts_per_rank) + expert_idx;
+    }
+
+    __forceinline__ __device__ __host__ int* get_sb_dispatch_ll_tail_ptr(
+        const int& parity, const int& channel_idx, const int& scaleup_rank_idx) const {
+        const auto base_ptr = get_sb_scaleout_count_base_ptr(2);
+        return base_ptr + parity * (kNumMaxChannels * kNumMaxSBScaleupRanks) +
+            channel_idx * num_scaleup_ranks + scaleup_rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ int* get_sb_combine_tail_ptr(
+        const int& parity, const int& channel_idx, const int& scaleup_rank_idx) const {
+        const auto base_ptr = get_sb_dispatch_ll_tail_ptr(2, 0, 0);
+        return base_ptr + parity * (kNumMaxChannels * kNumMaxSBScaleupRanks) +
+            channel_idx * num_scaleup_ranks + scaleup_rank_idx;
+    }
+
+    // Written (NVLink `st.release`) by scale-up peer j with its dispatch iteration when its
+    // forwarding is complete; polled by the copy epilogue instead of the exit barrier.
+    __forceinline__ __device__ __host__ int* get_sb_dispatch_done_flag_ptr(const int& scaleup_rank_idx) const {
+        return get_sb_combine_tail_ptr(2, 0, 0) + scaleup_rank_idx;
     }
 };
 

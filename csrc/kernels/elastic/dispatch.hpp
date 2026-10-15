@@ -43,6 +43,9 @@ public:
         // Double-buffer the forward warp's TMA token loads (ping-pong). Enabled only when compute
         // overlap is off, so overlap runs keep DeepEP's original single-buffer forward path.
         bool double_buffer_forward;
+        // Small-batch (decode) variant of the unordered hybrid kernel, see
+        // `hybrid_dispatch_unordered.cuh`. Decided by the buffer from `num_max_tokens_per_rank`.
+        bool small_batch;
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
         int num_scaleout_warps, num_forward_warps; // For direct dispatch
@@ -105,7 +108,8 @@ public:
                 args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch_unordered";
-            func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                args.small_batch,
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
                 args.allow_multiple_reduction,
@@ -238,6 +242,7 @@ static void launch_dispatch(void* x, void* sf,
                             // this handle feeds; direct dispatch ignores it.
                             const bool& do_expand,
                             const int& dispatch_iteration,
+                            const bool& small_batch,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -280,6 +285,7 @@ static void launch_dispatch(void* x, void* sf,
         .allow_multiple_reduction = allow_multiple_reduction,
         .do_expand = do_expand,
         .double_buffer_forward = double_buffer_forward,
+        .small_batch = small_batch,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
@@ -316,6 +322,7 @@ class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopy
 public:
     struct Args {
         // Templated arguments
+        bool small_batch;
         bool do_expand, cached_mode, do_zero_padding;
         int num_channels;
         int num_warps;
@@ -347,9 +354,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
+                           args.small_batch,
                            args.do_expand, args.cached_mode, args.do_zero_padding,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -391,6 +399,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
                                           const bool& do_zero_padding,
+                                          const bool& small_batch,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -399,6 +408,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
 
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
+        .small_batch = small_batch,
         .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding,
         .num_channels = num_channels, .num_warps = num_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,

@@ -32,6 +32,10 @@ public:
         // Use the ordered (upstream) hybrid kernel instead of the unordered one.
         // Resolved once from `EP_HYBRID_KERNEL`; only affects the hybrid path.
         bool use_ordered_kernel;
+        // Small-batch (decode) variant of the unordered hybrid kernel, paired with the
+        // small-batch dispatch (see `hybrid_combine_unordered.cuh`).
+        bool small_batch;
+        int gin_indexed_signals_cnt;
         int num_scaleup_warps, num_forward_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
@@ -56,6 +60,7 @@ public:
         int scaleout_rank_idx, scaleup_rank_idx;
         int num_reduced_tokens;
         int num_combined_tokens;
+        int combine_iteration;
 
         jit::LaunchArgs launch_args;
     };
@@ -77,8 +82,11 @@ public:
                                     args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = args.use_ordered_kernel ? "hybrid_combine" : "hybrid_combine_unordered";
-            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            const auto sb_prefix = args.use_ordered_kernel ? std::string() :
+                fmt::format("{}, {}, ", args.small_batch, args.gin_indexed_signals_cnt);
+            func_name = fmt::format("{}<{}{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.use_ordered_kernel ? "hybrid_combine_impl" : "hybrid_unordered_combine_impl",
+                                    sb_prefix,
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
                                     args.num_scaleup_warps, args.num_forward_warps,
@@ -133,7 +141,8 @@ static void __instantiate_kernel() {{
                                                      args.buffer, args.workspace,
                                                      args.scaleout_rank_idx, args.scaleup_rank_idx,
                                                      args.num_reduced_tokens,
-                                                     args.num_combined_tokens));
+                                                     args.num_combined_tokens,
+                                                     args.combine_iteration));
         }
     }
 };
@@ -163,6 +172,8 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                            const bool& small_batch, const int& gin_indexed_signals_cnt,
+                            const int& combine_iteration,
                             const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -209,6 +220,8 @@ static void* launch_combine(void* x,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
         .use_ordered_kernel = use_ordered_kernel,
+        .small_batch = small_batch,
+        .gin_indexed_signals_cnt = gin_indexed_signals_cnt,
         .num_scaleup_warps = num_scaleup_warps, .num_forward_warps = num_forward_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
@@ -228,6 +241,7 @@ static void* launch_combine(void* x,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,
         .num_combined_tokens = num_combined_tokens,
+        .combine_iteration = combine_iteration,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
     };

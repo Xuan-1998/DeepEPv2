@@ -12,6 +12,7 @@
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <cuda_runtime.h>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <vector>
@@ -57,6 +58,7 @@ class ElasticBuffer {
     bool allow_multiple_reduction;
 
     mutable int dispatch_iteration = 0;
+    mutable int combine_iteration = 0;
 
     // Whether to prefer overlapping communication with compute (use more SMs and channels if false)
     bool prefer_overlap_with_compute;
@@ -696,6 +698,67 @@ public:
         }
     }
 
+    // Small-batch (decode) mode of the unordered hybrid kernels, see
+    // `hybrid_dispatch_unordered.cuh`. Selected per call from `num_max_tokens_per_rank`, which
+    // every rank passes identically, so all ranks pick the same kernel variant. The buffer is
+    // split into four regions: two combine halves (alternating per combine call) followed by
+    // two dispatch halves (alternating per dispatch call). Both regions are sized by the
+    // call's `hidden` / `num_topk` only, so dispatch and combine derive the same offsets; the
+    // dispatch half is sized for the largest token (BF16 payload plus FP8 scales).
+    static constexpr int64_t kSmallBatchRegionAlignment = 4096;
+
+    static bool small_batch_enabled_by_env() {
+        static const bool enabled = get_env<int>("EP_SMALL_BATCH", 1) != 0;
+        return enabled;
+    }
+
+    static int small_batch_max_tokens() {
+        static const int max_tokens = get_env<int>("EP_SMALL_BATCH_MAX_TOKENS", 256);
+        return max_tokens;
+    }
+
+    struct SmallBatchLayout {
+        bool enabled;
+        int64_t combine_bytes;   // one combine half
+        int64_t dispatch_bytes;  // one dispatch half
+        int64_t total_bytes;     // 2 * combine_bytes + 2 * dispatch_bytes
+
+        void* combine_buffer(void* buffer, const int& parity) const {
+            return static_cast<uint8_t*>(buffer) + parity * combine_bytes;
+        }
+
+        void* dispatch_buffer(void* buffer, const int& parity) const {
+            return static_cast<uint8_t*>(buffer) + 2 * combine_bytes + parity * dispatch_bytes;
+        }
+    };
+
+    static SmallBatchLayout get_small_batch_layout(const int& num_max_tokens_per_rank,
+                                                  const int& hidden, const int& num_topk,
+                                                  const int& num_scaleout_ranks, const int& num_scaleup_ranks,
+                                                  const bool& is_scaleup_nvlink,
+                                                  const bool& allow_multiple_reduction,
+                                                  const int64_t& num_available_bytes) {
+        SmallBatchLayout layout{};
+        layout.combine_bytes = math::align<int64_t>(
+            get_combine_buffer_size(num_max_tokens_per_rank, hidden, num_topk,
+                                    num_scaleout_ranks, num_scaleup_ranks,
+                                    is_scaleup_nvlink, allow_multiple_reduction),
+            kSmallBatchRegionAlignment);
+        layout.dispatch_bytes = math::align<int64_t>(
+            get_dispatch_buffer_size(num_max_tokens_per_rank, hidden,
+                                     /*num_sf_packs=*/math::ceil_div(hidden, 32), num_topk,
+                                     /*elem_size=*/static_cast<int>(sizeof(nv_bfloat16)),
+                                     num_scaleout_ranks, num_scaleup_ranks, is_scaleup_nvlink),
+            kSmallBatchRegionAlignment);
+        layout.total_bytes = 2 * layout.combine_bytes + 2 * layout.dispatch_bytes;
+        layout.enabled = small_batch_enabled_by_env() and
+                         num_scaleout_ranks > 1 and
+                         not elastic::use_ordered_hybrid_kernel() and
+                         num_max_tokens_per_rank <= small_batch_max_tokens() and
+                         layout.total_bytes <= num_available_bytes;
+        return layout;
+    }
+
     static int64_t calculate_buffer_size(const int64_t& nccl_comm,
                                          const int& num_max_tokens_per_rank, const int& hidden,
                                          int num_topk, const bool& use_fp8_dispatch,
@@ -728,8 +791,19 @@ public:
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink, allow_multiple_reduction);
 
+        // Small-batch mode needs its four regions to fit as well (sized at the small-batch
+        // token cap, so a large buffer only grows when the cap's layout is bigger)
+        int64_t num_small_batch_bytes = 0;
+        if (small_batch_enabled_by_env() and num_scaleout_ranks > 1 and not elastic::use_ordered_hybrid_kernel()) {
+            num_small_batch_bytes = get_small_batch_layout(
+                std::min(num_max_tokens_per_rank, small_batch_max_tokens()), hidden, num_topk,
+                num_scaleout_ranks, num_scaleup_ranks, is_scaleup_nvlink, allow_multiple_reduction,
+                std::numeric_limits<int64_t>::max()).total_bytes;
+        }
+
         // Return the maximum of those layouts, aligned to 2 MB
-        return math::align(std::max(num_dispatch_bytes, num_combine_bytes), symmetric::kNumAlignmentBytes);
+        return math::align(std::max({num_dispatch_bytes, num_combine_bytes, num_small_batch_bytes}),
+                           symmetric::kNumAlignmentBytes);
     }
 
     static symmetric::cpu_handle_t create_cpu_handle(const int64_t& num_cpu_bytes) {
@@ -836,6 +910,12 @@ public:
             topk_weights_ptr = topk_weights->data_ptr<float>();
         }
 
+        // Small-batch mode and its buffer half for this dispatch
+        const auto small_batch = get_small_batch_layout(
+            num_max_tokens_per_rank, hidden, num_topk,
+            nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+            nccl_context->is_scaleup_nvlink, allow_multiple_reduction, num_buffer_bytes);
+
         // Expert receiving counter
         int* cumulative_local_expert_recv_stats_ptr = nullptr;
         if (cumulative_local_expert_recv_stats.has_value()) {
@@ -939,6 +1019,17 @@ public:
                 num_channels_per_sm = elastic::gin_alloc::constexpr_channels_per_sm(
                     nccl_context->gin_config.gin_indexed_signals_cnt,
                     num_sms, num_qps, /*with_notify=*/true, num_channels_per_sm);
+                // Small-batch mode indexes the dispatch and combine signals by iteration
+                // parity: 4 ids per channel-in-context instead of `num_parts`
+                if (small_batch.enabled) {
+                    while (num_channels_per_sm > 1 and
+                           4 * elastic::gin_alloc::channels_per_context(num_sms, num_qps - 1, num_channels_per_sm) >
+                               nccl_context->gin_config.gin_indexed_signals_cnt)
+                        -- num_channels_per_sm;
+                    EP_HOST_ASSERT(4 * elastic::gin_alloc::channels_per_context(num_sms, num_qps - 1, num_channels_per_sm) <=
+                                       nccl_context->gin_config.gin_indexed_signals_cnt and
+                                   "GIN signal budget cannot host the small-batch signals; reduce --num-sms");
+                }
                 if (get_env<int>("EP_BUFFER_DEBUG"))
                     printf("[DEBUG] DeepEP GIN resolved channels per SM: %d\n", num_channels_per_sm);
             }
@@ -1089,6 +1180,10 @@ public:
 
         ++ dispatch_iteration;
 
+        // Small-batch mode alternates the dispatch buffer half per dispatch
+        void* const dispatch_buffer = small_batch.enabled
+            ? small_batch.dispatch_buffer(buffer, dispatch_iteration & 1) : buffer;
+
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
@@ -1106,7 +1201,7 @@ public:
                         num_sf_packs, sf_token_stride, sf_hidden_stride,
                         num_experts, num_topk, expert_alignment,
                         nccl_context->dev_comm, nccl_context->window,
-                        buffer,
+                        dispatch_buffer,
                         workspace, mapped_host_workspace,
                         nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
                         nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
@@ -1119,6 +1214,7 @@ public:
                         not prefer_overlap_with_compute,
                         allow_multiple_reduction, do_expand,
                         dispatch_iteration,
+                        small_batch.enabled,
                         comm_stream);
 
         // Received token counters
@@ -1243,7 +1339,7 @@ public:
 
         // Launch copy kernels with full SMs
         stream_control_before_epilogue(previous_event_before_epilogue);
-        launch_dispatch_copy_epilogue(buffer, workspace,
+        launch_dispatch_copy_epilogue(dispatch_buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
                                       recv_x.data_ptr(), recv_sf_ptr,
@@ -1262,6 +1358,7 @@ public:
                                       num_channels,
                                       do_expand, cached_mode,
                                       do_zero_padding,
+                                      small_batch.enabled,
                                       comm_stream);
 
         // Stream control
@@ -1411,6 +1508,16 @@ public:
             token_map_at_dispatch_ptr = token_map_at_dispatch->data_ptr<int>();
         }
 
+        // Small-batch mode (same decision as the dispatch that produced this handle) and its
+        // combine buffer half, alternating per combine call
+        const auto small_batch = get_small_batch_layout(
+            num_max_tokens_per_rank, hidden, num_topk,
+            nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+            nccl_context->is_scaleup_nvlink, allow_multiple_reduction, num_buffer_bytes);
+        ++ combine_iteration;
+        void* const combine_buffer = small_batch.enabled
+            ? small_batch.combine_buffer(buffer, combine_iteration & 1) : buffer;
+
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
         const auto reduce_buffer = launch_combine(
@@ -1422,7 +1529,7 @@ public:
             channel_linked_list_ptr,
             token_map_at_dispatch_ptr,
             nccl_context->dev_comm, nccl_context->window,
-            buffer, workspace,
+            combine_buffer, workspace,
             num_reduced_tokens, num_combined_tokens,
             num_max_tokens_per_rank,
             hidden, num_experts, num_topk,
@@ -1433,6 +1540,8 @@ public:
             num_sms, jit::device_runtime->get_num_smem_bytes(),
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
+            small_batch.enabled, nccl_context->gin_config.gin_indexed_signals_cnt,
+            combine_iteration,
             comm_stream);
 
         // Allocate output tensors

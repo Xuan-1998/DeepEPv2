@@ -176,6 +176,13 @@ __forceinline__ __device__ void cp_async_mbarrier_arrive(mbarrier* ptr) {
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
 }
 
+/// Timers
+__forceinline__ __device__ unsigned long long globaltimer() {
+    unsigned long long value;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value));
+    return value;
+}
+
 /// Barriers
 template <int kNumThreads>
 __forceinline__ __device__ void named_barrier(const int& idx) {
