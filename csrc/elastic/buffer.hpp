@@ -137,6 +137,26 @@ public:
         this->num_gpu_timeout_cycles = static_cast<int64_t>(num_gpu_timeout_secs);
         this->num_gpu_timeout_cycles *= jit::device_runtime->get_clock_rate();
 
+        // Device printf FIFO: the timeout prints run per warp or per lane on every SM, and the FIFO is
+        // circular, so a small one loses lines. A dispatch at 28 SMs x 7 channels x 4 scale-out ranks prints
+        // 784 lines, and each line takes one 512-byte record, so 16 MiB holds 32,768 lines. CUDA refuses the
+        // change once a kernel that calls printf ran in this context, which is not fatal.
+        if (const auto num_printf_fifo_mb = get_env<int>("EP_PRINTF_FIFO_MB", 16); num_printf_fifo_mb > 0) {
+            size_t num_fifo_bytes = 0;
+            CUDA_RUNTIME_CHECK(cudaDeviceGetLimit(&num_fifo_bytes, cudaLimitPrintfFifoSize));
+            const auto num_wanted_bytes = static_cast<size_t>(num_printf_fifo_mb) << 20;
+            if (num_fifo_bytes < num_wanted_bytes) {
+                if (cudaDeviceSetLimit(cudaLimitPrintfFifoSize, num_wanted_bytes) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    printf("DeepEP: could not raise the device printf FIFO from %zu to %zu bytes "
+                           "(EP_PRINTF_FIFO_MB=0 skips this)\n", num_fifo_bytes, num_wanted_bytes);
+                }
+                CUDA_RUNTIME_CHECK(cudaDeviceGetLimit(&num_fifo_bytes, cudaLimitPrintfFifoSize));
+            }
+            if (get_env<int>("EP_BUFFER_DEBUG"))
+                printf("[DEBUG] DeepEP device printf FIFO: %zu bytes\n", num_fifo_bytes);
+        }
+
         // Assign workspaces and buffers
         workspace = this->nccl_context->mapped_window_ptr;
         workspace_layout_wo_expert = std::make_shared<layout::WorkspaceLayout>(
