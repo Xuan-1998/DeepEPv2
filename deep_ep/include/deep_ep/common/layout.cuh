@@ -32,6 +32,7 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxExpertsPerRank = 256;
     static constexpr int kNumMaxInflightAGRS = 32;
     static constexpr int kNumMaxParts = 64;
+    static constexpr int kNumMaxGridSyncSMs = 256;
 
     static constexpr int64_t kNumBarrierSignalBytes = 16;
 
@@ -87,6 +88,9 @@ struct WorkspaceLayout {
 
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
+
+        // Timed grid sync: a counter, and per SM a warp arrival mask and the generation it arrived at
+        num_bytes += (1 + 2 * kNumMaxGridSyncSMs) * sizeof(int);
 
         return num_bytes;
     }
@@ -185,6 +189,19 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ uint32_t* get_grid_sync_counter_ptr() const {
+        return reinterpret_cast<uint32_t*>(math::advance_ptr<int>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int)));
+    }
+
+    __forceinline__ __device__ __host__ uint32_t* get_grid_sync_arrived_ptr(const int& sm_idx) const {
+        return get_grid_sync_counter_ptr() + 1 + sm_idx;
+    }
+
+    __forceinline__ __device__ __host__ uint32_t* get_grid_sync_generation_ptr(const int& sm_idx) const {
+        return get_grid_sync_counter_ptr() + 1 + kNumMaxGridSyncSMs + sm_idx;
     }
 };
 
