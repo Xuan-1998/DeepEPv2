@@ -560,6 +560,12 @@ hybrid_unordered_dispatch_impl(
                 const int num_put_tokens = count > 0 ? count : 1;
                 comm::wait_sq_room<kNumTimeoutCycles>("hybrid dispatch send", gin.gin, 1, sq_completed_cache,
                                                       scaleout_rank_idx, scaleup_rank_idx);
+#if defined(EP_INJECT_STUCK_PUT_SM)
+                // Test hook for the lane nanny: one sender lane of rank 0 never returns from its put
+                if (sm_idx == EP_INJECT_STUCK_PUT_SM and scaleout_warp_idx == 0 and lane_idx == EP_INJECT_STUCK_PUT_LANE and
+                    rank_idx == 0 and dispatch_iteration == 1)
+                    while (true) __nanosleep(1000);
+#endif
                 gin.put<ncclTeamTagRail>(
                     scaleout_recv_buffer.get_token_buffer(slot).get_base_ptr(),
                     send_ch.get_token_buffer(slot).get_base_ptr(),
@@ -1117,6 +1123,12 @@ hybrid_unordered_dispatch_impl(
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
         __syncwarp();
     }
+
+#if defined(EP_INJECT_STUCK_SM)
+    // Test hook for the timed grid sync: one warp of rank 0 never reaches the exit barrier
+    if (sm_idx == EP_INJECT_STUCK_SM and warp_idx == EP_INJECT_STUCK_WARP and rank_idx == 0 and dispatch_iteration == 1)
+        while (true) __nanosleep(1000);
+#endif
 
     // Scale-up barrier to ensure data arrival
     // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again

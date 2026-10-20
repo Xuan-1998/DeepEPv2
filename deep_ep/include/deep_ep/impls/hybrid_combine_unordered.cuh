@@ -867,6 +867,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
                             tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
                         put_start[0] = clock64();
+#if defined(EP_INJECT_STUCK_PROXY_SM)
+                        // Test hook for the proxy watchdog: the sweeper of rank 0 never returns from a put
+                        if (sm_idx == EP_INJECT_STUCK_PROXY_SM and scaleout_rank_idx == 0 and scaleup_rank_idx == 0)
+                            while (true) __nanosleep(1000);
+#endif
                         gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
                             desc.recv_ptr, desc.send_ptr,
                             desc.num_bytes,
@@ -939,6 +944,12 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                     const auto& desc = ring[tail % static_cast<unsigned>(kProxyRingDepth)];
                     put_start[lane_idx] = clock64();
+#if defined(EP_INJECT_STUCK_PROXY_SM)
+                    // Test hook for the proxy watchdog: one proxy lane of rank 0 never returns from a put
+                    if (sm_idx == EP_INJECT_STUCK_PROXY_SM and lane_idx == EP_INJECT_STUCK_PROXY_LANE and
+                        scaleout_rank_idx == 0 and scaleup_rank_idx == 0)
+                        while (true) __nanosleep(1000);
+#endif
                     gin.put<ncclTeamTagRail>(
                         desc.recv_ptr, desc.send_ptr,
                         desc.num_bytes,
