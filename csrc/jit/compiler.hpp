@@ -67,9 +67,13 @@ public:
         flags += fmt::format(" -I {}/include", nccl_root.c_str());
 
         // Some special flags for EP
-        // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+
+        // Extra flags appended verbatim, e.g. `EP_JIT_EXTRA_FLAGS="-DEP_TIMED_GRID_SYNC=0"`
+        // NOTES: the flags are part of the kernel signature, so each value gets its own cache entry
+        if (const auto extra_flags = get_env<std::string>("EP_JIT_EXTRA_FLAGS"); not extra_flags.empty())
+            flags += " " + extra_flags;
     }
 
     virtual ~Compiler() = default;
