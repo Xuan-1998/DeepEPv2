@@ -359,8 +359,11 @@ hybrid_unordered_dispatch_impl(
             // Issue scaleout writes to peers
             EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
-            if (thread_idx < kNumScaleoutRanks) {
+            comm::guarded_post<kNumTimeoutCycles>(thread_idx < kNumScaleoutRanks, [&]() {
                 const auto dst_scaleout_rank_idx = thread_idx;
+                uint32_t sq_completed_cache = comm::kSqCompletedUnset;
+                comm::wait_sq_room<kNumTimeoutCycles>("hybrid notify put", gin.gin, 2, sq_completed_cache,
+                                                      scaleout_rank_idx, scaleup_rank_idx);
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),
@@ -370,7 +373,7 @@ hybrid_unordered_dispatch_impl(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
                     kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);
-            }
+            }, "hybrid notify put", scaleout_rank_idx, scaleup_rank_idx);
             __syncwarp();
 
             // Util functions to get metadata from scale-out peers
@@ -530,6 +533,7 @@ hybrid_unordered_dispatch_impl(
         int coalesce_flushed = 0;
         int stored_flushed_parts = 0;
         int stored_flushed_subs = 0;
+        uint32_t sq_completed_cache = comm::kSqCompletedUnset;
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
             return sub_part_size_at<kNumSubParts>(part_size(p), stored_flushed_subs);
@@ -540,23 +544,31 @@ hybrid_unordered_dispatch_impl(
             return stored_flushed_subs + 1 >=
                 num_sub_parts_at<kNumSubParts>(part_size(kNumParts - 1));
         };
-        const auto flush_part = [&](const int& up_to, const bool& is_final) {
-            if (lane_idx >= kNumScaleoutRanks or lane_idx == scaleout_rank_idx)
-                return;
+        // NOTES: called by all lanes, so that `guarded_post` can use a lane that does not post (the local rank's)
+        // to watch the posting lanes; each lane still keeps the state of its own destination
+        const auto flush_part = [&](const bool& want, const int& up_to, const bool& is_final) {
+            const bool do_post = want and lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx;
             const int part_idx = stored_flushed_parts;
             const int sub_idx = stored_flushed_subs;
             const int count = up_to - coalesce_flushed;
             const int slot = sub_slot(part_idx, sub_idx);
-            auto send_ch = scaleout_send_buffer.get_rank_buffer(lane_idx)
+            auto send_ch = scaleout_send_buffer.get_rank_buffer(do_post ? lane_idx : 0)
                                .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
-            stage_part_header(send_ch, slot, count, /*more=*/not is_final);
-            const int num_put_tokens = count > 0 ? count : 1;
-            gin.put<ncclTeamTagRail>(
-                scaleout_recv_buffer.get_token_buffer(slot).get_base_ptr(),
-                send_ch.get_token_buffer(slot).get_base_ptr(),
-                scaleout_token_layout.get_num_bytes<false>() * num_put_tokens,
-                lane_idx, 0,
-                ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
+            if (do_post)
+                stage_part_header(send_ch, slot, count, /*more=*/not is_final);
+            comm::guarded_post<kNumTimeoutCycles>(do_post, [&]() {
+                const int num_put_tokens = count > 0 ? count : 1;
+                comm::wait_sq_room<kNumTimeoutCycles>("hybrid dispatch send", gin.gin, 1, sq_completed_cache,
+                                                      scaleout_rank_idx, scaleup_rank_idx);
+                gin.put<ncclTeamTagRail>(
+                    scaleout_recv_buffer.get_token_buffer(slot).get_base_ptr(),
+                    send_ch.get_token_buffer(slot).get_base_ptr(),
+                    scaleout_token_layout.get_num_bytes<false>() * num_put_tokens,
+                    lane_idx, 0,
+                    ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
+            }, "hybrid dispatch send", scaleout_rank_idx, scaleup_rank_idx);
+            if (not do_post)
+                return;
             coalesce_flushed = up_to;
             if (sub_idx + 1 >= num_sub_parts_at<kNumSubParts>(part_size(part_idx))) {
                 stored_flushed_subs = 0;
@@ -763,21 +775,17 @@ hybrid_unordered_dispatch_impl(
             // Preload the next token (overlapping with the scale-out put issues)
             preload_next_token(token_idx + kNumChannels);
 
-            if (stored_flushed_parts < kNumParts and
-                stored_scaleout_tail >= coalesce_flushed + cur_sub_size()) {
-                flush_part(stored_scaleout_tail, /*is_final=*/is_last_sub_put());
-            }
+            flush_part(stored_flushed_parts < kNumParts and stored_scaleout_tail >= coalesce_flushed + cur_sub_size(),
+                       stored_scaleout_tail, /*is_final=*/is_last_sub_put());
             __syncwarp();
 
             // Issue scale-out tail update
             update_scaleout_tail();
         }
 
-        if (stored_scaleout_tail > coalesce_flushed) {
-            flush_part(stored_scaleout_tail, /*is_final=*/true);
-        } else if (stored_flushed_parts < kNumParts) {
-            flush_part(coalesce_flushed, /*is_final=*/true);
-        }
+        const bool has_tail = stored_scaleout_tail > coalesce_flushed;
+        flush_part(has_tail or stored_flushed_parts < kNumParts, has_tail ? stored_scaleout_tail : coalesce_flushed,
+                   /*is_final=*/true);
         __syncwarp();
 
         // Flush unflushed tails

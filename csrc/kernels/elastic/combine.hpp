@@ -164,9 +164,10 @@ static void* launch_combine(void* x,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
                             const at::cuda::CUDAStream& stream) {
-    // Maximize shared memory utilization
+    // Maximize shared memory utilization (the diagnostics' tail stays free, see `kNumDiagSmemBytes`)
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
-    auto num_warps = std::min(num_smem_bytes / token_layout.get_num_bytes<true>(), 32);
+    const int num_layout_smem_bytes = num_smem_bytes - kNumDiagSmemBytes;
+    auto num_warps = std::min(num_layout_smem_bytes / token_layout.get_num_bytes<true>(), 32);
 
     // Decide warps
     const bool use_ordered_kernel = use_ordered_hybrid_kernel();
@@ -181,7 +182,7 @@ static void* launch_combine(void* x,
         if (use_ordered_kernel) {
             // The ordered kernel has no proxy warp and only carves TMA buffers out of shmem.
             num_warps = num_scaleup_warps + num_forward_warps;
-            EP_HOST_ASSERT(num_warps * token_layout.get_num_bytes<true>() <= num_smem_bytes and
+            EP_HOST_ASSERT(num_warps * token_layout.get_num_bytes<true>() <= num_layout_smem_bytes and
                            "Invalid combine SM count, please try to match your dispatch config");
         } else {
             const auto num_data_warps = num_scaleup_warps + num_forward_warps;
@@ -197,7 +198,7 @@ static void* launch_combine(void* x,
             const int64_t proxy_ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
                 num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault);
             // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
-            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
+            EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_layout_smem_bytes and
                            "Combine TMA buffers + proxy rings exceed per-block shared memory");
         }
     }

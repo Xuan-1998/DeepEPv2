@@ -897,15 +897,17 @@ public:
         // Only for hybrid version
         int num_channels_per_sm = 1, num_channels = 1;
         const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
+        // NOTES: the kernel launches with `num_smem_bytes`, the channel layout must leave the diagnostics' tail free
+        const int num_layout_smem_bytes = num_smem_bytes - kNumDiagSmemBytes;
         if (nccl_context->num_scaleout_ranks > 1) {
             const auto dispatch_token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
             const auto combine_token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
             EP_HOST_ASSERT(num_sms <= kNumMaxSMs);
             num_channels_per_sm = std::min<int>(
-                (num_smem_bytes - get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts)) / dispatch_token_layout.get_num_bytes<true>(),
+                (num_layout_smem_bytes - get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts)) / dispatch_token_layout.get_num_bytes<true>(),
                 32 - kNumNotifyWarps);
             num_channels_per_sm = std::min<int>(
-                num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
+                num_layout_smem_bytes / combine_token_layout.get_num_bytes<true>(),
                 num_channels_per_sm);
             if (elastic::use_ordered_hybrid_kernel()) {
                 // The ordered kernel carves one send + one forward TMA buffer per channel and has
@@ -926,7 +928,7 @@ public:
             EP_HOST_ASSERT(static_cast<int64_t>(dispatch_buffers_per_channel) * num_channels_per_sm *
                                    dispatch_token_layout.get_num_bytes<true>() +
                                get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts) <=
-                           num_smem_bytes and
+                           num_layout_smem_bytes and
                            "dispatch TMA pool exceeds the shared-memory budget");
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
@@ -950,7 +952,7 @@ public:
                            combine_token_layout.get_num_bytes<true, int64_t>() +
                        elastic::ProxyRingLayout::get_num_bytes(num_channels_per_sm,
                                                                elastic::kProxyRingDepthDefault) >
-                   num_smem_bytes)
+                   num_layout_smem_bytes)
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
                            "shared memory cannot host a single dispatch channel at this token size");

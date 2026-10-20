@@ -258,11 +258,12 @@ static void launch_dispatch(void* x, void* sf,
     int num_scaleout_warps = 0, num_forward_warps = 0;
     int num_threads = 0;
 
-    // Maximize shared memory utilization
+    // Maximize shared memory utilization (the diagnostics' tail stays free, see `kNumDiagSmemBytes`)
     if (num_scaleout_ranks == 1) {
         const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
         num_dispatch_warps = std::min<int>(
-            (num_smem_bytes - num_notify_smem_bytes) / token_layout.get_num_bytes<true>(), 32 - num_notify_warps);
+            (num_smem_bytes - kNumDiagSmemBytes - num_notify_smem_bytes) / token_layout.get_num_bytes<true>(),
+            32 - num_notify_warps);
         num_threads = (num_notify_warps + num_dispatch_warps) * 32;
     } else {
         // Hybrid kernels

@@ -88,6 +88,10 @@ union sf_pack_t {
 };
 
 constexpr int kNumTMAAlignedBytes = 16;
+
+// The last bytes of the dynamic shared memory belong to the timeout diagnostics (see `comm::diag_smem_base`).
+// Kernels launch with the whole opt-in size, so the host sizes every shared-memory layout without them.
+constexpr int kNumDiagSmemBytes = 1024;
 constexpr int kNumAlignedSFPacks = 16 / sizeof(sf_pack_t);
 
 // Some communication channel settings

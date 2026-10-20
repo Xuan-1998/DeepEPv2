@@ -802,12 +802,26 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         constexpr bool kSingleLaneSweeper = false;
         #endif
 
+        // The posting lanes stamp the start of every put, and the last lane watches the stamps (`comm::proxy_watchdog`)
+        constexpr int kNumPostingLanes = kSingleLaneSweeper ? 1 : kNumForwardWarps;
+        EP_STATIC_ASSERT(kNumPostingLanes < 31, "The last lane is the watchdog");
+        const auto put_start = comm::proxy_put_start_slots();
+        if (lane_idx < kNumPostingLanes)
+            put_start[lane_idx] = 0;
+        if (lane_idx == 0)
+            *comm::proxy_active_slot() = kNumPostingLanes;
+        __syncwarp();
+        const auto finish_posting_lane = [&]() {
+            __threadfence_block();
+            atomicSub_block(comm::proxy_active_slot(), 1);
+        };
+
         if constexpr (kSingleLaneSweeper) {
             // Sequential design: one lane sweeps all rings, issues puts serially.
             // Owns per-ring GIN contexts (built inline so each put routes to its
             // channel's QP). Best when per-put cost is high enough that warp-lockstep
             // parallelism doesn't pay off (B200 SM100).
-            if (ptx::elect_one_sync()) {
+            if (lane_idx == 0) {
                 int num_forward_warps_done_cnt = 0;
                 unsigned tail[kNumForwardWarps] = {};
                 bool ring_done[kNumForwardWarps] = {};
@@ -824,8 +838,12 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, mode);
                 }
 
+                // The sweeper has no single condition to wait on, so it times the gap since the last put or
+                // finished ring: a forward warp stuck outside its timed waits would otherwise keep it spinning
+                int64_t last_progress_clock = clock64();
                 while (num_forward_warps_done_cnt < kNumForwardWarps) {
                     int gin_put_ops = 0;
+                    bool ring_finished = false;
 
                     #pragma unroll
                     for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
@@ -839,12 +857,14 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                                 tail[forward_warp_idx] == ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx))) {
                                 ring_done[forward_warp_idx] = true;
                                 ++ num_forward_warps_done_cnt;
+                                ring_finished = true;
                             }
                             continue;
                         }
 
                         const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
                             tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
+                        put_start[0] = clock64();
                         gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
                             desc.recv_ptr, desc.send_ptr,
                             desc.num_bytes,
@@ -852,11 +872,24 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                             0, /*flags=0*/
                             ncclGin_SignalAdd{ring_signal_id[forward_warp_idx], static_cast<uint64_t>(1)}
                         );
+                        put_start[0] = 0;
 
                         ++ tail[forward_warp_idx];
                         ptx::st_release_cta(proxy_ring_layout.get_tail(forward_warp_idx), tail[forward_warp_idx]);
                         ++ gin_put_ops;
                     }
+
+                    comm::check_progress<kNumTimeoutCycles>(last_progress_clock, gin_put_ops > 0 or ring_finished, [&]() {
+                        #pragma unroll
+                        for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
+                            comm::print_proxy_ring_state(
+                                "proxy sweeper", scaleout_rank_idx, scaleup_rank_idx, sm_idx, forward_warp_idx,
+                                static_cast<int>(ring_done[forward_warp_idx]),
+                                ptx::ld_acquire_cta(proxy_ring_layout.get_head(forward_warp_idx)),
+                                tail[forward_warp_idx],
+                                ptx::ld_acquire_cta(proxy_ring_layout.get_done(forward_warp_idx)));
+                        }
+                    });
 
                     if (gin_put_ops == 0)
                         __nanosleep(1000);
@@ -865,9 +898,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 #pragma unroll
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
                     comm::flush_with_timeout<kNumTimeoutCycles>(
-                        gin_ctx[forward_warp_idx].gin, ncclCoopThread());
+                        gin_ctx[forward_warp_idx].gin, ncclCoopThread(), scaleout_rank_idx, scaleup_rank_idx);
+                finish_posting_lane();
             }
-            __syncwarp();
         } else {
             // Parallel design: each lane represents one forward warp within this SM
             // and drains its own ring. Warp-lockstep parallelism across up to
@@ -880,6 +913,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
                 unsigned tail = 0;
 
+                // Watchdog, as for the sweeper: each lane times the gap since its last put
+                int64_t last_progress_clock = clock64();
                 while (true) {
                     const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx));
                     if (tail == head) {
@@ -891,10 +926,17 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         } else if (tail != 0 and (tail % static_cast<unsigned>(kNumForwardWarps)) == 0) {
                             __nanosleep(1000); // release context for data warps
                         }
+                        comm::check_progress<kNumTimeoutCycles>(last_progress_clock, false, [&]() {
+                            comm::print_proxy_ring_state(
+                                "proxy lane", scaleout_rank_idx, scaleup_rank_idx, sm_idx, lane_idx, 0,
+                                ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx)), tail,
+                                ptx::ld_acquire_cta(proxy_ring_layout.get_done(lane_idx)));
+                        });
                         continue;
                     }
 
                     const auto& desc = ring[tail % static_cast<unsigned>(kProxyRingDepth)];
+                    put_start[lane_idx] = clock64();
                     gin.put<ncclTeamTagRail>(
                         desc.recv_ptr, desc.send_ptr,
                         desc.num_bytes,
@@ -902,14 +944,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                         0, /*flags=0*/
                         ncclGin_SignalAdd{signal_id, static_cast<uint64_t>(1)}
                     );
+                    put_start[lane_idx] = 0;
 
                     ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
                     ++ tail;
+                    last_progress_clock = clock64();
                 }
 
-                comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread());
+                comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread(), scaleout_rank_idx, scaleup_rank_idx);
+                finish_posting_lane();
             }
         }
+
+        if (lane_idx == 31)
+            comm::proxy_watchdog<kNumTimeoutCycles>(kNumPostingLanes, "combine proxy", scaleout_rank_idx, scaleup_rank_idx);
+        __syncwarp();
     }
 
     // No barrier at epilogue

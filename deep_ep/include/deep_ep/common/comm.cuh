@@ -65,12 +65,187 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
+// Watchdog for loops without a single condition to wait on (the combine proxy warp sweeps several rings):
+// the caller says whether the iteration made progress, and after two timeout budgets without any, `func`
+// prints and the thread traps. Two budgets, so that a forward warp waiting for its own data reports first.
+template <int64_t kNumTimeoutCycles, typename func_t>
+__device__ __forceinline__ void check_progress(int64_t& last_progress_clock, const bool& progressed,
+                                               const func_t& func) {
+    const auto now = clock64();
+    if (progressed) {
+        last_progress_clock = now;
+        return;
+    }
+    if (now - last_progress_clock < 2 * kNumTimeoutCycles)
+        return;
+    func();
+    while (clock64() - now < kNumOneSecCycles) {}
+    ptx::trap();
+}
+
+__device__ __forceinline__ void print_proxy_ring_state(const char* where, const int scaleout_rank_idx,
+                                                       const int scaleup_rank_idx, const int sm_idx,
+                                                       const int forward_warp_idx, const int ring_done,
+                                                       const unsigned head, const unsigned tail, const int done_flag) {
+    printf("DeepEP combine (%s) no progress timeout, scale-out: %d, scale-up: %d, sm: %d, forward warp: %d, "
+           "ring done: %d, head: %u, tail: %u, done flag: %d\n",
+           where, scaleout_rank_idx, scaleup_rank_idx, sm_idx, forward_warp_idx, ring_done, head, tail, done_flag);
+}
+
+// `ncclGin::put` and `ncclGin::signal` spin without a timeout in the EFA GDA backend while the send queue is
+// full: the slot to reserve must be within `sq_size` of the NIC's FI_WRITE counter. The posting lane waits
+// here first, with a timeout, for room for `num_wqes` more WQEs. The NIC counter only grows, so the caller's
+// `cached_completed` is a lower bound of it: the fast path is one load of the reservation cursor, and the
+// counter is read about once per `sq_size` posts.
+static constexpr uint32_t kSqCompletedUnset = 0xffffffffu;  // Never a counter value, the counter wraps at 2^31
+
+template <int64_t kNumTimeoutCycles>
+__device__ __forceinline__ uint32_t wait_sq_room_slow(const char* where, const ncclGinCtx& ctx, const uint32_t& num_wqes,
+                                                      const uint32_t& reserved,
+                                                      const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    uint32_t completed = 0;
+#if NCCL_GIN_EFA_GDA_ENABLE
+    const auto* dev = nccl::gin::efa_gda::getDevHandle(ctx);
+    const uint32_t sq_size = dev->data.sq_size;
+    timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+        completed = static_cast<uint32_t>(
+            nccl::gin::efa_gda::hwCounterLoad<cuda::memory_order_relaxed>(dev->data.local_cntr_value));
+        if (((reserved + num_wqes - completed) & nccl::gin::efa_gda::EFA_CNTR_MASK) <= sq_size)
+            return true;
+        if (is_last_check) {
+            printf("DeepEP GIN send queue full timeout (%s), scale-out: %d, scale-up: %d, sm: %d, thread: %d, "
+                   "ctx: %d, SQ size: %u, reserved: %u, completed by the NIC: %u, wanted: %u WQEs\n",
+                   where, scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
+                   ctx.contextId, sq_size, reserved, completed, num_wqes);
+        }
+        return false;
+    });
+#endif
+    return completed;
+}
+
+template <int64_t kNumTimeoutCycles, typename nccl_gin_t>
+__device__ __forceinline__ void wait_sq_room(const char* where, const nccl_gin_t& nccl_gin, const uint32_t& num_wqes,
+                                             uint32_t& cached_completed,
+                                             const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+#if NCCL_GIN_EFA_GDA_ENABLE
+    const auto ctx = nccl_gin._makeCtx();
+    if (ctx.backend != NCCL_NET_DEVICE_GIN_EFA_GDA)
+        return;
+    const auto* dev = nccl::gin::efa_gda::getDevHandle(ctx);
+    const auto reserved = *reinterpret_cast<const volatile uint32_t*>(
+        &static_cast<const efa_cuda_qp*>(dev->data.qp)->sq.wq.pc);
+    if (cached_completed != kSqCompletedUnset and
+        ((reserved + num_wqes - cached_completed) & nccl::gin::efa_gda::EFA_CNTR_MASK) <= dev->data.sq_size)
+        return;
+    cached_completed = wait_sq_room_slow<kNumTimeoutCycles>(where, ctx, num_wqes, reserved,
+                                                            scaleout_rank_idx, scaleup_rank_idx);
+#endif
+}
+
+// Shared memory of the diagnostics below: the last `kNumDiagSmemBytes` of the dynamic region, which the host
+// leaves out of every shared-memory layout. Static `__shared__` would not fit, as the kernels launch with the
+// whole opt-in size. A kernel launched with less dynamic memory (the barrier kernel launches with none) gets
+// `nullptr`.
+static constexpr int kDiagNannyMaskOffset = 0;          // `uint32_t[32]`, one per warp
+static constexpr int kDiagProxyPutStartOffset = 128;    // `int64_t[32]`, one per lane of the proxy warp
+static constexpr int kDiagProxyActiveOffset = 384;      // `int`
+EP_STATIC_ASSERT(kDiagProxyActiveOffset + static_cast<int>(sizeof(int)) <= kNumDiagSmemBytes, "Diagnostics exceed their reserve");
+
+__device__ __forceinline__ int8_t* diag_smem_base() {
+    extern __shared__ __align__(16) int8_t diag_smem_alias[];
+    uint32_t num_dynamic_smem_bytes;
+    asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(num_dynamic_smem_bytes));
+    if (num_dynamic_smem_bytes < static_cast<uint32_t>(kNumDiagSmemBytes))
+        return nullptr;
+    return diag_smem_alias + num_dynamic_smem_bytes - kNumDiagSmemBytes;
+}
+
+// Lane nanny for GIN posts. Besides a full send queue, `ncclGin::put` can spin forever on the backend's
+// un-rung backlog or on the doorbell turn of an earlier poster, which `wait_sq_room` cannot see. Call from
+// all 32 lanes: the lanes with `do_post` run `post`, the lowest other lane watches a per-warp mask of the
+// lanes that returned and reports the ones that did not. Independent thread scheduling runs the two
+// divergent paths side by side. There is no nanny when all 32 lanes post or without diagnostics memory.
+template <int64_t kNumTimeoutCycles, typename post_t>
+__device__ __forceinline__ void guarded_post(const bool& do_post, const post_t& post, const char* where,
+                                             const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    const unsigned post_mask = __ballot_sync(0xffffffffu, do_post);
+    if (post_mask == 0)
+        return;
+
+    // NOTES: `post` must be inlined only once, a second copy of `ncclGin::put` costs spills in the dispatch
+    const int warp_idx = static_cast<int>(threadIdx.x) / 32, lane_idx = static_cast<int>(threadIdx.x) % 32;
+    const auto diag_smem = diag_smem_base();
+    const bool has_nanny = diag_smem != nullptr and post_mask != 0xffffffffu;
+    const int nanny_lane_idx = has_nanny ? __ffs(~post_mask) - 1 : -1;
+    const auto returned = has_nanny ? reinterpret_cast<unsigned*>(diag_smem + kDiagNannyMaskOffset) + warp_idx : nullptr;
+    if (lane_idx == nanny_lane_idx)
+        *returned = 0;
+    __syncwarp();
+
+    if (do_post) {
+        post();
+        if (has_nanny) {
+            __threadfence_block();
+            atomicOr_block(returned, 1u << lane_idx);
+        }
+    } else if (lane_idx == nanny_lane_idx) {
+        timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+            const auto returned_mask = *reinterpret_cast<volatile unsigned*>(returned);
+            if (returned_mask == post_mask)
+                return true;
+            if (is_last_check) {
+                printf("DeepEP GIN post stuck (%s), scale-out: %d, scale-up: %d, sm: %d, warp: %d, "
+                       "stuck lanes: 0x%08x, posting lanes: 0x%08x\n",
+                       where, scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), warp_idx,
+                       post_mask & ~returned_mask, post_mask);
+            }
+            return false;
+        });
+    }
+    __syncwarp();
+}
+
+// Watchdog lane for the combine proxy warp, whose posting lanes run their own loops, so a warp-uniform
+// nanny does not fit. Each posting lane stamps the start of a put and clears it after, and the watching
+// lane scans the stamps until the active count of posting lanes reaches 0.
+__device__ __forceinline__ volatile int64_t* proxy_put_start_slots() {
+    return reinterpret_cast<volatile int64_t*>(diag_smem_base() + kDiagProxyPutStartOffset);
+}
+
+__device__ __forceinline__ int* proxy_active_slot() {
+    return reinterpret_cast<int*>(diag_smem_base() + kDiagProxyActiveOffset);
+}
+
+template <int64_t kNumTimeoutCycles>
+__device__ __forceinline__ void proxy_watchdog(const int& num_posting_lanes, const char* where,
+                                               const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    const auto active = reinterpret_cast<volatile int*>(proxy_active_slot());
+    const auto put_start = proxy_put_start_slots();
+    while (*active > 0) {
+        const auto now = clock64();
+        for (int i = 0; i < num_posting_lanes; ++ i) {
+            const auto start = put_start[i];
+            if (start != 0 and now - start >= kNumTimeoutCycles) {
+                printf("DeepEP GIN post stuck (%s), scale-out: %d, scale-up: %d, sm: %d, lane: %d inside put for %lld cycles\n",
+                       where, scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), i,
+                       static_cast<long long>(now - start));
+                const auto print_clock = clock64();
+                while (clock64() - print_clock < kNumOneSecCycles) {}
+                ptx::trap();
+            }
+        }
+        __nanosleep(2000);
+    }
+}
+
 template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
-__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
+__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop,
+                                                   const int& scaleout_rank_idx = -1, const int& scaleup_rank_idx = -1) {
     if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
                   static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
-        printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
-               static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+        printf("DeepEP Gin flush timeout, scale-out: %d, scale-up: %d, sm: %d, thread: %d\n",
+               scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
         ptx::trap();
     }
 }
@@ -200,7 +375,8 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
     // Flush all QPs by all SMs (only needed for release semantics)
     if constexpr (kFlushStores) {
         for (int i = global_warp_idx; i < num_qps; i += kNumSMs * kNumWarps) {
-            ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA).flush(ncclCoopWarp());
+            flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA),
+                                                  ncclCoopWarp(), scaleout_rank_idx, scaleup_rank_idx);
         }
 
         // World-team barriers may mix direct NVLink writes with GIN signals, so a system-scope
@@ -225,10 +401,15 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
         // So on receiver R, each of the (kNumRanks - 1) slots gets exactly +1 from a
         // distinct sender, and the wait side just iterates all slots looking for one
         // increment per slot.
-        for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
-            if (i == rank_idx) continue;
-            const auto sig = static_cast<ncclGinSignal_t>((rank_idx < i) ? rank_idx : (rank_idx - 1));
-            gin.signal(team, i, ncclGin_SignalInc{sig});
+        // NOTES: every thread runs the same trip count, `guarded_post` needs warp-uniform calls
+        uint32_t sq_completed_cache = kSqCompletedUnset;
+        for (int base = 0; base < kNumRanks; base += kNumThreads) {
+            const int i = base + thread_idx;
+            guarded_post<kNumTimeoutCycles>(i < kNumRanks and i != rank_idx, [&]() {
+                const auto sig = static_cast<ncclGinSignal_t>((rank_idx < i) ? rank_idx : (rank_idx - 1));
+                wait_sq_room<kNumTimeoutCycles>("barrier signal", gin, 1, sq_completed_cache, scaleout_rank_idx, scaleup_rank_idx);
+                gin.signal(team, i, ncclGin_SignalInc{sig});
+            }, "barrier signal", scaleout_rank_idx, scaleup_rank_idx);
         }
 
         for (int i = thread_idx; i < kNumRanks - 1; i += kNumThreads) {
