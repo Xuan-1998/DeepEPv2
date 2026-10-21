@@ -576,25 +576,42 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Replay the dispatch: the remote region of the forward list first (entries 0, 1, ...
         // up to a negative mark), then the local region (entries kForwardListTop,
         // kForwardListTop - 1, ... down to a negative mark); see the dispatch forwarder.
+        // The next entry is loaded as soon as the current one is known valid, so its latency
+        // overlaps the current token's tail wait and reduce. A valid remote entry i has
+        // i + 1 <= remote_count <= kForwardListTop and a valid local entry i has
+        // i - 1 >= kForwardListTop - local_count >= 0, so the loads stay inside the list.
         constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
-        bool in_local_region = false;
-        for (int i = 0; ; i += in_local_region ? -1 : 1) {
-            auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
-            if (src_token_global_idx < 0 and not in_local_region) {
-                in_local_region = true;
-                i = kForwardListTop;
-                src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+        const auto load_forward_entry = [&](const int* ptr, int& token_global_idx, int& topk_scaleup_rank_idx, int& topk_slot_idx) {
+            token_global_idx = __ldg(ptr);
+            topk_scaleup_rank_idx = lane_idx < kNumTopk ? __ldg(ptr + 2 + lane_idx) : -1;
+            topk_slot_idx = lane_idx < kNumTopk ? __ldg(ptr + 2 + kNumTopk + lane_idx) : -1;
+        };
+        const int* entry_ptr = token_metadata_at_forward;
+        int entry_stride = kNumForwardMetadataDims;
+        int next_src_token_global_idx, next_src_scaleup_rank_idx, next_src_slot_idx;
+        load_forward_entry(entry_ptr, next_src_token_global_idx, next_src_scaleup_rank_idx, next_src_slot_idx);
+        while (true) {
+            const auto src_token_global_idx = next_src_token_global_idx;
+            auto stored_src_scaleup_rank_idx = next_src_scaleup_rank_idx;
+            auto stored_src_slot_idx = next_src_slot_idx;
+            if (src_token_global_idx < 0) {
+                // The remote region ended: continue with the local region, from the top down
+                if (entry_stride < 0)
+                    break;
+                entry_stride = -kNumForwardMetadataDims;
+                entry_ptr = token_metadata_at_forward + kForwardListTop * kNumForwardMetadataDims;
+                load_forward_entry(entry_ptr, next_src_token_global_idx, next_src_scaleup_rank_idx, next_src_slot_idx);
+                continue;
             }
+
+            // Load the next entry of this region before working on this one
+            entry_ptr += entry_stride;
+            load_forward_entry(entry_ptr, next_src_token_global_idx, next_src_scaleup_rank_idx, next_src_slot_idx);
+
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
             const auto src_token_idx = src_token_global_idx % kNumMaxTokensPerRank;
-            auto stored_src_scaleup_rank_idx = lane_idx < kNumTopk ?
-                __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + lane_idx) : -1;
-            auto stored_src_slot_idx = lane_idx < kNumTopk ?
-                __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + kNumTopk + lane_idx) : -1;
-            if (src_token_global_idx < 0)
-                break;
 
             // Scaleup rank mask
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up peers");
