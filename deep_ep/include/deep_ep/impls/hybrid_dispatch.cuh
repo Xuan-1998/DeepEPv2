@@ -638,15 +638,19 @@ hybrid_dispatch_impl(
             token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims] = -1;
         __syncwarp();
 
-        // Update linked list's ending position
+        // Update linked list's ending position. The copy epilogue reads the tail word as two
+        // packed region counts (see the unordered dispatch); this kernel records every token in
+        // the first region, so the count goes in the low half and the second region stays empty.
         if constexpr (not kReuseSlotIndices) {
+            EP_STATIC_ASSERT(kNumScaleoutRanks * kNumMaxTokensPerChannel < (1 << 16),
+                             "Forward list counts must pack into 16 bits");
             const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
                 if (const auto j = i * 32 + lane_idx; i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks) {
                     ptx::st_relaxed_sys(
                         gin.get_sym_ptr<ncclTeamTagLsa>(tail_ptr, j),
-                        transform_linked_list_idx(stored_scaleup_send_counters[i]));
+                        stored_scaleup_send_counters[i]);
                 }
             }
         }
