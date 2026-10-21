@@ -183,22 +183,38 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             __syncwarp();
         };
 
-        // Shape of `channel_linked_list`: `[kNumChannels, kNumMaxTokensPerChannel + 1, kNumScaleupRanks]`
+        // Shape of `channel_linked_list`: `[kNumChannels, kNumScaleoutRanks * kNumMaxTokensPerChannel + 1, kNumScaleupRanks]`
+        // Each (channel, source) list has two regions, laid out by the dispatch forwarder: tokens
+        // the source got from remote scale-out ranks at entries 0, 1, ... and tokens it got from
+        // its local rank at entries kForwardListTop, kForwardListTop - 1, ... Walk the remote
+        // region up to its negative mark, then the local region down to its mark, so the partials
+        // reach the source in the order its forward warp replays them (remote first).
         // Iterate until all scale-up peers finish
+        constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
         int dst_scaleup_rank_idx = channel_idx;
         int stored_ll_idx[kNumScaleupRanksPerLane] = {}, stored_token_idx[kNumScaleupRanksPerLane] = {};
+        bool stored_ll_local[kNumScaleupRanksPerLane] = {};
         #pragma unroll
         for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
             stored_token_idx[i] = -1;
+        const auto load_ll_entry = [&](const int& i) {
+            const auto j = i * 32 + lane_idx;
+            return i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks ?
+                __ldg(channel_linked_list +
+                      channel_idx * (kForwardListTop + 1) * kNumScaleupRanks +
+                      stored_ll_idx[i] * kNumScaleupRanks + j) : -1;
+        };
         while (true) {
-            // Load token indices in the list
+            // Load token indices in the list; a lane whose remote region just ended moves to the
+            // top of its local region
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
-                const auto j = i * 32 + lane_idx;
-                stored_token_idx[i] = i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks ?
-                    __ldg(channel_linked_list +
-                          channel_idx * (kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumScaleupRanks +
-                          stored_ll_idx[i] * kNumScaleupRanks + j) : -1;
+                stored_token_idx[i] = load_ll_entry(i);
+                if (stored_token_idx[i] < 0 and not stored_ll_local[i]) {
+                    stored_ll_local[i] = true;
+                    stored_ll_idx[i] = kForwardListTop;
+                    stored_token_idx[i] = load_ll_entry(i);
+                }
             }
             __syncwarp();
 
@@ -376,10 +392,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             // NOTES: TMA wait is inside
             update_tails();
 
-            // Move linked list
+            // Move linked list (up in the remote region, down in the local one)
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i)
-                stored_ll_idx[i] += (stored_token_idx[i] >= 0);
+                stored_ll_idx[i] += stored_token_idx[i] >= 0 ? (stored_ll_local[i] ? -1 : 1) : 0;
         }
 
         // Update for the unissued ones
@@ -482,10 +498,19 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             __syncwarp();
         };
 
-        // Replay the dispatch
+        // Replay the dispatch: the remote region of the forward list first (entries 0, 1, ...
+        // up to a negative mark), then the local region (entries kForwardListTop,
+        // kForwardListTop - 1, ... down to a negative mark); see the dispatch forwarder.
+        constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
-        for (int i = 0; ; ++ i) {
-            const auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+        bool in_local_region = false;
+        for (int i = 0; ; i += in_local_region ? -1 : 1) {
+            auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+            if (src_token_global_idx < 0 and not in_local_region) {
+                in_local_region = true;
+                i = kForwardListTop;
+                src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+            }
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
             const auto src_token_idx = src_token_global_idx % kNumMaxTokensPerRank;

@@ -813,11 +813,23 @@ hybrid_unordered_dispatch_impl(
                 idx * kNumScaleupRanks + scaleup_rank_idx;
         };
 
+        // Forward list layout, shared by the metadata list and the per-peer linked lists: tokens
+        // from remote scale-out sources fill entries 0, 1, ... in processing order, tokens from
+        // the local source fill entries kForwardListTop, kForwardListTop - 1, ... in processing
+        // order. Combine replays the remote region first and then the local region, so it meets
+        // every remote token (a `gin.put`) before any local one (an NVLink bypass) whatever order
+        // the forwarder consumed them in. Each region ends at a negative entry; the regions never
+        // overlap because remote entries number at most (kNumScaleoutRanks - 1) *
+        // kNumMaxTokensPerChannel and local ones at most kNumMaxTokensPerChannel.
+        constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
+        EP_STATIC_ASSERT(kForwardListTop < (1 << 16), "Forward list counts must pack into 16 bits");
+
         // Forward tokens from scale-out ranks
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Too many scale-out ranks");
-        int num_tokens_processed = 0;
+        int num_remote_processed = 0, num_local_processed = 0;
         int stored_scaleout_old_tail_idx = 0;
-        int stored_scaleup_send_counters[kNumScaleupRanksPerLane] = {};
+        int stored_scaleup_remote_counters[kNumScaleupRanksPerLane] = {};
+        int stored_scaleup_local_counters[kNumScaleupRanksPerLane] = {};
         int stored_finish_flag = lane_idx >= kNumScaleoutRanks;
         int stored_scaleout_tail_idx = 0;
         int recv_scaleout_rank_idx = channel_idx % kNumScaleoutRanks;
@@ -933,6 +945,7 @@ hybrid_unordered_dispatch_impl(
                 stored_scaleout_old_tail_idx = end_slot_idx;
 
             const auto recv_buffer = scaleout_recv_buffer.get_rank_buffer(recv_scaleout_rank_idx);
+            const bool is_local_chunk = recv_scaleout_rank_idx == scaleout_rank_idx;
 
             const layout::TokenLayout fwd_bufs[2] = {tma_buffer, tma_buffer_alt};
             ptx::mbarrier* const fwd_mbs[2] = {mbarrier_ptr, mbarrier_ptr_alt};
@@ -987,14 +1000,17 @@ hybrid_unordered_dispatch_impl(
                 stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
                     dst_expert_idx / kNumExpertsPerRank : -1;
 
-                // Write the per-scaleup channel index for this token
+                // Write the per-scaleup channel index for this token (remote region ascending,
+                // local region descending from the top, see `kForwardListTop`)
                 int linked_list_idx = -1;
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                     const auto src_lane_idx = stored_dst_scaleup_rank_idx - j * 32;
                     const bool valid = 0 <= src_lane_idx and src_lane_idx < 32;
-                    const auto exchanged = ptx::exchange(
-                        stored_scaleup_send_counters[j], valid ? src_lane_idx : 0);
+                    const int my_ll_idx = is_local_chunk
+                        ? kForwardListTop - stored_scaleup_local_counters[j]
+                        : stored_scaleup_remote_counters[j];
+                    const auto exchanged = ptx::exchange(my_ll_idx, valid ? src_lane_idx : 0);
                     linked_list_idx = valid ? exchanged : linked_list_idx;
                 }
                 if (not kReuseSlotIndices and lane_idx < kNumTopk) {
@@ -1034,14 +1050,19 @@ hybrid_unordered_dispatch_impl(
                     stored_dst_scaleup_rank_idx >= 0 ?
                     (mask_t(1) << stored_dst_scaleup_rank_idx) : mask_t(0));
                 #pragma unroll
-                for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
-                    stored_scaleup_send_counters[j] += (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
+                for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                    const int sent = (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
+                    stored_scaleup_remote_counters[j] += is_local_chunk ? 0 : sent;
+                    stored_scaleup_local_counters[j] += is_local_chunk ? sent : 0;
+                }
 
                 // Record metadata at forward
                 if constexpr (not kReuseSlotIndices) {
                     EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of selections");
+                    const int list_idx = is_local_chunk
+                        ? kForwardListTop - num_local_processed : num_remote_processed;
                     const auto metadata_ptr = token_metadata_at_forward +
-                        num_tokens_processed * kNumForwardMetadataDims;
+                        list_idx * kNumForwardMetadataDims;
 
                     // Source token index and last token index flag
                     if (ptx::elect_one_sync()) {
@@ -1056,17 +1077,22 @@ hybrid_unordered_dispatch_impl(
                         dst_slot_idx_ptr[lane_idx] = stored_dst_slot_idx;
                     }
                 }
-                num_tokens_processed += 1;
+                num_remote_processed += is_local_chunk ? 0 : 1;
+                num_local_processed += is_local_chunk ? 1 : 0;
                 __syncwarp();
             }
         }
 
-        // Assign the source token index part of the metadata into `-1` as an ending mark
-        if (not kReuseSlotIndices and ptx::elect_one_sync())
-            token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims] = -1;
+        // End both regions with a negative source token index. The remote region's mark is -2
+        // (local region follows at the top); when the two marks coincide, -2 wins.
+        if (not kReuseSlotIndices and ptx::elect_one_sync()) {
+            token_metadata_at_forward[(kForwardListTop - num_local_processed) * kNumForwardMetadataDims] = -1;
+            token_metadata_at_forward[num_remote_processed * kNumForwardMetadataDims] = -2;
+        }
         __syncwarp();
 
-        // Update linked list's ending position
+        // Update linked list's ending positions: the copy epilogue on each peer terminates its
+        // remote region at `remote_count` and its local region at `kForwardListTop - local_count`
         if constexpr (not kReuseSlotIndices) {
             const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
             #pragma unroll
@@ -1074,7 +1100,7 @@ hybrid_unordered_dispatch_impl(
                 if (const auto j = i * 32 + lane_idx; i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks) {
                     ptx::st_relaxed_sys(
                         gin.get_sym_ptr<ncclTeamTagLsa>(tail_ptr, j),
-                        transform_linked_list_idx(stored_scaleup_send_counters[i]));
+                        stored_scaleup_remote_counters[i] | (stored_scaleup_local_counters[i] << 16));
                 }
             }
         }

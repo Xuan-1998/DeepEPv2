@@ -207,18 +207,27 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
     }
 
-    // Maintain linked list's ending
-    // Or you can understand it as writing the tail at once
+    // Maintain the linked lists' endings
+    // Each (channel, source scale-up rank) list holds the tokens that source forwarded to us:
+    // remote-sourced ones at entries 0, 1, ..., local-sourced ones at entries kForwardListTop,
+    // kForwardListTop - 1, ... (see the dispatch forwarder). The forwarder left the two counts
+    // packed in the tail word; terminate both regions and clean the word for combine.
     if constexpr (kDoCreateLinkedList) {
         constexpr int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32);
+        constexpr int kNumListEntries = kNumScaleoutRanks * kNumMaxTokensPerChannel + 1;
+        constexpr int kForwardListTop = kNumListEntries - 1;
         const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
         for (int i = global_warp_idx; i < kNumChannels; i += kNumSMs * kNumWarps) {
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                 if (const auto k = j * 32 + lane_idx; j < (kNumScaleupRanksPerLane - 1) or k < kNumScaleupRanks) {
-                    channel_linked_list[
-                        *workspace_layout.get_channel_scaleup_tail_ptr(i, k)
-                    ] = -1;
+                    const int packed = *workspace_layout.get_channel_scaleup_tail_ptr(i, k);
+                    const int remote_count = packed & 0xffff, local_count = packed >> 16;
+                    const auto flat_idx = [=](const int& idx) {
+                        return i * (kNumListEntries * kNumScaleupRanks) + idx * kNumScaleupRanks + k;
+                    };
+                    channel_linked_list[flat_idx(remote_count)] = -1;
+                    channel_linked_list[flat_idx(kForwardListTop - local_count)] = -1;
 
                     // Clean for combine usages
                     *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;
