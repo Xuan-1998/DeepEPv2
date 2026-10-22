@@ -11,6 +11,7 @@
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+#include <cooperative_groups.h>
 #include <cuda/atomic>
 #include <nccl.h>
 #include <nccl_device.h>
@@ -75,10 +76,15 @@ __device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_
     }
 }
 
-// Grid barrier with a timeout, in place of `cooperative_groups::this_grid().sync()`
+// Grid barrier. With `EP_DEBUG_CHECKS` a counter barrier with a timeout that reports the SMs that did not arrive,
+// the cooperative-groups barrier otherwise
+#ifndef EP_DEBUG_CHECKS
+#define EP_DEBUG_CHECKS 0
+#endif
 template <int64_t kNumTimeoutCycles>
 __device__ __forceinline__ void grid_sync(const layout::WorkspaceLayout& workspace, const char* where,
                                           const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+#if EP_DEBUG_CHECKS
     constexpr uint32_t kGenerationBit = 0x80000000u;
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -103,6 +109,9 @@ __device__ __forceinline__ void grid_sync(const layout::WorkspaceLayout& workspa
         }
     }
     __syncthreads();
+#else
+    cooperative_groups::this_grid().sync();
+#endif
 }
 
 // Channels map onto QPs with a BALANCED CONTIGUOUS (block) partition: fill a QP with
