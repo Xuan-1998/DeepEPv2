@@ -158,6 +158,7 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         } else if (gin_config.gin_context_cnt > 0) {
             reqs.ginContextCount = gin_config.gin_context_cnt;
         }
+        reqs.ginCounterCount = get_env<int>("EP_DEBUG_CHECKS") != 0 ? 1 : 0;
 
         // The unordered kernels synchronize through counting signals only; VA and
         // strong signals are not required.
