@@ -65,6 +65,34 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
+template <int64_t kNumTimeoutCycles>
+__device__ __forceinline__ void wait_send_queue_room(const char* where, const ncclGin& gin, uint32_t& cached_completed,
+                                                     const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+#if NCCL_GIN_EFA_GDA_ENABLE
+    const auto ctx = gin._makeCtx();
+    if (ctx.backend != NCCL_NET_DEVICE_GIN_EFA_GDA)
+        return;
+    const auto* dev = nccl::gin::efa_gda::getDevHandle(ctx);
+    const auto reserved = *reinterpret_cast<const volatile uint32_t*>(&static_cast<const efa_cuda_qp*>(dev->data.qp)->sq.wq.pc);
+    const auto has_room = [&](const uint32_t& completed) {
+        return ((reserved + 1 - completed) & nccl::gin::efa_gda::EFA_CNTR_MASK) <= dev->data.sq_size;
+    };
+    if (has_room(cached_completed))
+        return;
+    timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+        cached_completed = static_cast<uint32_t>(nccl::gin::efa_gda::hwCounterLoad<cuda::memory_order_relaxed>(dev->data.local_cntr_value));
+        if (has_room(cached_completed))
+            return true;
+        if (is_last_check)
+            printf("DeepEP GIN send queue full timeout (%s), scale-out: %d, scale-up: %d, sm: %d, thread: %d, ctx: %d, "
+                   "SQ size: %u, WQEs reserved: %u, completed by the NIC: %u\n",
+                   where, scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
+                   ctx.contextId, dev->data.sq_size, reserved, cached_completed);
+        return false;
+    });
+#endif
+}
+
 template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
 __device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
     if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
@@ -225,9 +253,11 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
         // So on receiver R, each of the (kNumRanks - 1) slots gets exactly +1 from a
         // distinct sender, and the wait side just iterates all slots looking for one
         // increment per slot.
+        uint32_t sq_completed = 0;
         for (int i = thread_idx; i < kNumRanks; i += kNumThreads) {
             if (i == rank_idx) continue;
             const auto sig = static_cast<ncclGinSignal_t>((rank_idx < i) ? rank_idx : (rank_idx - 1));
+            wait_send_queue_room<kNumTimeoutCycles>("Gin barrier signal", gin, sq_completed, scaleout_rank_idx, scaleup_rank_idx);
             gin.signal(team, i, ncclGin_SignalInc{sig});
         }
 

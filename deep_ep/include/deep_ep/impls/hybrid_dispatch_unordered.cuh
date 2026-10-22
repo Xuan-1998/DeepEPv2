@@ -361,11 +361,14 @@ hybrid_unordered_dispatch_impl(
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
+                uint32_t sq_completed = 0;
+                comm::wait_send_queue_room<kNumTimeoutCycles>("hybrid notify put", gin.gin, sq_completed, scaleout_rank_idx, scaleup_rank_idx);
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),
                     kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
                     ncclGinOptFlagsAggregateRequests);
+                comm::wait_send_queue_room<kNumTimeoutCycles>("hybrid notify put", gin.gin, sq_completed, scaleout_rank_idx, scaleup_rank_idx);
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
@@ -530,6 +533,7 @@ hybrid_unordered_dispatch_impl(
         int coalesce_flushed = 0;
         int stored_flushed_parts = 0;
         int stored_flushed_subs = 0;
+        uint32_t sq_completed = 0;
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
             return sub_part_size_at<kNumSubParts>(part_size(p), stored_flushed_subs);
@@ -551,6 +555,7 @@ hybrid_unordered_dispatch_impl(
                                .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
             stage_part_header(send_ch, slot, count, /*more=*/not is_final);
             const int num_put_tokens = count > 0 ? count : 1;
+            comm::wait_send_queue_room<kNumTimeoutCycles>("hybrid dispatch send", gin.gin, sq_completed, scaleout_rank_idx, scaleup_rank_idx);
             gin.put<ncclTeamTagRail>(
                 scaleout_recv_buffer.get_token_buffer(slot).get_base_ptr(),
                 send_ch.get_token_buffer(slot).get_base_ptr(),

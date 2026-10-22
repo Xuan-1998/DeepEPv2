@@ -812,6 +812,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 unsigned tail[kNumForwardWarps] = {};
                 bool ring_done[kNumForwardWarps] = {};
                 ncclGinSignal_t ring_signal_id[kNumForwardWarps];
+                uint32_t sq_completed[kNumForwardWarps] = {};
 
                 alignas(handle::NCCLGin) unsigned char gin_ctx_storage[kNumForwardWarps * sizeof(handle::NCCLGin)];
                 auto* const gin_ctx = reinterpret_cast<handle::NCCLGin*>(gin_ctx_storage);
@@ -845,6 +846,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                         const auto& desc = proxy_ring_layout.get_ring(forward_warp_idx)[
                             tail[forward_warp_idx] % static_cast<unsigned>(kProxyRingDepth)];
+                        comm::wait_send_queue_room<kNumTimeoutCycles>("combine proxy put", gin_ctx[forward_warp_idx].gin,
+                                                                       sq_completed[forward_warp_idx], scaleout_rank_idx, scaleup_rank_idx);
                         gin_ctx[forward_warp_idx].put<ncclTeamTagRail>(
                             desc.recv_ptr, desc.send_ptr,
                             desc.num_bytes,
@@ -879,6 +882,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                 ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
                 unsigned tail = 0;
+                uint32_t sq_completed = 0;
 
                 while (true) {
                     const unsigned head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx));
@@ -895,6 +899,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     }
 
                     const auto& desc = ring[tail % static_cast<unsigned>(kProxyRingDepth)];
+                    comm::wait_send_queue_room<kNumTimeoutCycles>("combine proxy put", gin.gin, sq_completed, scaleout_rank_idx, scaleup_rank_idx);
                     gin.put<ncclTeamTagRail>(
                         desc.recv_ptr, desc.send_ptr,
                         desc.num_bytes,
