@@ -130,8 +130,17 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
             return ctx;
         };
 
+        // EP_DEBUG_CHECKS counts every put on GIN counter 0 of its context, one more QP per
+        // context, which the signal budget has to give up
+        const bool debug_checks = get_env<int>("EP_DEBUG_CHECKS") != 0;
+        const int num_fixed_qps = elastic::gin_alloc::kNumFixedQPsPerContext + (debug_checks ? 1 : 0);
         if (scaleout_active) {
-            gin_config = elastic::gin_alloc::make_gin_resources(resolve_gin_context_cnt());
+            gin_config = elastic::gin_alloc::make_gin_resources(resolve_gin_context_cnt(), num_fixed_qps);
+            EP_HOST_ASSERT(gin_config.gin_context_cnt * gin_config.gin_indexed_signals_cnt >=
+                           elastic::gin_alloc::kMaxScaleoutWarps and
+                           "EP_DEBUG_CHECKS takes one QP per context for its put counter; "
+                           "with it the GIN layout covers every ScaleOut warp only up to 11 contexts, "
+                           "reduce num_allocated_qps");
         } else {
             gin_config.gin_context_cnt = resolve_gin_context_cnt();
             gin_config.gin_indexed_signals_cnt = 0;
@@ -158,6 +167,7 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         } else if (gin_config.gin_context_cnt > 0) {
             reqs.ginContextCount = gin_config.gin_context_cnt;
         }
+        reqs.ginCounterCount = debug_checks ? 1 : 0;
 
         // The unordered kernels synchronize through counting signals only; VA and
         // strong signals are not required.

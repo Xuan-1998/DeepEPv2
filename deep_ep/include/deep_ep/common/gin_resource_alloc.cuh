@@ -56,12 +56,17 @@ static constexpr int kMaxGinContextCnt           = kMaxGinContextBudget;
 static constexpr int kDefaultGinContextCnt       = 11;
 
 // Per-context indexed-signal budget, workaround for current limitations in provider.
-__forceinline__ __device__ __host__ constexpr int gin_indexed_signals_for(int gin_context_cnt) {
-    return (kTotalQPBudget - 2 * gin_context_cnt) / gin_context_cnt;
+// Every context first takes `num_fixed_qps` QPs: the data and the PutValue endpoint, plus one
+// per GIN counter (`EP_DEBUG_CHECKS` asks for one), the rest of the budget goes to signals.
+static constexpr int kNumFixedQPsPerContext = 2;
+__forceinline__ __device__ __host__ constexpr int gin_indexed_signals_for(int gin_context_cnt,
+                                                                          int num_fixed_qps = kNumFixedQPsPerContext) {
+    return (kTotalQPBudget - num_fixed_qps * gin_context_cnt) / gin_context_cnt;
 }
 
-__forceinline__ __device__ __host__ constexpr GinResourceConfig make_gin_resources(int gin_context_cnt) {
-    return GinResourceConfig{gin_indexed_signals_for(gin_context_cnt), gin_context_cnt};
+__forceinline__ __device__ __host__ constexpr GinResourceConfig make_gin_resources(int gin_context_cnt,
+                                                                                   int num_fixed_qps = kNumFixedQPsPerContext) {
+    return GinResourceConfig{gin_indexed_signals_for(gin_context_cnt, num_fixed_qps), gin_context_cnt};
 }
 
 // Each ScaleOut warp (== channel) needs its own dedicated indexed signal id, so the total

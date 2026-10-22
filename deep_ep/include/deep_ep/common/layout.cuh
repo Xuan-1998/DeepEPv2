@@ -13,6 +13,7 @@
 
 #include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/common/gin_resource_alloc.cuh>
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
 
@@ -52,7 +53,9 @@ struct WorkspaceLayout {
         EP_UNIFIED_ASSERT(num_experts_per_rank <= kNumMaxExpertsPerRank);
     }
 
-    static int64_t get_num_bytes() {
+    // Everything before the `EP_DEBUG_CHECKS` put counters, as a constant so that the device side
+    // can find them from the window base without a layout object
+    __forceinline__ __device__ __host__ static constexpr int64_t get_gin_put_posted_offset() {
         // Pure NVLink scaleup barrier signals
         int64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
@@ -89,6 +92,11 @@ struct WorkspaceLayout {
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
         return num_bytes;
+    }
+
+    static int64_t get_num_bytes() {
+        // EP_DEBUG_CHECKS: puts posted per GIN context, read against the context's put counter at a timeout
+        return get_gin_put_posted_offset() + gin_alloc::kMaxGinContextBudget * sizeof(uint32_t);
     }
 
     __forceinline__ __device__ __host__ unsigned long long* get_nvl_barrier_counter_ptr() const {

@@ -4,7 +4,12 @@
 #include <nccl_device.h>
 
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/ptx.cuh>
+
+#ifndef EP_DEBUG_CHECKS
+#define EP_DEBUG_CHECKS 0
+#endif
 
 namespace deep_ep::elastic::handle {
 
@@ -21,6 +26,13 @@ struct NCCLGin {
     ncclGin gin;
     ncclTeam team_world, team_lsa, team_rail;
     uint64_t lsa_base_ptr;
+#if EP_DEBUG_CHECKS
+    // Every put of this context increments GIN counter 0 of the context when the NIC completes it
+    // locally, and `put_posted` when it is posted, so a timeout can print posted against completed
+    static constexpr ncclGinCounter_t kPutCounter = 0;
+    int context_idx;
+    uint32_t* put_posted;
+#endif
 
     // TODO(NCCL): QP index should just be a hint or the users maintain the mapping?
     __device__ __forceinline__
@@ -32,6 +44,10 @@ struct NCCLGin {
         team_world(ncclTeamWorld(nccl_dev_comm)), team_lsa(ncclTeamLsa(nccl_dev_comm)), team_rail(ncclTeamRail(nccl_dev_comm)) {
         // TODO: what if we only have 1 NVLink rank
         lsa_base_ptr = reinterpret_cast<uint64_t>(ncclGetLsaPointer(nccl_window, 0, team_lsa.rank));
+#if EP_DEBUG_CHECKS
+        context_idx = qp_idx;
+        put_posted = reinterpret_cast<uint32_t*>(lsa_base_ptr + layout::WorkspaceLayout::get_gin_put_posted_offset()) + qp_idx;
+#endif
     }
 
     template <typename team_t>
@@ -188,12 +204,19 @@ struct NCCLGin {
                     nccl_window, reinterpret_cast<int64_t>(send_sym_ptr) - lsa_base_ptr,
                     num_bytes,
                     remote_action,
+#if EP_DEBUG_CHECKS
+                    ncclGin_WeakCounterInc{kPutCounter},
+#else
                     ncclGin_None(),
+#endif
                     ncclCoopThread(),
                     ncclGin_None(),
                     cuda::thread_scope_thread,
                     cuda::thread_scope_device,
                     ncclGinOptFlagsDefault | extra_options);
+#if EP_DEBUG_CHECKS
+            atomicAdd(reinterpret_cast<unsigned int*>(put_posted), 1u);
+#endif
         });
     }
 
