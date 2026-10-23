@@ -566,25 +566,35 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         };
 
         // Replay the dispatch: the forward list holds two FIFOs (see the dispatch forwarder), remote-sourced
-        // tokens from entry 0 upward and local-sourced tokens from kForwardListTop downward, each ended by -1
+        // tokens from entry 0 upward and local-sourced tokens from kForwardListTop downward, each ended by -1.
+        // The next entry is loaded one token ahead, so its latency overlaps this token's wait and reduce.
         constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
-        for (int i = 0, step = 1; ; i += step) {
-            auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
-            if (src_token_global_idx < 0 and step > 0) {
+        const auto load_entry = [&](const int* entry, int& token_global_idx, int& topk_scaleup_rank_idx, int& topk_slot_idx) {
+            token_global_idx = __ldg(entry);
+            topk_scaleup_rank_idx = lane_idx < kNumTopk ? __ldg(entry + 2 + lane_idx) : -1;
+            topk_slot_idx = lane_idx < kNumTopk ? __ldg(entry + 2 + kNumTopk + lane_idx) : -1;
+        };
+        // A pointer and a stride, not an index: with an index the compiler keeps the expanded combine in 168 registers instead of 142
+        const int* next = token_metadata_at_forward;
+        int step = kNumForwardMetadataDims, next_token_global_idx, next_scaleup_rank_idx, next_slot_idx;
+        load_entry(next, next_token_global_idx, next_scaleup_rank_idx, next_slot_idx);
+        while (true) {
+            const auto src_token_global_idx = next_token_global_idx;
+            auto stored_src_scaleup_rank_idx = next_scaleup_rank_idx, stored_src_slot_idx = next_slot_idx;
+            if (src_token_global_idx < 0) {
+                if (step < 0)
+                    break;
                 // The first FIFO ended: continue with the second one, from the top down
-                i = kForwardListTop, step = -1;
-                src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                next = token_metadata_at_forward + kForwardListTop * kNumForwardMetadataDims, step = -kNumForwardMetadataDims;
+                load_entry(next, next_token_global_idx, next_scaleup_rank_idx, next_slot_idx);
+                continue;
             }
+            next += step;
+            load_entry(next, next_token_global_idx, next_scaleup_rank_idx, next_slot_idx);
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
             const auto src_token_idx = src_token_global_idx % kNumMaxTokensPerRank;
-            auto stored_src_scaleup_rank_idx = lane_idx < kNumTopk ?
-                __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + lane_idx) : -1;
-            auto stored_src_slot_idx = lane_idx < kNumTopk ?
-                __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + kNumTopk + lane_idx) : -1;
-            if (src_token_global_idx < 0)
-                break;
 
             // Scaleup rank mask
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up peers");
