@@ -644,9 +644,10 @@ hybrid_dispatch_impl(
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
                 if (const auto j = i * 32 + lane_idx; i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks) {
+                    // The copy epilogue reads this as the list length (see the unordered dispatch), not as an index
                     ptx::st_relaxed_sys(
                         gin.get_sym_ptr<ncclTeamTagLsa>(tail_ptr, j),
-                        transform_linked_list_idx(stored_scaleup_send_counters[i]));
+                        stored_scaleup_send_counters[i]);
                 }
             }
         }
