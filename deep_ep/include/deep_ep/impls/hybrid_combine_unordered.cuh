@@ -802,6 +802,33 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         constexpr bool kSingleLaneSweeper = false;
         #endif
 
+        const auto watch_proxy_puts = [&]() {
+            unsigned last_num_puts = 0;
+            for (int64_t start_clock = clock64();; __nanosleep(1000)) {
+                unsigned num_puts = 0, num_pending = 0;
+                int num_done_rings = 0;
+                for (int i = 0; i < kNumForwardWarps; ++ i) {
+                    const bool is_done = ptx::ld_acquire_cta(proxy_ring_layout.get_done(i)) != 0;
+                    const auto tail = ptx::ld_acquire_cta(proxy_ring_layout.get_tail(i));
+                    const auto head = ptx::ld_acquire_cta(proxy_ring_layout.get_head(i));
+                    num_puts += tail;
+                    num_pending += head - tail;
+                    num_done_rings += is_done and head == tail;
+                }
+                if (num_done_rings == kNumForwardWarps)
+                    return;
+                if (num_puts != last_num_puts or num_pending == 0)
+                    last_num_puts = num_puts, start_clock = clock64();
+                if (clock64() - start_clock >= kNumTimeoutCycles) {
+                    printf("DeepEP combine (proxy put) timeout, scale-out: %d, scale-up: %d, sm: %d, puts: %u, pending: %u\n",
+                           scaleout_rank_idx, scaleup_rank_idx, sm_idx, num_puts, num_pending);
+                    start_clock = clock64();
+                    while (clock64() - start_clock < comm::kNumOneSecCycles) {}
+                    ptx::trap();
+                }
+            }
+        };
+
         if constexpr (kSingleLaneSweeper) {
             // Sequential design: one lane sweeps all rings, issues puts serially.
             // Owns per-ring GIN contexts (built inline so each put routes to its
@@ -866,6 +893,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
                     comm::flush_with_timeout<kNumTimeoutCycles>(
                         gin_ctx[forward_warp_idx].gin, ncclCoopThread());
+            } else if (lane_idx == 31) {
+                watch_proxy_puts();
             }
             __syncwarp();
         } else {
@@ -908,6 +937,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 }
 
                 comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread());
+            } else if (lane_idx == 31) {
+                watch_proxy_puts();
             }
         }
     }
