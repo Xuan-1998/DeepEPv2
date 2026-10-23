@@ -766,6 +766,19 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // `waitSignalMeetShadow`) so a stuck peer surfaces a diagnostic rather than
         // hanging.
         if (ptx::elect_one_sync()) {
+            comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                const auto ring_tail = ptx::ld_acquire_cta(my_tail_ptr);
+                if (ring_tail == my_head)
+                    return true;
+
+                if (is_last_check) {
+                    printf("DeepEP combine (proxy ring drain) timeout, scale-out: %d, scale-up: %d, "
+                           "channel: %d, forward warp: %d, head: %u, tail: %u\n",
+                           scaleout_rank_idx, scaleup_rank_idx, channel_idx, forward_warp_idx, my_head, ring_tail);
+                }
+                return false;
+            });
+
             const auto shadow_ptr = gin.gin.getSignalShadowPtr(signal_id);
             const auto target = (*shadow_ptr += static_cast<uint64_t>(num_expected_arrivals));
             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
