@@ -216,9 +216,13 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                 if (const auto k = j * 32 + lane_idx; j < (kNumScaleupRanksPerLane - 1) or k < kNumScaleupRanks) {
-                    channel_linked_list[
-                        *workspace_layout.get_channel_scaleup_tail_ptr(i, k)
-                    ] = -1;
+                    // The tail word packs the lengths of the list's two FIFOs (remote | local << 16); end both
+                    constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
+                    EP_STATIC_ASSERT(kForwardListTop < (1 << 16), "The FIFO lengths must fit in 16 bits");
+                    const int lengths = *workspace_layout.get_channel_scaleup_tail_ptr(i, k);
+                    const auto entry = [=](const int& idx) { return i * ((kForwardListTop + 1) * kNumScaleupRanks) + idx * kNumScaleupRanks + k; };
+                    channel_linked_list[entry(lengths & 0xffff)] = -1;
+                    channel_linked_list[entry(kForwardListTop - (lengths >> 16))] = -1;
 
                     // Clean for combine usages
                     *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;
