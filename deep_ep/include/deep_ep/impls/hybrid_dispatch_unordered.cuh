@@ -359,7 +359,7 @@ hybrid_unordered_dispatch_impl(
             // Issue scaleout writes to peers
             EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
                              "kNumScaleoutRanks must be less than kNumNotifyThreads");
-            if (thread_idx < kNumScaleoutRanks) {
+            comm::guarded_post<kNumTimeoutCycles>(thread_idx < kNumScaleoutRanks, [&] {
                 const auto dst_scaleout_rank_idx = thread_idx;
                 gin.put<ncclTeamTagRail>(
                     workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
@@ -370,7 +370,7 @@ hybrid_unordered_dispatch_impl(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
                     workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
                     kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);
-            }
+            }, "hybrid dispatch notify", scaleout_rank_idx, scaleup_rank_idx);
             __syncwarp();
 
             // Util functions to get metadata from scale-out peers
