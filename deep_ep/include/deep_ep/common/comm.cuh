@@ -89,6 +89,83 @@ __device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_
     }
 }
 
+// Probes, compiled in with `EP_JIT_EXTRA_FLAGS="-DEP_PROBE_ENTRY_OUTSTANDING=1 -DEP_PROBE_EXIT_FLUSH=1"`.
+// EFA GDA backend only: they read the device handle's posted and completed counts, the same two
+// fields the backend's own flush waits on. One printf per kernel per GPU.
+__device__ __forceinline__ uint32_t gin_outstanding_wqes(const ncclGinCtx ctx) {
+    uint32_t total = 0;
+#if NCCL_GIN_EFA_GDA_ENABLE
+    if (ctx.backend == NCCL_NET_DEVICE_GIN_EFA_GDA) {
+        const auto outstanding = [](const nccl_ofi_gin_gdaki_dev_endpoint_handle& ep) {
+            const auto sub = *reinterpret_cast<const volatile uint64_t*>(&ep.submitted_count);
+            const auto hw = nccl::gin::efa_gda::hwCounterLoad<cuda::memory_order_relaxed>(ep.local_cntr_value);
+            return (static_cast<uint32_t>(sub) - static_cast<uint32_t>(hw)) & nccl::gin::efa_gda::EFA_CNTR_MASK;
+        };
+        const auto* dev = nccl::gin::efa_gda::getDevHandle(ctx);
+        total += outstanding(dev->data) + outstanding(dev->pvdata);
+        for (int i = 0; i < dev->nCounters; ++ i)
+            total += outstanding(dev->counter_handles[i]->base);
+    }
+#endif
+    return total;
+}
+
+// At a kernel entry, after the entry barrier: this GPU's WQEs that the NIC has not completed yet.
+// Context 0 carries the barrier signals the entry barrier just posted, so it is reported apart from
+// the data contexts. A non-zero data count at the combine entry is the window in which a peer's
+// NVLink write into my buffer could meet a dispatch put source the NIC may still re-read.
+__device__ __forceinline__ void probe_entry_outstanding(const char* where, const ncclDevComm_t& nccl_dev_comm,
+                                                        const int& scaleout_rank_idx, const int& scaleup_rank_idx,
+                                                        const int& iteration) {
+    int num_data_contexts_pending = 0;
+    uint32_t data_max = 0, data_total = 0, barrier_outstanding = 0;
+    for (int i = 0; i < static_cast<int>(nccl_dev_comm.ginContextCount); ++ i) {
+        const auto n = gin_outstanding_wqes(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA)._makeCtx());
+        if (i == 0) {
+            barrier_outstanding = n;
+            continue;
+        }
+        num_data_contexts_pending += n > 0;
+        data_max = n > data_max ? n : data_max;
+        data_total += n;
+    }
+    printf("DeepEP probe (%s entry), scale-out: %d, scale-up: %d, iteration: %d, contexts: %d, "
+           "barrier ctx outstanding: %u, data ctxs with outstanding WQEs: %d, data max outstanding: %u, data total outstanding: %u\n",
+           where, scaleout_rank_idx, scaleup_rank_idx, iteration, static_cast<int>(nccl_dev_comm.ginContextCount),
+           barrier_outstanding, num_data_contexts_pending, data_max, data_total);
+}
+
+// At the dispatch exit, after the NVLink exit barrier: SM 0 counts the data WQEs the NIC has not
+// completed, then flushes every context and times the flush. That is what a `gin.flush()` at this
+// point waits for. Call from every thread of SM 0 (`__syncthreads` inside).
+template <int kNumThreads, int64_t kNumTimeoutCycles>
+__device__ __forceinline__ void probe_exit_flush(const char* where, const ncclDevComm_t& nccl_dev_comm,
+                                                 const int& scaleout_rank_idx, const int& scaleup_rank_idx,
+                                                 const int& iteration) {
+    constexpr int kNumWarps = kNumThreads / 32;
+    const int thread_idx = static_cast<int>(threadIdx.x), warp_idx = thread_idx / 32;
+    const int num_contexts = static_cast<int>(nccl_dev_comm.ginContextCount);
+    uint32_t data_total = 0;
+    uint64_t t0 = 0;
+    if (thread_idx == 0) {
+        for (int i = 1; i < num_contexts; ++ i)
+            data_total += gin_outstanding_wqes(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA)._makeCtx());
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    }
+    __syncthreads();
+    for (int i = warp_idx; i < num_contexts; i += kNumWarps)
+        flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA), ncclCoopWarp());
+    __syncthreads();
+    if (thread_idx == 0) {
+        uint64_t t1;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+        printf("DeepEP probe (%s exit flush), scale-out: %d, scale-up: %d, iteration: %d, "
+               "data WQEs outstanding before the flush: %u, flush of %d contexts took %llu ns\n",
+               where, scaleout_rank_idx, scaleup_rank_idx, iteration, data_total, num_contexts,
+               static_cast<unsigned long long>(t1 - t0));
+    }
+}
+
 // Channels map onto QPs with a BALANCED CONTIGUOUS (block) partition: fill a QP with
 // consecutive channels before spilling to the next (so an SM's channels stay grouped
 // on the same GIN context), and when the channels do not divide the QPs evenly,

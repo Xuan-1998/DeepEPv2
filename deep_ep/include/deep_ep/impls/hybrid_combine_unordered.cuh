@@ -129,6 +129,10 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+#if defined(EP_PROBE_ENTRY_OUTSTANDING)
+    if (sm_idx == 0 and thread_idx == 0)
+        comm::probe_entry_outstanding("hybrid combine", nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, num_combined_tokens);
+#endif
 
     // Adjust register count at certain cases
     // TODO: support more cases, or try to make channel count more aligned

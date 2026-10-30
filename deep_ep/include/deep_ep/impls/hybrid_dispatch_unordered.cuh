@@ -275,6 +275,10 @@ hybrid_unordered_dispatch_impl(
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+#if defined(EP_PROBE_ENTRY_OUTSTANDING)
+    if (sm_idx == 0 and thread_idx == 0)
+        comm::probe_entry_outstanding("hybrid dispatch", nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, dispatch_iteration);
+#endif
 
     // Init TMA for scale-out and forward warps
     ptx::arrival_phase phase = 0;
@@ -1118,6 +1122,12 @@ hybrid_unordered_dispatch_impl(
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
+
+#if defined(EP_PROBE_EXIT_FLUSH)
+    if (sm_idx == 0)
+        comm::probe_exit_flush<kNumThreads, kNumTimeoutCycles>("hybrid dispatch", nccl_dev_comm, scaleout_rank_idx,
+                                                               scaleup_rank_idx, dispatch_iteration);
+#endif
 
     // Trigger the copy epilogue kernel
     cudaTriggerProgrammaticLaunchCompletion();
