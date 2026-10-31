@@ -106,6 +106,8 @@ struct WorkspaceLayout {
         // Scale-out notify send counts (rank + expert), 2 parities: the dispatch two calls later
         // is the next writer of a parity, so its count puts never need a flush before exit
         num_bytes += 2 * (kNumMaxRanks + kNumMaxExperts) * sizeof(int);
+        // Call sequence of the small-batch dispatch and combine (completed count and current call)
+        num_bytes += 4 * sizeof(int);
 
         return num_bytes;
     }
@@ -251,7 +253,35 @@ struct WorkspaceLayout {
         return get_sb_combine_tail_ptr(2, 0, 0) + static_cast<int>(kNumMaxSBScaleupRanks) +
             parity * (kNumMaxRanks + kNumMaxExperts);
     }
+
+    // Call sequence of the small-batch kernels (`kind` 0 = dispatch, 1 = combine), kept in device
+    // memory because a kernel argument is frozen by CUDA graph capture. `get_sb_seq_done_ptr` holds
+    // the number of completed calls: the kernel uses that plus one as its sequence (a plain load,
+    // nothing else writes the word while it runs) and the call's epilogue, which runs after the
+    // kernel and before the next call, stores the sequence it saw. The copy epilogue takes it from
+    // the done flag; the combine leaves it in `get_sb_seq_cur_ptr` for the reduce epilogue
+    __forceinline__ __device__ __host__ int* get_sb_seq_done_ptr(const int& kind) const {
+        return get_sb_scaleout_count_send_base_ptr(2) + kind;
+    }
+
+    __forceinline__ __device__ __host__ int* get_sb_seq_cur_ptr(const int& kind) const {
+        return get_sb_scaleout_count_send_base_ptr(2) + 2 + kind;
+    }
 };
+
+#ifdef __CUDACC__
+// This call's sequence (see `get_sb_seq_done_ptr`): a plain load, the word changes only between
+// kernels
+__forceinline__ __device__ int sb_read_seq(const WorkspaceLayout& workspace_layout, const int& kind) {
+    int done;
+    asm volatile("ld.relaxed.gpu.global.s32 %0, [%1];" : "=r"(done) : "l"(workspace_layout.get_sb_seq_done_ptr(kind)) : "memory");
+    return done + 1;
+}
+
+__forceinline__ __device__ void sb_store_seq_word(int* ptr, const int& value) {
+    asm volatile("st.relaxed.gpu.global.s32 [%0], %1;" :: "l"(ptr), "r"(value) : "memory");
+}
+#endif
 
 struct TokenLayout {
     int num_hidden_bytes, num_sf_bytes;

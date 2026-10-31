@@ -153,7 +153,7 @@ static constexpr bool kDataChannelsAboveQP0 = true;
 // correctness there (the next writer of these send slots is the dispatch two calls later, which
 // cannot start before the peers consumed this call's data), so it only costs the ack round trip
 #ifndef EP_SB_EXIT_FLUSH
-#define EP_SB_EXIT_FLUSH 1
+#define EP_SB_EXIT_FLUSH 0
 #endif
 // Small batch: prefetch the channel's tokens into L2 before staging them (lane k: k-th token)
 #ifndef EP_SB_L2_PREFETCH
@@ -163,35 +163,35 @@ static constexpr bool kDataChannelsAboveQP0 = true;
 // parity-indexed in this mode, so this is not needed for correctness (same argument as
 // `EP_SB_EXIT_FLUSH`); it costs the count puts' round trip on SM 0
 #ifndef EP_SB_NOTIFY_FLUSH
-#define EP_SB_NOTIFY_FLUSH 1
+#define EP_SB_NOTIFY_FLUSH 0
 #endif
 // Small batch: system-scope fence after a channel stages its headers. The SM's put issuer syncs
 // with the channel through a named barrier and its GIN post fences at system scope before the
 // doorbell, which already publishes the headers to the NIC
 #ifndef EP_SB_HEADER_FENCE
-#define EP_SB_HEADER_FENCE 1
+#define EP_SB_HEADER_FENCE 0
 #endif
 // Small batch: every thread fences at system scope after the exit grid sync. Only the done-flag
 // stores need a release, and theirs (`st.release.sys` after the grid sync) is cumulative over
 // the NVLink forwards of all SMs; system-scope fences of different warps of one SM serialize
 #ifndef EP_SB_EXIT_FENCE
-#define EP_SB_EXIT_FENCE 1
+#define EP_SB_EXIT_FENCE 0
 #endif
 // Small batch: no exit grid sync. Each SM adds to a device-scope counter once its forwards are
 // done, and the last one publishes the done flags
 #ifndef EP_SB_EXIT_LAST
-#define EP_SB_EXIT_LAST 0
+#define EP_SB_EXIT_LAST 1
 #endif
 // Small batch, cached dispatch: forwarders load a slot's cached destination slots before waiting
 // for the slot's token load, so the two latencies overlap
 #ifndef EP_SB_EARLY_SLOTS
-#define EP_SB_EARLY_SLOTS 0
+#define EP_SB_EARLY_SLOTS 1
 #endif
 // Small batch: a forwarder takes the next chunk from whichever source has data, instead of
 // waiting for the source its round-robin picked (half the channels pick the remote source
 // first and sat on their local tokens until the remote ones had landed)
 #ifndef EP_SB_FWD_READY
-#define EP_SB_FWD_READY 0
+#define EP_SB_FWD_READY 1
 #endif
 #ifdef EP_SB_PROBE
 // Small-batch timeline probes (raw %globaltimer ns, per block), reduced and printed by SM 0
@@ -267,7 +267,7 @@ hybrid_unordered_dispatch_impl(
     void* buffer,
     void* workspace, void* mapped_host_workspace,
     const int scaleout_rank_idx, const int scaleup_rank_idx,
-    const int dispatch_iteration) {
+    const int dispatch_iteration, const int64_t sb_buffer_stride) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
@@ -306,8 +306,18 @@ hybrid_unordered_dispatch_impl(
     constexpr int kNotifyBarrierIndex = 1;
     constexpr int kSendBarrierIndex = 2;
 
-    // Small-batch mode: parity of this iteration (buffer half + workspace slot set)
-    const int sb_parity = dispatch_iteration & 1;
+    // Small-batch mode: this call's sequence (device-side, see `get_sb_seq_done_ptr`) tags the
+    // headers and the done flags, and its parity selects the buffer half and the workspace slot
+    // set. `buffer` arrives as the parity-0 half. The copy epilogue records the completed call
+    const int sb_seq = kSmallBatch ? layout::sb_read_seq(workspace_layout, 0) : dispatch_iteration;
+    const int sb_parity = sb_seq & 1;
+    if constexpr (kSmallBatch)
+        buffer = math::advance_ptr(buffer, sb_parity * sb_buffer_stride);
+#ifdef EP_SB_SEQ_DEBUG
+    if (kSmallBatch and sm_idx == 0 and thread_idx == 0)
+        printf("SBSEQ so %d su %d dispatch seq %d cached %d expand %d\n", scaleout_rank_idx, scaleup_rank_idx, sb_seq,
+               static_cast<int>(kReuseSlotIndices), static_cast<int>(kDoExpand));
+#endif
 
     // Scale-out notify recv counts: parity-indexed in small-batch mode, legacy otherwise
     const auto so_rank_count_recv_ptr = [&](const int& src_scaleout_rank_idx, const int& dst_scaleup_rank_idx = 0) {
@@ -668,7 +678,7 @@ hybrid_unordered_dispatch_impl(
         const auto stage_part_header = [&](layout::BufferLayout<false>& send_ch,
                                            const int& slot, const int& count, const bool& more) {
             auto* hdr = send_ch.get_token_buffer(slot).get_hdr_ptr();
-            *hdr = pack_scaleout_header(dispatch_iteration, count, more);
+            *hdr = pack_scaleout_header(sb_seq, count, more);
             ptx::fence_acq_rel_sys();
         };
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
@@ -966,7 +976,7 @@ hybrid_unordered_dispatch_impl(
                     if (s < sb_num_subs and (off < count or (s == 0 and count == 0))) {
                         const int sub_count = count - off < size ? count - off : size;
                         *send_ch.get_token_buffer(sub_slot(0, s)).get_hdr_ptr() =
-                            pack_scaleout_header(dispatch_iteration, sub_count, /*more=*/off + size < count);
+                            pack_scaleout_header(sb_seq, sub_count, /*more=*/off + size < count);
                     }
                 }
                 // One publish fence for all headers of this channel
@@ -1002,7 +1012,7 @@ hybrid_unordered_dispatch_impl(
                     // Only the sub-parts this channel staged for this peer carry a header of
                     // this iteration (stale headers in this half are two iterations old)
                     if (active)
-                        active = unpack_scaleout_header(*send_tb.get_hdr_ptr(), dispatch_iteration, count, more);
+                        active = unpack_scaleout_header(*send_tb.get_hdr_ptr(), sb_seq, count, more);
                     if (active) {
                         const auto [put_qp_idx, put_sharing_mode] =
                             comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
@@ -1177,7 +1187,7 @@ hybrid_unordered_dispatch_impl(
                         if (s < num_subs) {
                             sub_valid[s] = is_remote_src and
                                 unpack_scaleout_header(read_batch_header(lane_idx, k, s),
-                                                       dispatch_iteration, sub_count[s], sub_more[s]);
+                                                       sb_seq, sub_count[s], sub_more[s]);
                             num_valid += __popc(ptx::gather(sub_valid[s]));
                         }
                     }
@@ -1471,7 +1481,7 @@ hybrid_unordered_dispatch_impl(
                 if (is_last and lane_idx < kNumScaleupRanks) {
                     const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
                         workspace_layout.get_sb_dispatch_done_flag_ptr(scaleup_rank_idx), lane_idx);
-                    ptx::st_release_sys(dst_ptr, dispatch_iteration);
+                    ptx::st_release_sys(dst_ptr, sb_seq);
                     // The other SMs may still be allocating slots from these counters until they
                     // arrive, so only the last SM clears them (SM 0 does it after the grid sync)
                     if constexpr (not kReuseSlotIndices)
@@ -1489,7 +1499,7 @@ hybrid_unordered_dispatch_impl(
         if (sm_idx == 0 and thread_idx < kNumScaleupRanks) {
             const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
                 workspace_layout.get_sb_dispatch_done_flag_ptr(scaleup_rank_idx), thread_idx);
-            ptx::st_release_sys(dst_ptr, dispatch_iteration);
+            ptx::st_release_sys(dst_ptr, sb_seq);
         }
         }
 #ifdef EP_SB_PROBE

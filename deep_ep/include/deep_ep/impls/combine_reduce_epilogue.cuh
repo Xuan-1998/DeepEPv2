@@ -46,7 +46,8 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
                              void* bias_0, void* bias_1,
                              const int* token_map_at_dispatch,
                              const int num_combined_tokens,
-                             const int scaleout_rank_idx, const int scaleup_rank_idx) {
+                             const int scaleout_rank_idx, const int scaleup_rank_idx,
+                             void* workspace, const int64_t sb_buffer_stride) {
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     constexpr int kNumExpertsPerRank = kNumExperts / (kNumScaleupRanks * kNumScaleoutRanks);
     EP_STATIC_ASSERT(kNumExperts % (kNumScaleupRanks * kNumScaleoutRanks) == 0, "Invalid number of experts or ranks");
@@ -60,11 +61,6 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
     const auto comm_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, kNumTopk, false);
     constexpr int kHybridMode = (kNumScaleoutRanks > 1) and not kOrderedLayout;
-    const auto comm_buffer = layout::BufferLayout<false>(
-        comm_token_layout,
-        kHybridMode ? kNumScaleoutRanks : kNumTokensInLayout,
-        kHybridMode ? (kNumChannels * kNumSlotsPerChannel) : kNumMaxTokensPerRank,
-        recv_buffer);
 
     // Store buffers
     const auto output_token_layout = layout::TokenLayout(kNumHiddenBytes, 0, 0, false);
@@ -87,6 +83,26 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // Will block until the main combine kernel has finished and all data are visible
     // NOTES: PDL is used, please do not use `__ldg`
     cudaGridDependencySynchronize();
+
+    // Small batch: `recv_buffer` arrives as the parity-0 half; the combine that filled it left
+    // its sequence in the current-call word (read after the grid dependency, the combine may
+    // still run before it under PDL). This combine is complete: record it for the next one
+    if (sb_buffer_stride > 0) {
+        const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+        const int seq = __ldcg(workspace_layout.get_sb_seq_cur_ptr(1));
+        recv_buffer = math::advance_ptr(recv_buffer, (seq & 1) * sb_buffer_stride);
+        if (sm_idx == 0 and threadIdx.x == 0)
+            layout::sb_store_seq_word(workspace_layout.get_sb_seq_done_ptr(1), seq);
+#ifdef EP_SB_SEQ_DEBUG
+        if (sm_idx == 0 and threadIdx.x == 0)
+            printf("SBSEQ so %d su %d reduce-epilogue seq %d\n", scaleout_rank_idx, scaleup_rank_idx, seq);
+#endif
+    }
+    const auto comm_buffer = layout::BufferLayout<false>(
+        comm_token_layout,
+        kHybridMode ? kNumScaleoutRanks : kNumTokensInLayout,
+        kHybridMode ? (kNumChannels * kNumSlotsPerChannel) : kNumMaxTokensPerRank,
+        recv_buffer);
 
     // Read from buffers and do reduction
     for (int token_idx = global_warp_idx; token_idx < num_combined_tokens; token_idx += kNumWarps * kNumSMs) {

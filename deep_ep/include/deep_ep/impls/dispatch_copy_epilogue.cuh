@@ -30,7 +30,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int* num_unaligned_recv_tokens_per_expert,
                             int num_recv_tokens,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
-                            const int scaleout_rank_idx, const int scaleup_rank_idx) {
+                            const int scaleout_rank_idx, const int scaleup_rank_idx,
+                            const int64_t sb_buffer_stride) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
@@ -46,7 +47,6 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
     const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumWarps, 1, smem)
         .get_rank_buffer(warp_idx).get_token_buffer(0);
-    const auto scaleup_buffer = layout::BufferLayout<false>(token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
 
     // Init TMA
     ptx::arrival_phase phase = 0;
@@ -71,7 +71,18 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
         __syncthreads();
         sb_parity = target & 1;
+        // `buffer` arrives as the parity-0 half
+        buffer = math::advance_ptr(buffer, sb_parity * sb_buffer_stride);
+        // This dispatch is complete: the next one takes the following sequence
+        if (sm_idx == 0 and thread_idx == 0)
+            layout::sb_store_seq_word(sb_workspace_layout.get_sb_seq_done_ptr(0), target);
+#ifdef EP_SB_SEQ_DEBUG
+        if (blockIdx.x == 0 and thread_idx == 0)
+            printf("SBSEQ so %d su %d copy-epilogue target %d\n", scaleout_rank_idx, scaleup_rank_idx, target);
+#endif
     }
+    // After the half is known
+    const auto scaleup_buffer = layout::BufferLayout<false>(token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
 
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)

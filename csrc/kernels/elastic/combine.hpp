@@ -61,6 +61,8 @@ public:
         int num_reduced_tokens;
         int num_combined_tokens;
         int combine_iteration;
+        // Small batch: `buffer` is the parity-0 half, the kernel adds its parity times this
+        int64_t sb_buffer_stride;
 
         jit::LaunchArgs launch_args;
     };
@@ -142,7 +144,7 @@ static void __instantiate_kernel() {{
                                                      args.scaleout_rank_idx, args.scaleup_rank_idx,
                                                      args.num_reduced_tokens,
                                                      args.num_combined_tokens,
-                                                     args.combine_iteration));
+                                                     args.combine_iteration, args.sb_buffer_stride));
         }
     }
 };
@@ -183,8 +185,11 @@ static int get_small_batch_scaleup_warps_per_channel(const layout::TokenLayout& 
         const int64_t num_scaleup_warps = static_cast<int64_t>(per_channel) * num_channels_per_sm;
         const int64_t publisher_bytes = num_scaleup_warps * (2 + num_scaleup_ranks) * static_cast<int64_t>(sizeof(int));
         const int64_t list_bytes = num_scaleup_warps * 3 * num_scaleup_ranks * list_len * static_cast<int64_t>(sizeof(int));
+        // A block of at most 12 warps compiles for 168 registers instead of 128, which the
+        // forwarders' reduce step needs; a third warp per channel is not worth that (E44)
+        const int num_warps = (per_channel + 1) * num_channels_per_sm + num_proxy_warps;
         return (num_scaleup_warps + num_channels_per_sm) * token_bytes + ring_bytes + publisher_bytes + list_bytes <= num_smem_bytes and
-               (per_channel + 1) * num_channels_per_sm + num_proxy_warps <= 32;
+               num_warps <= 32 and (per_channel <= 2 or num_warps <= 12);
     };
     int per_channel = kMaxScaleupWarpsPerChannel;
     while (per_channel > 1 and not fits(per_channel))
@@ -215,7 +220,7 @@ static void* launch_combine(void* x,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
                             const bool& small_batch, const int& gin_indexed_signals_cnt,
-                            const int& combine_iteration,
+                            const int& combine_iteration, const int64_t& sb_buffer_stride,
                             const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -296,6 +301,7 @@ static void* launch_combine(void* x,
         .num_reduced_tokens = num_reduced_tokens,
         .num_combined_tokens = num_combined_tokens,
         .combine_iteration = combine_iteration,
+        .sb_buffer_stride = small_batch ? sb_buffer_stride : 0,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
     };
@@ -342,6 +348,8 @@ public:
         int* token_map_at_dispatch;
         int num_combined_tokens;
         int scaleout_rank_idx, scaleup_rank_idx;
+        void* workspace;
+        int64_t sb_buffer_stride;
 
         jit::LaunchArgs launch_args;
     };
@@ -375,7 +383,8 @@ static void __instantiate_kernel() {{
                                                  args.bias_0, args.bias_1,
                                                  args.token_map_at_dispatch,
                                                  args.num_combined_tokens,
-                                                 args.scaleout_rank_idx, args.scaleup_rank_idx));
+                                                 args.scaleout_rank_idx, args.scaleup_rank_idx,
+                                                 args.workspace, args.sb_buffer_stride));
     }
 };
 
@@ -393,6 +402,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
                                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                                            const int& num_sms, const int& num_smem_bytes,
                                            const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                                           void* workspace, const int64_t& sb_buffer_stride,
                                            const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     // Too many warps may cause performance degrade, so we limit into 1024
@@ -418,6 +428,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .token_map_at_dispatch = token_map_at_dispatch,
         .num_combined_tokens = num_combined_tokens,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .workspace = workspace, .sb_buffer_stride = sb_buffer_stride,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)
     };
     const auto code = CombineReduceEpilogueRuntime::generate(args);

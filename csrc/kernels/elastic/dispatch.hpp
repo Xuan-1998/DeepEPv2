@@ -75,6 +75,8 @@ public:
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
         int dispatch_iteration;
+        // Small batch: `buffer` is the parity-0 half, the kernel adds its parity times this
+        int64_t sb_buffer_stride;
 
         jit::LaunchArgs launch_args;
     };
@@ -189,7 +191,7 @@ static void __instantiate_kernel() {{
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
                 args.scaleout_rank_idx, args.scaleup_rank_idx,
-                args.dispatch_iteration
+                args.dispatch_iteration, args.sb_buffer_stride
             ));
         }
     }
@@ -242,7 +244,7 @@ static void launch_dispatch(void* x, void* sf,
                             // this handle feeds; direct dispatch ignores it.
                             const bool& do_expand,
                             const int& dispatch_iteration,
-                            const bool& small_batch,
+                            const bool& small_batch, const int64_t& sb_buffer_stride,
                             const at::cuda::CUDAStream& stream) {
     // Cached mode does not support expert token counting
     if (cached_mode)
@@ -311,6 +313,7 @@ static void launch_dispatch(void* x, void* sf,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .dispatch_iteration = dispatch_iteration,
+        .sb_buffer_stride = small_batch ? sb_buffer_stride : 0,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);
@@ -343,6 +346,7 @@ public:
         int num_recv_tokens;
         int recv_sf_token_stride, recv_sf_hidden_stride;
         int scaleout_rank_idx, scaleup_rank_idx;
+        int64_t sb_buffer_stride;
 
         jit::LaunchArgs launch_args;
     };
@@ -377,7 +381,8 @@ static void __instantiate_kernel() {{
                                                  args.num_unaligned_recv_tokens_per_expert,
                                                  args.num_recv_tokens,
                                                  args.recv_sf_token_stride, args.recv_sf_hidden_stride,
-                                                 args.scaleout_rank_idx, args.scaleup_rank_idx));
+                                                 args.scaleout_rank_idx, args.scaleup_rank_idx,
+                                                 args.sb_buffer_stride));
     }
 };
 
@@ -399,7 +404,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
                                           const bool& do_zero_padding,
-                                          const bool& small_batch,
+                                          const bool& small_batch, const int64_t& sb_buffer_stride,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -426,6 +431,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .num_recv_tokens = num_recv_tokens,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .sb_buffer_stride = small_batch ? sb_buffer_stride : 0,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)};
     const auto code = DispatchCopyEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch_copy_epilogue", code);

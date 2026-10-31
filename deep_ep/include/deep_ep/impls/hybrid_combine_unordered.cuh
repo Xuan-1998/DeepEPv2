@@ -43,7 +43,7 @@ namespace deep_ep::elastic {
 // Small batch proxy: 0 = one warp per channel posting its batches one by one, 1 = one warp per
 // SM collecting the batches of all channels and posting them together (one coalesced post per QP)
 #ifndef EP_SB_PROXY_MODE
-#define EP_SB_PROXY_MODE 0
+#define EP_SB_PROXY_MODE 1
 #endif
 // Small batch: prefetch the expert outputs into L2 at kernel start (forward warps, which wait for
 // the first partials anyway), so the scale-up warps' bulk loads hit L2 instead of HBM
@@ -71,7 +71,7 @@ namespace deep_ep::elastic {
 // pending tail behind one system-scope fence, so the sending warps never wait for that fence.
 // Needs proxy mode 1 (it runs on a proxy warp slot that mode leaves idle)
 #ifndef EP_SB_TAIL_PUBLISHER
-#define EP_SB_TAIL_PUBLISHER 0
+#define EP_SB_TAIL_PUBLISHER 1
 #endif
 // Small batch: scale-up warps prefetch the rows of a linked-list step into L2 when they read the
 // step (lane-parallel), so the step's per-peer bulk loads after the first one hit L2
@@ -82,7 +82,7 @@ namespace deep_ep::elastic {
 // of the scale-up warps' local reduce and of the forwarders' reduce in the expanded layout, where
 // the register adjustment is off. Each step of the reduce is one memory latency
 #ifndef EP_SB_SU_UNROLL
-#define EP_SB_SU_UNROLL 4
+#define EP_SB_SU_UNROLL 8
 #endif
 #ifndef EP_SB_FWD_UNROLL_EX
 #define EP_SB_FWD_UNROLL_EX 4
@@ -127,22 +127,22 @@ namespace deep_ep::elastic {
 // round r. The list follows the dispatch's forwarding order, which puts local tokens first, so
 // walking it in lockstep steps pushed a peer's first remote row only after other peers' rows
 #ifndef EP_SB_SU_COMPACT
-#define EP_SB_SU_COMPACT 0
+#define EP_SB_SU_COMPACT 1
 #endif
 // Small batch with the tail publisher: in the remote pass, hand each row's count to the
 // publisher right after its bulk store (1) or once the next row's load is in flight (2),
 // instead of once per linked-list step
 #ifndef EP_SB_SU_ROW_TAILS
-#define EP_SB_SU_ROW_TAILS 0
+#define EP_SB_SU_ROW_TAILS 2
 #endif
 // Small batch: device-scope fence before a forwarder hands a batch to the proxy
 #ifndef EP_SB_HANDOFF_FENCE
-#define EP_SB_HANDOFF_FENCE 1
+#define EP_SB_HANDOFF_FENCE 0
 #endif
 // Small batch: forwarders reduce straight into the scale-out send slot (or the local receive
 // slot) in global memory instead of staging the token in shared memory and bulk-storing it
 #ifndef EP_SB_FWD_DIRECT
-#define EP_SB_FWD_DIRECT 0
+#define EP_SB_FWD_DIRECT 1
 #endif
 // Small batch, expanded layout with the compact walk: scale-up warps load the top-k slots of a
 // whole round of rows at once (the per-row load sat between knowing the row and its reduce)
@@ -158,7 +158,7 @@ namespace deep_ep::elastic {
 // above one EFA packet (about 8 KB) take far longer to complete than single-packet ones, and the
 // receiver counts every piece (each one carries the signal)
 #ifndef EP_SB_PUT_SPLIT
-#define EP_SB_PUT_SPLIT 1
+#define EP_SB_PUT_SPLIT 4
 #endif
 // Small batch, proxy mode 1: size the scale-out pieces per token instead of per batch (this many
 // pieces per token, 0 = use `EP_SB_PUT_SPLIT`), so a batch shorter than `EP_SB_BATCH_SIZE`
@@ -173,14 +173,15 @@ namespace deep_ep::elastic {
 #define EP_SB_PROXY_WARPS 0
 #endif
 // Small batch, proxy mode 1: start a sweep only with at least this many batches, unless every
-// forwarder has handed over its last batch
+// forwarder has handed over its last batch. Every sweep costs one GIN post whatever its size, so
+// the default waits for one batch per channel of the SM (0 = that default)
 #ifndef EP_SB_PROXY_MIN
-#define EP_SB_PROXY_MIN 1
+#define EP_SB_PROXY_MIN 0
 #endif
 // Small batch with the remote-first order: forwarders mark their ring done after the remote
 // pass (the local pass hands over no batch), so the proxy knows the remote pass is complete
 #ifndef EP_SB_EARLY_DONE
-#define EP_SB_EARLY_DONE 0
+#define EP_SB_EARLY_DONE 1
 #endif
 // Diagnostics (small batch, results are wrong): skip the scale-up data movement, the forwarders'
 // tail wait or their reduce, to measure what each costs on the critical path
@@ -321,7 +322,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     void* buffer, void* workspace,
                     const int scaleout_rank_idx, const int scaleup_rank_idx,
                     int num_reduced_tokens, const int num_combined_tokens,
-                    const int combine_iteration) {
+                    const int combine_iteration, const int64_t sb_buffer_stride) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto thread_idx = static_cast<int>(threadIdx.x);
@@ -332,7 +333,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     constexpr int kNumOrderPasses = kRemoteFirst ? 2 : 1;
 
     // Small-batch mode: parity of this combine call (buffer half, tail slots, signal ids)
-    const int sb_parity = combine_iteration & 1;
+    // Small-batch mode: this call's sequence (device-side, see `get_sb_seq_done_ptr`); its parity
+    // selects the buffer half, the tail slots and the signal ids. `buffer` arrives as the parity-0
+    // half. The reduce epilogue reads the sequence from `get_sb_seq_cur_ptr` and records the call
+    const auto sb_workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+    const int sb_seq = kSmallBatch ? layout::sb_read_seq(sb_workspace_layout, 1) : combine_iteration;
+    const int sb_parity = sb_seq & 1;
+    if constexpr (kSmallBatch) {
+        buffer = math::advance_ptr(buffer, sb_parity * sb_buffer_stride);
+        if (sm_idx == 0 and thread_idx == 0)
+            layout::sb_store_seq_word(sb_workspace_layout.get_sb_seq_cur_ptr(1), sb_seq);
+    }
+#ifdef EP_SB_SEQ_DEBUG
+    if (kSmallBatch and sm_idx == 0 and thread_idx == 0)
+        printf("SBSEQ so %d su %d combine seq %d expanded %d\n", scaleout_rank_idx, scaleup_rank_idx, sb_seq, static_cast<int>(kUseExpandedLayout));
+#endif
     // Small-batch signal ids: the dispatch owns [0, 2 * cpc), the combine [2 * cpc, 4 * cpc),
     // both indexed (channel-in-context, parity). Mirrors `part_signal_id_of` in the dispatch.
     constexpr int kNumSBChannelsPerContext = gin_alloc::channels_per_context(
@@ -1763,8 +1778,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 const unsigned total = static_cast<unsigned>(ptx::reduce_add(static_cast<int>(avail)));
                 if (total == 0)
                     continue;
-                if constexpr (EP_SB_PROXY_MIN > 1) {
-                    if (total < static_cast<unsigned>(EP_SB_PROXY_MIN) and not __all_sync(0xffffffffu, fwd_done))
+                constexpr int kSbProxyMin = EP_SB_PROXY_MIN > 0 ? EP_SB_PROXY_MIN : kNumChannelsPerSM;
+                if constexpr (kSbProxyMin > 1) {
+                    if (total < static_cast<unsigned>(kSbProxyMin) and not __all_sync(0xffffffffu, fwd_done))
                         continue;
                 }
                 unsigned excl = avail;

@@ -1010,11 +1010,14 @@ public:
                            "dispatch TMA pool exceeds the shared-memory budget");
             if (not prefer_overlap_with_compute)
                 num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
-            // Small batch: fewer channels per SM shrink the combine block, which raises the register
-            // budget per thread (11 warps compile for 168 registers, 16 for 128)
-            if (small_batch.enabled)
-                if (const auto forced = get_env<int>("EP_SB_CHANNELS_PER_SM", 0); forced > 0)
-                    num_channels_per_sm = std::min<int>(num_channels_per_sm, forced);
+            // Small batch: 3 channels per SM from 16 SMs on. The combine block then has 11 warps,
+            // which compile for 168 registers instead of 128 (the forwarders' reduce step does
+            // not fit in 128), and 16 SMs keep the channel count of 12 SMs x 4. EP_SB_CHANNELS_PER_SM
+            // overrides the cap
+            if (small_batch.enabled) {
+                const int forced = get_env<int>("EP_SB_CHANNELS_PER_SM", 0);
+                num_channels_per_sm = std::min<int>(num_channels_per_sm, forced > 0 ? forced : (num_sms >= 16 ? 3 : 4));
+            }
             // Reduce the channel count to fit this launch's GIN indexed-signal budget.
             // `with_notify` is pinned (not `not cached_mode`) so a cached dispatch derives the
             // same count the handle was shaped with.
@@ -1187,9 +1190,11 @@ public:
 
         ++ dispatch_iteration;
 
-        // Small-batch mode alternates the dispatch buffer half per dispatch
+        // Small-batch mode: the kernels alternate between two buffer halves with a device-side
+        // call sequence (a host counter would be frozen by CUDA graph capture); the host passes
+        // the parity-0 half and the stride
         void* const dispatch_buffer = small_batch.enabled
-            ? small_batch.dispatch_buffer(buffer, dispatch_iteration & 1) : buffer;
+            ? small_batch.dispatch_buffer(buffer, 0) : buffer;
 
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
@@ -1221,7 +1226,7 @@ public:
                         not prefer_overlap_with_compute,
                         allow_multiple_reduction, do_expand,
                         dispatch_iteration,
-                        small_batch.enabled,
+                        small_batch.enabled, small_batch.dispatch_bytes,
                         comm_stream);
 
         // Received token counters
@@ -1365,7 +1370,7 @@ public:
                                       num_channels,
                                       do_expand, cached_mode,
                                       do_zero_padding,
-                                      small_batch.enabled,
+                                      small_batch.enabled, small_batch.dispatch_bytes,
                                       comm_stream);
 
         // Stream control
@@ -1523,7 +1528,7 @@ public:
             nccl_context->is_scaleup_nvlink, allow_multiple_reduction, num_buffer_bytes);
         ++ combine_iteration;
         void* const combine_buffer = small_batch.enabled
-            ? small_batch.combine_buffer(buffer, combine_iteration & 1) : buffer;
+            ? small_batch.combine_buffer(buffer, 0) : buffer;
 
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
@@ -1548,7 +1553,7 @@ public:
             num_channels,
             use_expanded_layout, allow_multiple_reduction,
             small_batch.enabled, nccl_context->gin_config.gin_indexed_signals_cnt,
-            combine_iteration,
+            combine_iteration, small_batch.combine_bytes,
             comm_stream);
 
         // Allocate output tensors
@@ -1577,6 +1582,7 @@ public:
                                        jit::device_runtime->get_num_sms(),
                                        jit::device_runtime->get_num_smem_bytes(),
                                        use_expanded_layout, allow_multiple_reduction,
+                                       workspace, small_batch.enabled ? small_batch.combine_bytes : 0,
                                        comm_stream);
 
         // Stream control
