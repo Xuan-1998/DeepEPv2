@@ -34,6 +34,7 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxParts = 64;
 
     static constexpr int64_t kNumBarrierSignalBytes = 16;
+    static constexpr int64_t kNumEntryFlagBytes = 16;
 
     __forceinline__ __device__ __host__
     WorkspaceLayout(void* workspace,
@@ -87,6 +88,9 @@ struct WorkspaceLayout {
 
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
+
+        // Hybrid dispatch entry flag
+        num_bytes += kNumEntryFlagBytes;
 
         return num_bytes;
     }
@@ -186,11 +190,15 @@ struct WorkspaceLayout {
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
     }
+
+    __forceinline__ __device__ __host__ int* get_dispatch_entry_flag_ptr() const {
+        return get_agrs_session_signal_ptr(0) + kNumMaxRanks;
+    }
 };
 
 struct TokenLayout {
     int num_hidden_bytes, num_sf_bytes;
-    // NOTES: the top-k index is always 32-bit
+    // NOTES: the top-k index is 32-bit, except in scale-out tokens (16-bit, expert indices are below 2048)
     bool with_metadata;
     // Per-token scale-out header present iff true. See kHdrBytes note below.
     bool with_scaleout_hdr;
@@ -208,15 +216,19 @@ struct TokenLayout {
         with_metadata(with_metadata),
         with_scaleout_hdr(with_scaleout_hdr),
         num_topk(num_topk),
-        num_metadata_bytes((with_scaleout_hdr ? math::align<int>(hdrless_content_bytes(num_topk, with_metadata), sizeof(int64_t)) + kHdrBytes
+        num_metadata_bytes((with_scaleout_hdr ? math::align<int>(hdrless_content_bytes(num_topk, with_metadata, true), sizeof(int64_t)) + kHdrBytes
                                               : hdrless_content_bytes(num_topk, with_metadata))),
         base(base) {
         EP_STATIC_ASSERT(sizeof(int) == sizeof(float), "Invalid size assumption");
         EP_UNIFIED_ASSERT(num_hidden_bytes % ptx::kNumTMAAlignBytes == 0);
     }
 
-    __forceinline__ __device__ __host__ static int hdrless_content_bytes(const int& num_topk, const bool& with_metadata) {
-        return num_topk * (sizeof(int) + sizeof(float)) + (with_metadata ? (1 + num_topk) * sizeof(int) : 0);
+    // A scale-out token carries 16-bit top-k indices and no linked-list region: the forward warp
+    // widens the indices and writes the linked-list indices into the scale-up token
+    __forceinline__ __device__ __host__ static int hdrless_content_bytes(const int& num_topk, const bool& with_metadata,
+                                                                         const bool is_scaleout = false) {
+        return num_topk * (static_cast<int>(is_scaleout ? sizeof(int16_t) : sizeof(int)) + sizeof(float)) +
+               (with_metadata ? (1 + (is_scaleout ? 0 : num_topk)) * sizeof(int) : 0);
     }
 
     template <bool kWithMBarrier, typename dtype_t = int>
@@ -252,8 +264,13 @@ struct TokenLayout {
         return get_metadata_ptr();
     }
 
+    __forceinline__ __device__ __host__ int16_t* get_scaleout_topk_idx_ptr() const {
+        return reinterpret_cast<int16_t*>(get_metadata_ptr());
+    }
+
     __forceinline__ __device__ __host__ float* get_topk_weights_ptr() const {
-        return math::advance_ptr<float>(get_topk_idx_ptr(), num_topk * sizeof(int));
+        return math::advance_ptr<float>(get_topk_idx_ptr(),
+                                        num_topk * static_cast<int>(with_scaleout_hdr ? sizeof(int16_t) : sizeof(int)));
     }
 
     __forceinline__ __device__ __host__ int* get_src_token_global_idx_ptr() const {
@@ -265,7 +282,7 @@ struct TokenLayout {
     }
 
     __forceinline__ __device__ __host__ int64_t* get_hdr_ptr() const {
-        const int hdr_offset = math::align<int>(hdrless_content_bytes(num_topk, with_metadata), sizeof(int64_t));
+        const int hdr_offset = math::align<int>(hdrless_content_bytes(num_topk, with_metadata, with_scaleout_hdr), sizeof(int64_t));
         return static_cast<int64_t*>(static_cast<void*>(
             math::advance_ptr<int8_t>(get_metadata_ptr(), hdr_offset)));
     }
