@@ -78,26 +78,39 @@ __device__ __host__ __forceinline__ int num_sub_parts_at(const int& part_tokens)
     }
 }
 
-template <int kNumSubParts>
+// `kHalving`: every sub-part keeps one token and the remaining tokens split 2^(n-1) : ... : 2 : 1,
+// so the sizes halve from one sub-part to the next. Otherwise the split is uniform.
+template <int kNumSubParts, bool kHalving = false>
 __device__ __host__ __forceinline__ int sub_part_size_at(const int& part_tokens, const int& sub) {
     if constexpr (kNumSubParts <= 1) {
         return part_tokens;
     } else {
         const int num_subs = num_sub_parts_at<kNumSubParts>(part_tokens);
+        if constexpr (kHalving) {
+            const int spare = part_tokens - num_subs;
+            const int total = (1 << num_subs) - 1;
+            int assigned = 0, mine = 0;
+            for (int s = 0; s < num_subs; ++ s) {
+                const int v = spare * (1 << (num_subs - 1 - s)) / total;
+                assigned += v;
+                mine = s == sub ? v : mine;
+            }
+            return 1 + mine + (sub == 0 ? spare - assigned : 0);
+        }
         const int base = part_tokens / num_subs;
         const int rem = part_tokens - base * num_subs;
         return base + (sub < rem ? 1 : 0);
     }
 }
 
-template <int kNumSubParts>
+template <int kNumSubParts, bool kHalving = false>
 __device__ __host__ __forceinline__ int sub_part_offset_at(const int& part_tokens, const int& sub) {
     if constexpr (kNumSubParts <= 1) {
         return 0;
     } else {
         int off = 0;
         for (int s = 0; s < sub; ++ s)
-            off += sub_part_size_at<kNumSubParts>(part_tokens, s);
+            off += sub_part_size_at<kNumSubParts, kHalving>(part_tokens, s);
         return off;
     }
 }
@@ -246,11 +259,30 @@ hybrid_unordered_dispatch_impl(
     const auto part_first_slot = [&](const int& part) {
         return part_offset_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(part);
     };
+    // The last part lands at the end of the transfer: it splits into twice as many sub-puts with
+    // halving sizes, so few tokens are left to forward after the last landing. SM100 keeps the
+    // uniform split, its sub-puts have a token floor.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    constexpr bool kShapeLastPart = false;
+#else
+    constexpr bool kShapeLastPart = true;
+#endif
+    constexpr int kNumLastSubParts = kShapeLastPart ? 2 * kNumSubParts : kNumSubParts;
+    constexpr int kNumMaxSubParts = kNumLastSubParts > kNumSubParts ? kNumLastSubParts : kNumSubParts;
+    const auto num_subs_of = [&](const int& part_idx) {
+        return part_idx == kNumParts - 1 ? num_sub_parts_at<kNumLastSubParts>(part_size(part_idx))
+                                         : num_sub_parts_at<kNumSubParts>(part_size(part_idx));
+    };
+    const auto sub_size_of = [&](const int& part_idx, const int& sub_idx) {
+        return part_idx == kNumParts - 1 ? sub_part_size_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
+                                         : sub_part_size_at<kNumSubParts>(part_size(part_idx), sub_idx);
+    };
     // First slot of sub-part `sub_idx` within part `part_idx` (slots inside a sub-part are
     // filled contiguously from here; its in-band header lives in this slot's header word).
     const auto sub_slot = [&](const int& part_idx, const int& sub_idx) {
         return part_first_slot(part_idx) +
-            sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx);
+            (part_idx == kNumParts - 1 ? sub_part_offset_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
+                                       : sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx));
     };
     // Per-(channel, part) counting-signal id, shared by the sender and forward sides of the
     // channel this warp serves (both sides reduce to the same channel warp index).
@@ -268,26 +300,61 @@ hybrid_unordered_dispatch_impl(
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
-    // Zero the in-band headers of the remote sources before the entry barrier. The header words
-    // live in `buffer`, which the combine and other kernels also write between two dispatches, so
-    // they hold arbitrary data here. No remote sender writes them before it passes the barrier.
-    // The release fence orders the zeros before the barrier signal below, which is what lets the
-    // peers start putting into these slots. Nothing here reads what a peer wrote, so release is enough.
-    if (is_forward_warp and lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
-        const auto src_buffer = scaleout_recv_buffer
-            .get_channel_buffer<kNumSlotsPerChannel>(sm_idx * kNumChannelsPerSM + fwd_warp_idx)
-            .get_rank_buffer(lane_idx);
-        #pragma unroll
-        for (int k = 0; k < kNumParts; ++ k) {
-            for (int s = 0; s < num_sub_parts_at<kNumSubParts>(part_size(k)); ++ s)
-                *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
+    // Split entry: the first forward warp of SM 0 clears the in-band headers of the remote sources, runs
+    // the NVLink and rail handshakes and opens the entry flag. The header words live in `buffer`, which the
+    // combine and other kernels also write between two dispatches, so they hold arbitrary data until this
+    // clear. No remote sender writes them before it passes the rail barrier, and the release fence orders
+    // the zeros before this GPU's barrier signal. Warps stage into their own buffers right away. Every write
+    // into a peer's buffers and every header poll of a forwarder waits for the flag. The flag goes back to 0
+    // at kernel exit, so one constant marks an open entry, also when a CUDA graph replays the kernel.
+    constexpr int kEntryOpen = 1;
+    const auto entry_flag_ptr = workspace_layout.get_dispatch_entry_flag_ptr();
+    const auto wait_entry = [&]() {
+        comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+            if (ptx::ld_acquire_sys<int>(entry_flag_ptr) == kEntryOpen)
+                return true;
+            if (is_last_check and lane_idx == 0) {
+                printf("DeepEP hybrid dispatch (entry flag) timeout, scale-out: %d, scale-up: %d, "
+                       "sm: %d, warp: %d, flag: %d\n",
+                       scaleout_rank_idx, scaleup_rank_idx, sm_idx, warp_idx,
+                       ptx::ld_acquire_sys<int>(entry_flag_ptr));
+            }
+            return false;
+        });
+    };
+    if (sm_idx == 0 and warp_idx == kNumNotifyWarps + kNumScaleoutWarps) {
+        if constexpr (kNumScaleoutRanks > 1) {
+            for (int i = lane_idx; i < kNumChannels * kNumScaleoutRanks; i += 32) {
+                const int src_rank = i % kNumScaleoutRanks;
+                if (src_rank == scaleout_rank_idx)
+                    continue;
+                const auto src_buffer = scaleout_recv_buffer
+                    .get_channel_buffer<kNumSlotsPerChannel>(i / kNumScaleoutRanks)
+                    .get_rank_buffer(src_rank);
+                #pragma unroll
+                for (int k = 0; k < kNumParts; ++ k) {
+                    for (int s = 0; s < num_sub_parts_at<kNumSubParts>(part_size(k)); ++ s)
+                        *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
+                }
+            }
+            ptx::fence_release_sys();
         }
-        ptx::fence_release_sys();
+        __syncwarp();
+        if constexpr (kNumScaleupRanks > 1) {
+            comm::nvlink_barrier_warp<kNumScaleupRanks, kNumScaleupRanksPerLane, kNumTimeoutCycles,
+                                      comm::kHybridDispatchTag0>(
+                gin, workspace_layout, scaleup_rank_idx, lane_idx);
+        }
+        if constexpr (kNumScaleoutRanks > 1) {
+            comm::gin_barrier_wo_local_sync<kNumScaleoutRanks, 1, 32, kNumQPs, kNumTimeoutCycles,
+                                            ncclTeamTagRail, comm::kHybridDispatchTag0, false>(
+                gin.nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, 0, lane_idx);
+        }
+        __syncwarp();
+        if (lane_idx == 0)
+            ptx::st_release_sys(entry_flag_ptr, kEntryOpen);
+        __syncwarp();
     }
-
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 
     // Init TMA for scale-out and forward warps
     ptx::arrival_phase phase = 0;
@@ -368,6 +435,8 @@ hybrid_unordered_dispatch_impl(
                 });
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+
+            wait_entry();
 
             // Issue scaleout writes to peers
             EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
@@ -545,17 +614,20 @@ hybrid_unordered_dispatch_impl(
         int coalesce_flushed = 0;
         int stored_flushed_parts = 0;
         int stored_flushed_subs = 0;
+        bool entry_open = false;
+        const bool is_remote_dst = lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx;
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
-            return sub_part_size_at<kNumSubParts>(part_size(p), stored_flushed_subs);
+            return sub_size_of(p, stored_flushed_subs);
         };
         const auto is_last_sub_put = [&]() {
             if (stored_flushed_parts != kNumParts - 1)
                 return false;
-            return stored_flushed_subs + 1 >=
-                num_sub_parts_at<kNumSubParts>(part_size(kNumParts - 1));
+            return stored_flushed_subs + 1 >= num_subs_of(kNumParts - 1);
         };
-        const auto flush_part = [&](const int& up_to, const bool& is_final) {
+        // Kept inline: as a subroutine (NVCC 13.1 out-lines it at 4 call sites) its by-reference
+        // captures move into local memory and the stack frame grows from 432 B to 1280 B
+        const auto flush_part = [&](const int& up_to, const bool& is_final) __attribute__((always_inline)) {
             if (lane_idx >= kNumScaleoutRanks or lane_idx == scaleout_rank_idx)
                 return;
             const int part_idx = stored_flushed_parts;
@@ -573,7 +645,7 @@ hybrid_unordered_dispatch_impl(
                 lane_idx, 0,
                 ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
             coalesce_flushed = up_to;
-            if (sub_idx + 1 >= num_sub_parts_at<kNumSubParts>(part_size(part_idx))) {
+            if (sub_idx + 1 >= num_subs_of(part_idx)) {
                 stored_flushed_subs = 0;
                 stored_flushed_parts += 1;
             } else {
@@ -594,6 +666,10 @@ hybrid_unordered_dispatch_impl(
             }
             __syncwarp();
         };
+
+        // The staging buffer holds the token in the scale-out layout
+        const auto staged_token = layout::TokenLayout(
+            kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, tma_buffer.get_base_ptr(), /*with_scaleout_hdr=*/true);
 
         // Preload next token
         const auto preload_next_token = [&](const int& token_idx) {
@@ -640,9 +716,9 @@ hybrid_unordered_dispatch_impl(
                 const auto dst_expert_idx = static_cast<int>(uncasted_dst_expert_idx);
                 stored_dst_scaleout_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerScaleout : -1;
                 stored_dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
-                tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
+                staged_token.get_scaleout_topk_idx_ptr()[lane_idx] = static_cast<int16_t>(dst_expert_idx);
                 if (topk_weights != nullptr)
-                    tma_buffer.get_topk_weights_ptr()[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
+                    staged_token.get_topk_weights_ptr()[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
                 if (copied_topk_idx != nullptr)
                     copied_topk_idx[token_idx * kNumTopk + lane_idx] = uncasted_dst_expert_idx;
             }
@@ -650,7 +726,7 @@ hybrid_unordered_dispatch_impl(
 
             // Add source metadata (rank index and token index)
             if (ptx::elect_one_sync())
-                *tma_buffer.get_src_token_global_idx_ptr() = rank_idx * kNumMaxTokensPerRank + token_idx;
+                *staged_token.get_src_token_global_idx_ptr() = rank_idx * kNumMaxTokensPerRank + token_idx;
             ptx::tma_store_fence();
             __syncwarp();
 
@@ -762,14 +838,14 @@ hybrid_unordered_dispatch_impl(
                 auto send_ch = scaleout_send_buffer.get_rank_buffer(stored_dst_scaleout_rank_idx)
                                    .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
                 ptx::tma_store_1d(send_ch.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                                  tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                                  tma_buffer.get_base_ptr(), scaleout_token_layout.get_num_bytes<false>());
             }
             __syncwarp();
 
             // Local rank can be bypassed
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx == scaleout_rank_idx) {
                 ptx::tma_store_1d(scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                                  tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                                  tma_buffer.get_base_ptr(), scaleout_token_layout.get_num_bytes<false>());
             }
             ptx::tma_store_commit();
             ptx::tma_store_wait();
@@ -778,9 +854,13 @@ hybrid_unordered_dispatch_impl(
             // Preload the next token (overlapping with the scale-out put issues)
             preload_next_token(token_idx + kNumChannels);
 
-            if (stored_flushed_parts < kNumParts and
-                stored_scaleout_tail >= coalesce_flushed + cur_sub_size()) {
-                flush_part(stored_scaleout_tail, /*is_final=*/is_last_sub_put());
+            // Puts wait for the entry flag; the sub-parts staged until then go out one by one
+            if (not entry_open)
+                entry_open = ptx::exchange(static_cast<int>(ptx::ld_acquire_sys<int>(entry_flag_ptr) == kEntryOpen), 0) != 0;
+            if (entry_open) {
+                while (is_remote_dst and stored_flushed_parts < kNumParts and
+                       stored_scaleout_tail >= coalesce_flushed + cur_sub_size())
+                    flush_part(coalesce_flushed + cur_sub_size(), /*is_final=*/is_last_sub_put());
             }
             __syncwarp();
 
@@ -788,6 +868,10 @@ hybrid_unordered_dispatch_impl(
             update_scaleout_tail();
         }
 
+        wait_entry();
+        while (is_remote_dst and stored_flushed_parts < kNumParts and
+               stored_scaleout_tail >= coalesce_flushed + cur_sub_size())
+            flush_part(coalesce_flushed + cur_sub_size(), /*is_final=*/is_last_sub_put());
         if (stored_scaleout_tail > coalesce_flushed) {
             flush_part(stored_scaleout_tail, /*is_final=*/true);
         } else if (stored_flushed_parts < kNumParts) {
@@ -842,6 +926,10 @@ hybrid_unordered_dispatch_impl(
         int stored_terminal_sub = -1;
         int anomaly_part = -1, anomaly_num_valid = 0;
         bool anomaly_detected = false;
+        int poll_start_part = 0;
+        // The headers of the remote sources are zero only once the entry flag is open
+        wait_entry();
+        bool entry_open = true;
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
             // Pick next rank in round-robin
@@ -849,7 +937,8 @@ hybrid_unordered_dispatch_impl(
             const auto hi_mask = (wip_mask >> offset) << offset;
             recv_scaleout_rank_idx = hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(wip_mask);
 
-            // Wait for this rank to have data (or finish)
+            // Wait for this rank to have data (or finish). The combine replays the recorded
+            // forward order, so the sources stay interleaved per channel.
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                 const uint32_t arrived_or_finished =
                     stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag > 0;
@@ -869,18 +958,22 @@ hybrid_unordered_dispatch_impl(
                 bool prefix_alive = is_remote_src;
                 bool my_finished = false;
                 int missing_part = -1, missing_num_valid = 0, missing_landed = 0;
+                int first_open_part = kNumParts;
+                // Parts below `poll_start_part` have passed for every source still sending
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
+                    if (k < poll_start_part)
+                        continue;
                     const int64_t landed = ptx::exchange(
                         comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
 
-                    const int num_subs = num_sub_parts_at<kNumSubParts>(part_size(k));
-                    int sub_count[kNumSubParts];
-                    bool sub_more[kNumSubParts];
-                    bool sub_valid[kNumSubParts];
+                    const int num_subs = num_subs_of(k);
+                    int sub_count[kNumMaxSubParts];
+                    bool sub_more[kNumMaxSubParts];
+                    bool sub_valid[kNumMaxSubParts];
                     int num_valid = 0;
                     #pragma unroll
-                    for (int s = 0; s < kNumSubParts; ++ s) {
+                    for (int s = 0; s < kNumMaxSubParts; ++ s) {
                         sub_count[s] = 0;
                         sub_more[s] = false;
                         sub_valid[s] = false;
@@ -904,7 +997,7 @@ hybrid_unordered_dispatch_impl(
                     }
 
                     #pragma unroll
-                    for (int s = 0; s < kNumSubParts; ++ s) {
+                    for (int s = 0; s < kNumMaxSubParts; ++ s) {
                         if (s >= num_subs)
                             continue;
                         const bool through = prefix_alive and sub_valid[s] and part_landed;
@@ -915,9 +1008,18 @@ hybrid_unordered_dispatch_impl(
                             stored_terminal_part = k;
                             stored_terminal_sub = s;
                         }
+                        if (prefix_alive and not through and first_open_part == kNumParts)
+                            first_open_part = k;
                         prefix_alive = through;
                     }
+
+                    // No source can pass a later part before this one
+                    if (not __any_sync(0xffffffffu, prefix_alive))
+                        break;
                 }
+                const bool src_done = my_finished or stored_finish_flag > 0;
+                poll_start_part = __reduce_min_sync(0xffffffffu,
+                    (is_remote_src and not src_done) ? first_open_part : kNumParts);
                 if (is_local_src) {
                     stored_finish_flag       = intended_finish;
                     stored_scaleout_tail_idx = intended_tail;
@@ -943,6 +1045,12 @@ hybrid_unordered_dispatch_impl(
                 return false;
             });
 
+            // NVLink writes into peers wait for the entry flag
+            if (not entry_open) {
+                wait_entry();
+                entry_open = true;
+            }
+
             // Process one chunk from the current rank
             const auto start_slot_idx = ptx::exchange(stored_scaleout_old_tail_idx, recv_scaleout_rank_idx);
             const auto end_slot_idx = std::min(
@@ -961,14 +1069,15 @@ hybrid_unordered_dispatch_impl(
                 const auto tb = recv_buffer.get_token_buffer(slot);
                 if (ptx::elect_one_sync()) {
                     ptx::tma_load_1d(fwd_bufs[b].get_base_ptr(), tb.get_base_ptr(),
-                                     fwd_mbs[b], token_layout.get_num_bytes<false>());
-                    ptx::mbarrier_arrive_and_set_tx(fwd_mbs[b], token_layout.get_num_bytes<false>());
+                                     fwd_mbs[b], scaleout_token_layout.get_num_bytes<false>());
+                    ptx::mbarrier_arrive_and_set_tx(fwd_mbs[b], scaleout_token_layout.get_num_bytes<false>());
                 }
                 __syncwarp();
             };
 
+            // A buffer is reloaded once its stores have read it, the exit barrier waits for completion
             if constexpr (kDoubleBufferForward) {
-                ptx::tma_store_wait();
+                ptx::tma_store_wait_read();
                 __syncwarp();
                 if (start_slot_idx < end_slot_idx)
                     issue_fwd_load(0, start_slot_idx);
@@ -985,13 +1094,13 @@ hybrid_unordered_dispatch_impl(
                     __syncwarp();
 
                     if (slot_idx + 1 < end_slot_idx) {
-                        ptx::tma_store_wait();
+                        ptx::tma_store_wait_read();
                         __syncwarp();
                         issue_fwd_load(cur ^ 1, slot_idx + 1);
                     }
                 } else {
                     // Original single-buffer path: load this slot synchronously.
-                    ptx::tma_store_wait();
+                    ptx::tma_store_wait_read();
                     __syncwarp();
                     issue_fwd_load(0, slot_idx);
                     if (ptx::elect_one_sync())
@@ -999,10 +1108,28 @@ hybrid_unordered_dispatch_impl(
                     __syncwarp();
                 }
 
-                // Read top-k indices
+                // Read the received top-k indices, then widen them and move the weights and the
+                // source index to their scale-up offsets
                 EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
                 int stored_dst_scaleup_rank_idx = -1;
-                auto dst_expert_idx = lane_idx < kNumTopk ? tma_buffer.get_topk_idx_ptr()[lane_idx] : -1;
+                const auto received = layout::TokenLayout(
+                    kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, tma_buffer.get_base_ptr(), true);
+                int dst_expert_idx = -1;
+                float topk_weight = 0;
+                if (lane_idx < kNumTopk) {
+                    dst_expert_idx = received.get_scaleout_topk_idx_ptr()[lane_idx];
+                    topk_weight = received.get_topk_weights_ptr()[lane_idx];
+                }
+                const int src_token_global_idx = *received.get_src_token_global_idx_ptr();
+                __syncwarp();
+                if (lane_idx < kNumTopk) {
+                    tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
+                    tma_buffer.get_topk_weights_ptr()[lane_idx] = topk_weight;
+                }
+                if (lane_idx == 0)
+                    *tma_buffer.get_src_token_global_idx_ptr() = src_token_global_idx;
+                ptx::tma_store_fence();
+                __syncwarp();
                 dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout;
                 stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
                     dst_expert_idx / kNumExpertsPerRank : -1;
@@ -1086,6 +1213,9 @@ hybrid_unordered_dispatch_impl(
             token_metadata_at_forward[num_tokens_processed * kNumForwardMetadataDims] = -1;
         __syncwarp();
 
+        if (not entry_open)
+            wait_entry();
+
         // Update linked list's ending position
         if constexpr (not kReuseSlotIndices) {
             const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
@@ -1103,7 +1233,7 @@ hybrid_unordered_dispatch_impl(
         EP_STATIC_ASSERT(kNumParts <= 32, "One lane drains one part");
         #pragma unroll
         for (int k = 0; k < kNumParts; ++ k) {
-            const int num_subs_k = num_sub_parts_at<kNumSubParts>(part_size(k));
+            const int num_subs_k = num_subs_of(k);
             const int my_subs_k = stored_terminal_part > k  ? num_subs_k
                                 : stored_terminal_part == k ? stored_terminal_sub + 1
                                                             : 0;
@@ -1139,11 +1269,13 @@ hybrid_unordered_dispatch_impl(
     // Trigger the copy epilogue kernel
     cudaTriggerProgrammaticLaunchCompletion();
 
-    // Clean scale-up counters
+    // Clean scale-up counters and the entry flag (every warp passed its wait before the grid sync above)
     // All scale-out counters should be cleaned before
     EP_STATIC_ASSERT(kNumScaleupRanks <= kNumThreads, "Insufficient threads");
     if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumScaleupRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+    if (sm_idx == 0 and thread_idx == 0)
+        *entry_flag_ptr = 0;
 }
 
 }  // namespace deep_ep::elastic

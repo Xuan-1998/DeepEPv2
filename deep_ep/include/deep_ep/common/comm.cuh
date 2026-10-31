@@ -199,6 +199,42 @@ __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
     });
 }
 
+template <int kNumRanks, int kNumRanksPerLane, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
+__forceinline__ __device__ void nvlink_barrier_warp(
+    const handle::NCCLGin& gin,
+    const layout::WorkspaceLayout& workspace,
+    const int& rank_idx, const int& lane_idx) {
+    const int status = static_cast<int>((*workspace.get_nvl_barrier_counter_ptr()) & 3);
+    const int phase = status & 1, sign = status >> 1;
+
+    #pragma unroll
+    for (int j = 0; j < kNumRanksPerLane; ++ j) {
+        if (const int i = j * 32 + lane_idx; i < kNumRanks) {
+            const auto dst_ptr =
+                gin.get_sym_ptr<ncclTeamTagLsa>(workspace.get_nvl_barrier_signal_ptr(phase), i);
+            ptx::red_add_rel_sys(dst_ptr, sign ? -1 : 1);
+        }
+    }
+    __syncwarp();
+    if (lane_idx == 0)
+        atomicAdd(workspace.get_nvl_barrier_counter_ptr(), 1);
+
+    const auto target = sign ? 0 : kNumRanks;
+    timeout_while<kNumTimeoutCycles>(lane_idx == 0, [=](const bool& is_last_check) {
+        const auto signal = ptx::ld_acquire_sys<int>(workspace.get_nvl_barrier_signal_ptr(phase));
+        if (signal == target)
+            return true;
+
+        if (is_last_check) {
+            printf("DeepEP NVLink barrier timeout, tag: %d, nvl: %d, lane: %d, "
+                   "status: %d, signal: %d, phase: %d, target: %d\n",
+                   kTag, rank_idx, lane_idx, status, signal, phase, target);
+        }
+        return false;
+    });
+    __syncwarp();
+}
+
 template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNumTimeoutCycles,
           typename team_t, int kTag = kDeviceBarrierTag,
           bool kFlushStores = true,
