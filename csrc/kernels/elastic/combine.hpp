@@ -32,6 +32,10 @@ public:
         // Use the ordered (upstream) hybrid kernel instead of the unordered one.
         // Resolved once from `EP_HYBRID_KERNEL`; only affects the hybrid path.
         bool use_ordered_kernel;
+        // Small-batch (decode) variant of the unordered hybrid kernel, paired with the
+        // small-batch dispatch (see `hybrid_combine_unordered.cuh`).
+        bool small_batch;
+        int gin_indexed_signals_cnt;
         int num_scaleup_warps, num_forward_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
         int hidden;
@@ -56,6 +60,7 @@ public:
         int scaleout_rank_idx, scaleup_rank_idx;
         int num_reduced_tokens;
         int num_combined_tokens;
+        int combine_iteration;
 
         jit::LaunchArgs launch_args;
     };
@@ -77,8 +82,11 @@ public:
                                     args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = args.use_ordered_kernel ? "hybrid_combine" : "hybrid_combine_unordered";
-            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            const auto sb_prefix = args.use_ordered_kernel ? std::string() :
+                fmt::format("{}, {}, ", args.small_batch, args.gin_indexed_signals_cnt);
+            func_name = fmt::format("{}<{}{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.use_ordered_kernel ? "hybrid_combine_impl" : "hybrid_unordered_combine_impl",
+                                    sb_prefix,
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
                                     args.num_scaleup_warps, args.num_forward_warps,
@@ -133,7 +141,8 @@ static void __instantiate_kernel() {{
                                                      args.buffer, args.workspace,
                                                      args.scaleout_rank_idx, args.scaleup_rank_idx,
                                                      args.num_reduced_tokens,
-                                                     args.num_combined_tokens));
+                                                     args.num_combined_tokens,
+                                                     args.combine_iteration));
         }
     }
 };
@@ -141,6 +150,48 @@ static void __instantiate_kernel() {{
 static layout::TokenLayout get_combine_token_layout(
     const int& hidden, const int& elem_size, const int& num_topk) {
     return layout::TokenLayout(hidden * elem_size, 0, num_topk, false);
+}
+
+// Small-batch knobs that change the block shape are JIT defines. The host reads the same define
+// from `EP_JIT_EXTRA_FLAGS`, so the launch matches the kernel's template defaults
+static int get_jit_define(const std::string& name, const int& default_value) {
+    const auto flags = get_env<std::string>("EP_JIT_EXTRA_FLAGS");
+    const auto key = "-D" + name + "=";
+    const auto pos = flags.find(key);
+    return pos == std::string::npos ? default_value : std::atoi(flags.c_str() + pos + key.size());
+}
+
+// Small-batch combine: scale-up warps per channel. One warp pushes about 14 KB per 3 us to the
+// peers (one bulk store at a time), so the send phase of a decode-sized combine is bounded by
+// the longest per-warp chain; every channel gets as many sending warps as the shared memory
+// and the block size allow, up to 4. The shared memory holds one staging buffer per data warp,
+// the proxy rings, the tail publisher's hand-off and every scale-up warp's reordered linked
+// lists (see `send_partials` in the kernel).
+static int get_small_batch_scaleup_warps_per_channel(const layout::TokenLayout& token_layout,
+                                                    const int& num_channels_per_sm,
+                                                    const int& num_smem_bytes,
+                                                    const int& num_proxy_warps,
+                                                    const int& num_scaleout_ranks,
+                                                    const int& num_scaleup_ranks,
+                                                    const int& num_max_tokens_per_channel) {
+    constexpr int kMaxScaleupWarpsPerChannel = 4;
+    const auto token_bytes = token_layout.get_num_bytes<true, int64_t>();
+    const auto ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
+        num_channels_per_sm, deep_ep::elastic::kProxyRingDepthSmallBatch);
+    const int64_t list_len = static_cast<int64_t>(num_scaleout_ranks) * num_max_tokens_per_channel + 1;
+    const auto fits = [&](const int& per_channel) {
+        const int64_t num_scaleup_warps = static_cast<int64_t>(per_channel) * num_channels_per_sm;
+        const int64_t publisher_bytes = num_scaleup_warps * (2 + num_scaleup_ranks) * static_cast<int64_t>(sizeof(int));
+        const int64_t list_bytes = num_scaleup_warps * 3 * num_scaleup_ranks * list_len * static_cast<int64_t>(sizeof(int));
+        return (num_scaleup_warps + num_channels_per_sm) * token_bytes + ring_bytes + publisher_bytes + list_bytes <= num_smem_bytes and
+               (per_channel + 1) * num_channels_per_sm + num_proxy_warps <= 32;
+    };
+    int per_channel = kMaxScaleupWarpsPerChannel;
+    while (per_channel > 1 and not fits(per_channel))
+        -- per_channel;
+    if (const auto forced = get_env<int>("EP_SB_SCALEUP_WARPS", 0); forced > 0)
+        per_channel = forced;
+    return std::max(per_channel, 1);
 }
 
 static void* launch_combine(void* x,
@@ -163,6 +214,8 @@ static void* launch_combine(void* x,
                             const int& num_sms, const int& num_smem_bytes,
                             const int& num_channels,
                             const bool& use_expanded_layout, const bool& allow_multiple_reduction,
+                            const bool& small_batch, const int& gin_indexed_signals_cnt,
+                            const int& combine_iteration,
                             const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
@@ -177,6 +230,14 @@ static void* launch_combine(void* x,
         EP_HOST_ASSERT(num_channels / num_sms <= 16);
 
         num_scaleup_warps = num_forward_warps = num_channels / num_sms;
+        // Small batch runs one proxy warp per channel unless `EP_SB_PROXY_WARPS` sets fewer
+        // (see the kernel's `kNumProxyWarps`)
+        const int sb_proxy_warps = get_jit_define("EP_SB_PROXY_WARPS", 0);
+        const int num_proxy_warps = small_batch ? (sb_proxy_warps > 0 ? sb_proxy_warps : num_forward_warps) : 1;
+        if (small_batch and not use_ordered_kernel)
+            num_scaleup_warps *= get_small_batch_scaleup_warps_per_channel(
+                token_layout, num_forward_warps, num_smem_bytes, num_proxy_warps,
+                num_scaleout_ranks, num_scaleup_ranks, (num_max_tokens_per_rank + num_channels - 1) / num_channels);
 
         if (use_ordered_kernel) {
             // The ordered kernel has no proxy warp and only carves TMA buffers out of shmem.
@@ -185,17 +246,21 @@ static void* launch_combine(void* x,
                            "Invalid combine SM count, please try to match your dispatch config");
         } else {
             const auto num_data_warps = num_scaleup_warps + num_forward_warps;
-            num_warps = num_data_warps + 1;
+            num_warps = num_data_warps + num_proxy_warps;
             EP_HOST_ASSERT(num_warps * 32 <= 1024 and
                            "combine warp count (scale-up + forward + proxy) exceeds the "
                            "1024-thread block limit; use at least num_channels / 15 SMs");
 
             // TMA buffers and the proxy hand-off rings both live in the dynamic shmem arena; the
             // rings are placed after the TMA region (see hybrid_combine_unordered.cuh) so no alignment pad is
-            // needed. Bound by the same total the channel auto-tuner sized against.
-            const int64_t tma_smem_bytes = static_cast<int64_t>(num_data_warps) * token_layout.get_num_bytes<true>();
+            // needed. Bound by the same total the channel auto-tuner sized against. With the direct
+            // reduce the forwarders have no buffer (the kernel's `kNumBufferWarps`)
+            const bool fwd_direct = small_batch and allow_multiple_reduction and get_jit_define("EP_SB_FWD_DIRECT", 0) != 0;
+            const int64_t tma_smem_bytes = static_cast<int64_t>(fwd_direct ? num_scaleup_warps : num_data_warps) *
+                                           token_layout.get_num_bytes<true>();
             const int64_t proxy_ring_bytes = deep_ep::elastic::ProxyRingLayout::get_num_bytes(
-                num_forward_warps, deep_ep::elastic::kProxyRingDepthDefault);
+                num_forward_warps, small_batch ? deep_ep::elastic::kProxyRingDepthSmallBatch :
+                                                 deep_ep::elastic::kProxyRingDepthDefault);
             // The channel auto-tuner should prevent this assert from firing; leaving it as a sanity check.
             EP_HOST_ASSERT(tma_smem_bytes + proxy_ring_bytes <= num_smem_bytes and
                            "Combine TMA buffers + proxy rings exceed per-block shared memory");
@@ -209,6 +274,8 @@ static void* launch_combine(void* x,
         .use_expanded_layout = use_expanded_layout,
         .allow_multiple_reduction = allow_multiple_reduction,
         .use_ordered_kernel = use_ordered_kernel,
+        .small_batch = small_batch,
+        .gin_indexed_signals_cnt = gin_indexed_signals_cnt,
         .num_scaleup_warps = num_scaleup_warps, .num_forward_warps = num_forward_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .hidden = hidden,
@@ -228,6 +295,7 @@ static void* launch_combine(void* x,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
         .num_reduced_tokens = num_reduced_tokens,
         .num_combined_tokens = num_combined_tokens,
+        .combine_iteration = combine_iteration,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)
     };

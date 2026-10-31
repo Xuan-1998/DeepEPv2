@@ -75,6 +75,9 @@ public:
         // batching is adjusted accordingly.
         flags += fmt::format(" -DEP_COMBINE_BATCH_SIZE={}",
                              device_runtime->get_arch_major() >= 10 ? 6 : 12);
+        // Extra flags (e.g. `-DEP_SB_PROBE=1`); part of the kernel cache key via `flags`
+        if (const auto extra_flags = get_env<std::string>("EP_JIT_EXTRA_FLAGS"); not extra_flags.empty())
+            flags += " " + extra_flags;
     }
 
     virtual ~Compiler() = default;

@@ -23,6 +23,10 @@ struct ProxyPutDesc {
 static_assert(sizeof(ProxyPutDesc) == 24, "ProxyPutDesc must be tightly packed (2 ptrs + 2 ints)");
 
 inline constexpr int kProxyRingDepthDefault = 20;
+// Small-batch combine: a forwarder hands over at most a few batches per call (two per remote
+// node at 128 tokens), and the smaller rings leave room for one more scale-up staging buffer
+// per channel. Fuller rings only make the forwarder wait for the proxy.
+inline constexpr int kProxyRingDepthSmallBatch = 10;
 inline constexpr int kProxyControlWordsPerForwardWarp = 3;   // head, tail, done
 
 // Shared-memory layout for the proxy warp hand-off rings

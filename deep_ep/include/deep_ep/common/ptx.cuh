@@ -127,6 +127,14 @@ __forceinline__ __device__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(kNumRemainingWaits) : "memory");
 }
 
+// Waits only until the bulk stores have finished reading their shared-memory source, which is
+// all that reusing the source buffer needs; the writes may still be in flight (use
+// `tma_store_wait` before publishing their completion to anyone)
+template <int kNumRemainingWaits = 0>
+__forceinline__ __device__ void tma_store_wait_read() {
+    asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(kNumRemainingWaits) : "memory");
+}
+
 enum TMACacheHint: int64_t {
     kEvictFirst = 0x12f0000000000000ll,
     kEvictNormal = 0x1000000000000000ll
@@ -162,6 +170,11 @@ __forceinline__ __device__ void tma_store_commit() {
     asm volatile("cp.async.bulk.commit_group;");
 }
 
+// Bulk prefetch of global memory into L2 (a hint; `ptr` and `num_bytes` must be 16-byte aligned)
+__forceinline__ __device__ void prefetch_l2_bulk(const void* ptr, const uint32_t& num_bytes) {
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(ptr), "r"(num_bytes) : "memory");
+}
+
 template <class dtype_t>
 __forceinline__ __device__ void cp_async_ca(const dtype_t* gmem_src, const dtype_t* smem_dst) {
     EP_STATIC_ASSERT(sizeof(dtype_t) == 4 or sizeof(dtype_t) == 8 or sizeof(dtype_t) == 16, "Invalid dtype bytes");
@@ -174,6 +187,14 @@ __forceinline__ __device__ void cp_async_ca(const dtype_t* gmem_src, const dtype
 __forceinline__ __device__ void cp_async_mbarrier_arrive(mbarrier* ptr) {
     asm volatile("cp.async.mbarrier.arrive.shared::cta.b64 [%0];\n" ::
                  "r"(static_cast<uint32_t>(__cvta_generic_to_shared(ptr))));
+}
+
+/// Timers
+__forceinline__ __device__ unsigned long long globaltimer() {
+    unsigned long long value;
+    // The memory clobber pins the read against the surrounding memory operations
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value) : : "memory");
+    return value;
 }
 
 /// Barriers
