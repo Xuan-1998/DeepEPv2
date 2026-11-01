@@ -61,25 +61,13 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 
 static constexpr int kMinTokensPerPart = (EP_MIN_TOKENS_PER_PART) > 1 ? (EP_MIN_TOKENS_PER_PART) : 1;
 
-// Small-batch mode: maximum sub-parts (= puts) per channel and peer. Every sub-part is one
-// put, all issued together in one coalesced post per SM; more sub-parts let the receiver
-// forward the first tokens while the rest are still in flight. 8 (about one token per put at
-// 128 tokens) measured best on SM90; `num_sub_parts_at` still applies the per-arch minimum
-// tokens per sub-part.
-#ifndef EP_SB_SUB_PARTS
-#define EP_SB_SUB_PARTS 8
-#endif
-static constexpr int kSBSubPartsDefault = (EP_SB_SUB_PARTS) > 1 ? (EP_SB_SUB_PARTS) : 1;
-
-// `kNoArchFloor`: the small-batch mode ignores the SM100 floor, its sub-parts are meant to be
-// one token each so the receiver can forward the first tokens while the rest are in flight
-template <int kNumSubParts, int kMinSubTokens = kMinSubTokensDefault, bool kNoArchFloor = false>
+template <int kNumSubParts, int kMinSubTokens = kMinSubTokensDefault>
 __device__ __host__ __forceinline__ int num_sub_parts_at(const int& part_tokens) {
     if constexpr (kNumSubParts <= 1) {
         return 1;
     } else {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-        constexpr int kArchMinSubTokens = (not kNoArchFloor and (EP_SM100_MIN_SUB_TOKENS) > 1) ? (EP_SM100_MIN_SUB_TOKENS) : 1;
+        constexpr int kArchMinSubTokens = (EP_SM100_MIN_SUB_TOKENS) > 1 ? (EP_SM100_MIN_SUB_TOKENS) : 1;
 #else
         constexpr int kArchMinSubTokens = 1;
 #endif
@@ -93,26 +81,26 @@ __device__ __host__ __forceinline__ int num_sub_parts_at(const int& part_tokens)
     }
 }
 
-template <int kNumSubParts, bool kNoArchFloor = false>
+template <int kNumSubParts>
 __device__ __host__ __forceinline__ int sub_part_size_at(const int& part_tokens, const int& sub) {
     if constexpr (kNumSubParts <= 1) {
         return part_tokens;
     } else {
-        const int num_subs = num_sub_parts_at<kNumSubParts, kMinSubTokensDefault, kNoArchFloor>(part_tokens);
+        const int num_subs = num_sub_parts_at<kNumSubParts>(part_tokens);
         const int base = part_tokens / num_subs;
         const int rem = part_tokens - base * num_subs;
         return base + (sub < rem ? 1 : 0);
     }
 }
 
-template <int kNumSubParts, bool kNoArchFloor = false>
+template <int kNumSubParts>
 __device__ __host__ __forceinline__ int sub_part_offset_at(const int& part_tokens, const int& sub) {
     if constexpr (kNumSubParts <= 1) {
         return 0;
     } else {
         int off = 0;
         for (int s = 0; s < sub; ++ s)
-            off += sub_part_size_at<kNumSubParts, kNoArchFloor>(part_tokens, s);
+            off += sub_part_size_at<kNumSubParts>(part_tokens, s);
         return off;
     }
 }
@@ -146,77 +134,7 @@ __device__ __host__ __forceinline__ constexpr int part_offset_at(const int& part
 // cached mode too (no notify warps), matching the host tuner and the combine kernel.
 static constexpr bool kDataChannelsAboveQP0 = true;
 
-#ifndef EP_SB_PROBE_EVERY
-#define EP_SB_PROBE_EVERY 64
-#endif
-// Small batch: flush the data puts' GIN contexts before the scale-out warps exit. Not needed for
-// correctness there (the next writer of these send slots is the dispatch two calls later, which
-// cannot start before the peers consumed this call's data), so it only costs the ack round trip
-#ifndef EP_SB_EXIT_FLUSH
-#define EP_SB_EXIT_FLUSH 0
-#endif
-// Small batch: prefetch the channel's tokens into L2 before staging them (lane k: k-th token)
-#ifndef EP_SB_L2_PREFETCH
-#define EP_SB_L2_PREFETCH 0
-#endif
-// Small batch: flush the notify warp's count puts before it exits. The count send buffer is
-// parity-indexed in this mode, so this is not needed for correctness (same argument as
-// `EP_SB_EXIT_FLUSH`); it costs the count puts' round trip on SM 0
-#ifndef EP_SB_NOTIFY_FLUSH
-#define EP_SB_NOTIFY_FLUSH 0
-#endif
-// Small batch: system-scope fence after a channel stages its headers. The SM's put issuer syncs
-// with the channel through a named barrier and its GIN post fences at system scope before the
-// doorbell, which already publishes the headers to the NIC
-#ifndef EP_SB_HEADER_FENCE
-#define EP_SB_HEADER_FENCE 0
-#endif
-// Small batch: every thread fences at system scope after the exit grid sync. Only the done-flag
-// stores need a release, and theirs (`st.release.sys` after the grid sync) is cumulative over
-// the NVLink forwards of all SMs; system-scope fences of different warps of one SM serialize
-#ifndef EP_SB_EXIT_FENCE
-#define EP_SB_EXIT_FENCE 0
-#endif
-// Small batch: no exit grid sync. Each SM adds to a device-scope counter once its forwards are
-// done, and the last one publishes the done flags
-#ifndef EP_SB_EXIT_LAST
-#define EP_SB_EXIT_LAST 1
-#endif
-// Small batch, cached dispatch: forwarders load a slot's cached destination slots before waiting
-// for the slot's token load, so the two latencies overlap
-#ifndef EP_SB_EARLY_SLOTS
-#define EP_SB_EARLY_SLOTS 1
-#endif
-// Small batch: a forwarder takes the next chunk from whichever source has data, instead of
-// waiting for the source its round-robin picked (half the channels pick the remote source
-// first and sat on their local tokens until the remote ones had landed)
-#ifndef EP_SB_FWD_READY
-#define EP_SB_FWD_READY 1
-#endif
-#ifdef EP_SB_PROBE
-// Small-batch timeline probes (raw %globaltimer ns, per block), reduced and printed by SM 0
-// once every 64 iterations. Slots: 0 min entry | 1 min staged | 2 max staged | 3 min issued |
-// 4 max issued | 5 max last remote terminal observed | 6 max forward done
-__device__ unsigned long long sb_probe[128][12];
-#endif
-
-// Small-batch mode (`kSmallBatch`): the decode-sized variant of this kernel. Every rank
-// keeps running without any cross-rank barrier:
-//  * no entry barrier: the host alternates the hybrid buffer between two parity halves per
-//    dispatch iteration, and every workspace slot a peer writes is parity-indexed too
-//    (`get_sb_*` in `layout.cuh`), so a peer running one iteration ahead cannot collide
-//    with this rank's consumption or resets. Headers carry the iteration and the per-part
-//    signals use shadow accounting, so early next-iteration arrivals are simply left for
-//    the next iteration (`landed >= num_valid`).
-//  * no exit barrier: forwarding completion is published to each scale-up peer as a
-//    monotonic done flag, polled by the copy epilogue.
-//  * one put per (channel, peer), issued for all channels of an SM by one warp so the
-//    lanes coalesce into a single GIN post per QP (the per-put cost on EFA GDA is paid
-//    once per coalesced group, not once per channel).
-// The HT variant (`kSmallBatch == false`) is unchanged.
-
-template <bool kSmallBatch,
-          bool kDoCPUSync,
+template <bool kDoCPUSync,
           bool kReuseSlotIndices,
           bool kAllowMultipleReduction,
           bool kDoExpand,
@@ -238,11 +156,10 @@ template <bool kSmallBatch,
           int kNumGeomParts = kMinTokensPerPart <= 1 ? kNumBudgetParts
                             : ((kNumMaxTokensPerChannel / kMinTokensPerPart > 1)
                                ? kNumMaxTokensPerChannel / kMinTokensPerPart : 1),
-          int kNumParts = kSmallBatch ? 1 : (kNumBudgetParts < kNumGeomParts ? kNumBudgetParts : kNumGeomParts),
+          int kNumParts = kNumBudgetParts < kNumGeomParts ? kNumBudgetParts : kNumGeomParts,
           int kPartSize = math::constexpr_ceil_div(kNumMaxTokensPerChannel, kNumParts),
           int kBatchSize = kPartSize,
-          int kNumSubParts = kSmallBatch ? (kSBSubPartsDefault < kBatchSize ? kSBSubPartsDefault : kBatchSize)
-                                         : (kNumSubPartsDefault < kBatchSize ? kNumSubPartsDefault : kBatchSize),
+          int kNumSubParts = kNumSubPartsDefault < kBatchSize ? kNumSubPartsDefault : kBatchSize,
           int kNumSlotsPerForwardChunk = 16,
           int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
           int kNumNotifyThreads = kNumNotifyWarps * 32,
@@ -267,7 +184,7 @@ hybrid_unordered_dispatch_impl(
     void* buffer,
     void* workspace, void* mapped_host_workspace,
     const int scaleout_rank_idx, const int scaleup_rank_idx,
-    const int dispatch_iteration, const int64_t sb_buffer_stride) {
+    const int dispatch_iteration) {
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
@@ -280,8 +197,7 @@ hybrid_unordered_dispatch_impl(
     EP_STATIC_ASSERT(kNumSubParts <= kBatchSize,
                      "More sub-parts than tokens in a part: every sub-part must own >= 1 token "
                      "so its header has its own slot");
-    EP_STATIC_ASSERT(kSmallBatch or
-                     gin_alloc::constexpr_channels_per_sm(
+    EP_STATIC_ASSERT(gin_alloc::constexpr_channels_per_sm(
                          kNumGinSignals, kNumSMs, kNumQPs, kDataChannelsAboveQP0, kNumScaleoutWarps)
                          == kNumScaleoutWarps,
                      "GIN signal budget cannot host the launched channel count");
@@ -304,40 +220,6 @@ hybrid_unordered_dispatch_impl(
 
     // Named barrier indices
     constexpr int kNotifyBarrierIndex = 1;
-    constexpr int kSendBarrierIndex = 2;
-
-    // Small-batch mode: this call's sequence (device-side, see `get_sb_seq_done_ptr`) tags the
-    // headers and the done flags, and its parity selects the buffer half and the workspace slot
-    // set. `buffer` arrives as the parity-0 half. The copy epilogue records the completed call
-    const int sb_seq = kSmallBatch ? layout::sb_read_seq(workspace_layout, 0) : dispatch_iteration;
-    const int sb_parity = sb_seq & 1;
-    if constexpr (kSmallBatch)
-        buffer = math::advance_ptr(buffer, sb_parity * sb_buffer_stride);
-#ifdef EP_SB_SEQ_DEBUG
-    if (kSmallBatch and sm_idx == 0 and thread_idx == 0)
-        printf("SBSEQ so %d su %d dispatch seq %d cached %d expand %d\n", scaleout_rank_idx, scaleup_rank_idx, sb_seq,
-               static_cast<int>(kReuseSlotIndices), static_cast<int>(kDoExpand));
-#endif
-
-    // Scale-out notify recv counts: parity-indexed in small-batch mode, legacy otherwise
-    const auto so_rank_count_recv_ptr = [&](const int& src_scaleout_rank_idx, const int& dst_scaleup_rank_idx = 0) {
-        if constexpr (kSmallBatch)
-            return workspace_layout.get_sb_scaleout_rank_count_ptr(sb_parity, src_scaleout_rank_idx, dst_scaleup_rank_idx);
-        else
-            return workspace_layout.get_scaleout_rank_count_ptr<false>(src_scaleout_rank_idx, dst_scaleup_rank_idx);
-    };
-    const auto so_count_send_base = [&]() {
-        if constexpr (kSmallBatch)
-            return workspace_layout.get_sb_scaleout_count_send_base_ptr(sb_parity);
-        else
-            return workspace_layout.get_scaleout_rank_expert_count_ptr<true>();
-    };
-    const auto so_expert_count_recv_ptr = [&](const int& src_scaleout_rank_idx, const int& expert_idx = 0) {
-        if constexpr (kSmallBatch)
-            return workspace_layout.get_sb_scaleout_expert_count_ptr(sb_parity, src_scaleout_rank_idx, expert_idx);
-        else
-            return workspace_layout.get_scaleout_expert_count_ptr<false>(src_scaleout_rank_idx, expert_idx);
-    };
 
     // NCCL Gin handle
     // Each warp is a channel
@@ -372,31 +254,15 @@ hybrid_unordered_dispatch_impl(
     // filled contiguously from here; its in-band header lives in this slot's header word).
     const auto sub_slot = [&](const int& part_idx, const int& sub_idx) {
         return part_first_slot(part_idx) +
-            sub_part_offset_at<kNumSubParts, kSmallBatch>(part_size(part_idx), sub_idx);
+            sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx);
     };
     // Per-(channel, part) counting-signal id, shared by the sender and forward sides of the
     // channel this warp serves (both sides reduce to the same channel warp index).
-    // Small-batch mode has one part and indexes the signal by iteration parity instead, so a
-    // peer one iteration ahead ticks the other id and `landed == num_valid` stays exact; the
-    // combine takes the next `2 * kNumSBChannelsPerContext` ids (see the combine kernel).
-    constexpr int kNumSBChannelsPerContext = gin_alloc::channels_per_context(
-        kNumSMs, kNumQPs - (kDataChannelsAboveQP0 ? 1 : 0), kNumChannelsPerSM);
-    EP_STATIC_ASSERT(not kSmallBatch or 4 * kNumSBChannelsPerContext <= kNumGinSignals,
-                     "GIN signal budget cannot host the small-batch dispatch + combine signals");
-    const auto part_signal_id_of = [&](const int& channel_in_sm_idx, const int& part_idx) {
-        if constexpr (kSmallBatch) {
-            return static_cast<ncclGinSignal_t>(
-                comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
-                    sm_idx, channel_in_sm_idx) * 2 + sb_parity);
-        } else {
-            return static_cast<ncclGinSignal_t>(
-                comm::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
-                                             kNumParts, kDataChannelsAboveQP0>(
-                    sm_idx, channel_in_sm_idx, part_idx));
-        }
-    };
     const auto part_signal_id = [&](const int& part_idx) {
-        return part_signal_id_of((warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, part_idx);
+        return static_cast<ncclGinSignal_t>(
+            comm::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
+                                         kNumParts, kDataChannelsAboveQP0>(
+                sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, part_idx));
     };
 
     auto scaleup_buffer = layout::BufferLayout<false>(
@@ -405,28 +271,10 @@ hybrid_unordered_dispatch_impl(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleup_buffer.get_buffer_end_ptr());
     auto scaleout_recv_buffer = layout::BufferLayout<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
-    // Un-narrowed copies for the small-batch put issuer (the per-role code below narrows the
-    // layouts above to its own channel)
-    const auto scaleout_send_buffer_root = scaleout_send_buffer;
-    const auto scaleout_recv_buffer_root = scaleout_recv_buffer;
 
-    if constexpr (kSmallBatch) {
-        // Barrier-free entry (see the small-batch mode notes above the template). The
-        // block-local sync only orders this block's own initialisation against all warps.
-#ifdef EP_SB_PROBE
-        if (thread_idx == 0) {
-            #pragma unroll
-            for (int q = 0; q < 12; ++ q)
-                sb_probe[sm_idx][q] = (q == 0 or q == 1 or q == 3 or q == 8) ? ~0ull : 0ull;
-            sb_probe[sm_idx][0] = ptx::globaltimer();
-        }
-#endif
-        __syncthreads();
-    } else {
-        comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
-            gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
-    }
+    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
+        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 
     // Init TMA for scale-out and forward warps
     ptx::arrival_phase phase = 0;
@@ -489,7 +337,7 @@ hybrid_unordered_dispatch_impl(
                     const auto status = ptx::ld_volatile<int64_t>(workspace_layout.get_notify_reduction_workspace_ptr() + i);
                     if ((status >> 32) == kNumSMs) {
                         // Encode and write into the send buffer
-                        so_count_send_base()[i] =
+                        workspace_layout.get_scaleout_rank_expert_count_ptr<true>()[i] =
                             math::encode_decode_positive<int>(status & 0xffffffffll);
 
                         // Clean for the next usage
@@ -514,13 +362,13 @@ hybrid_unordered_dispatch_impl(
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
                 gin.put<ncclTeamTagRail>(
-                    so_rank_count_recv_ptr(scaleout_rank_idx),
-                    so_count_send_base() + dst_scaleout_rank_idx * kNumScaleupRanks,
+                    workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_rank_idx),
+                    workspace_layout.get_scaleout_rank_count_ptr<true>(dst_scaleout_rank_idx),
                     kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
                     ncclGinOptFlagsAggregateRequests);
                 gin.put<ncclTeamTagRail>(
-                    so_expert_count_recv_ptr(scaleout_rank_idx),
-                    so_count_send_base() + kNumRanks + dst_scaleout_rank_idx * (kNumScaleupRanks * kNumExpertsPerRank),
+                    workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_rank_idx),
+                    workspace_layout.get_scaleout_expert_count_ptr<true>(dst_scaleout_rank_idx),
                     kNumExpertsPerScaleout * sizeof(int), dst_scaleout_rank_idx);
             }
             __syncwarp();
@@ -560,7 +408,7 @@ hybrid_unordered_dispatch_impl(
             for (int i = thread_idx; i < kNumScaleupRanks; i += kNumNotifyThreads) {
                 // Wait scale-out arrival and reduce
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
-                    return so_rank_count_recv_ptr(scaleout_peer_idx, i);
+                    return workspace_layout.get_scaleout_rank_count_ptr<false>(scaleout_peer_idx, i);
                 });
 
                 // Write into the remote scale-up peer
@@ -576,7 +424,7 @@ hybrid_unordered_dispatch_impl(
             for (int i = thread_idx; i < kNumExpertsPerScaleout; i += kNumNotifyThreads) {
                 // Wait scale-out arrival and reduce
                 const auto count = recv_and_reduce([=](const int& scaleout_peer_idx) {
-                    return so_expert_count_recv_ptr(scaleout_peer_idx, i);
+                    return workspace_layout.get_scaleout_expert_count_ptr<false>(scaleout_peer_idx, i);
                 }, true);
 
                 // Write into the remote scale-up peer
@@ -663,14 +511,7 @@ hybrid_unordered_dispatch_impl(
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
 
-            if (not kSmallBatch or EP_SB_NOTIFY_FLUSH != 0)
-                comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
-#ifdef EP_SB_PROBE
-            if constexpr (kSmallBatch) {
-                if (lane_idx == 0)
-                    atomicMax(&sb_probe[sm_idx][9], ptx::globaltimer());   // slot 9: notify done (SM 0)
-            }
-#endif
+            comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
@@ -678,7 +519,7 @@ hybrid_unordered_dispatch_impl(
         const auto stage_part_header = [&](layout::BufferLayout<false>& send_ch,
                                            const int& slot, const int& count, const bool& more) {
             auto* hdr = send_ch.get_token_buffer(slot).get_hdr_ptr();
-            *hdr = pack_scaleout_header(sb_seq, count, more);
+            *hdr = pack_scaleout_header(dispatch_iteration, count, more);
             ptx::fence_acq_rel_sys();
         };
         scaleout_recv_buffer = scaleout_recv_buffer.get_rank_buffer(scaleout_rank_idx);
@@ -693,13 +534,13 @@ hybrid_unordered_dispatch_impl(
         int stored_flushed_subs = 0;
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
-            return sub_part_size_at<kNumSubParts, kSmallBatch>(part_size(p), stored_flushed_subs);
+            return sub_part_size_at<kNumSubParts>(part_size(p), stored_flushed_subs);
         };
         const auto is_last_sub_put = [&]() {
             if (stored_flushed_parts != kNumParts - 1)
                 return false;
             return stored_flushed_subs + 1 >=
-                num_sub_parts_at<kNumSubParts, kMinSubTokensDefault, kSmallBatch>(part_size(kNumParts - 1));
+                num_sub_parts_at<kNumSubParts>(part_size(kNumParts - 1));
         };
         const auto flush_part = [&](const int& up_to, const bool& is_final) {
             if (lane_idx >= kNumScaleoutRanks or lane_idx == scaleout_rank_idx)
@@ -719,7 +560,7 @@ hybrid_unordered_dispatch_impl(
                 lane_idx, 0,
                 ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
             coalesce_flushed = up_to;
-            if (sub_idx + 1 >= num_sub_parts_at<kNumSubParts, kMinSubTokensDefault, kSmallBatch>(part_size(part_idx))) {
+            if (sub_idx + 1 >= num_sub_parts_at<kNumSubParts>(part_size(part_idx))) {
                 stored_flushed_subs = 0;
                 stored_flushed_parts += 1;
             } else {
@@ -774,13 +615,6 @@ hybrid_unordered_dispatch_impl(
                 __syncwarp();
             }
         };
-
-        if constexpr (kSmallBatch and EP_SB_L2_PREFETCH != 0) {
-            EP_STATIC_ASSERT(kNumHiddenBytes % 16 == 0, "Unaligned hidden for the bulk prefetch");
-            const int t = channel_idx + (lane_idx + 1) * kNumChannels;
-            if (t < num_tokens)
-                ptx::prefetch_l2_bulk(math::advance_ptr(x, static_cast<int64_t>(t) * kNumHiddenBytes), kNumHiddenBytes);
-        }
 
         // Iterate all tokens
         preload_next_token(channel_idx);
@@ -925,139 +759,33 @@ hybrid_unordered_dispatch_impl(
                                   tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
             }
             ptx::tma_store_commit();
-            // Small batch: the staging buffer is reused as soon as the store has read it; the
-            // stores are completed in full before the headers / local tail are published
-            if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
+            ptx::tma_store_wait();
             __syncwarp();
 
             // Preload the next token (overlapping with the scale-out put issues)
             preload_next_token(token_idx + kNumChannels);
 
-            if constexpr (not kSmallBatch) {
-                if (stored_flushed_parts < kNumParts and
-                    stored_scaleout_tail >= coalesce_flushed + cur_sub_size()) {
-                    flush_part(stored_scaleout_tail, /*is_final=*/is_last_sub_put());
-                }
-                __syncwarp();
+            if (stored_flushed_parts < kNumParts and
+                stored_scaleout_tail >= coalesce_flushed + cur_sub_size()) {
+                flush_part(stored_scaleout_tail, /*is_final=*/is_last_sub_put());
             }
+            __syncwarp();
 
-            // Issue scale-out tail update (small batch: only the final one, after the full
-            // store wait below, since the per-token waits only cover the smem read)
-            if constexpr (not kSmallBatch)
-                update_scaleout_tail();
+            // Issue scale-out tail update
+            update_scaleout_tail();
         }
 
-        if constexpr (kSmallBatch) {
-            // One part: every channel sends one put per (sub-part, remote peer), a sub-part
-            // being one or a few tokens. Stage all headers now (lane = destination), publish
-            // the local-source tail, then let the SM's first send warp issue all channels'
-            // puts in one convergent sweep so the lanes of each QP coalesce into a single GIN
-            // post. A channel with no token for a peer still sends one empty terminal put.
-            constexpr int kSBNumSubs = kNumSubParts;
-            // Sub-parts actually used: the architecture floor in `num_sub_parts_at` (15 tokens
-            // on SM100) can leave fewer than `kNumSubParts`, and the slots of the unused ones
-            // belong to the next channel
-            const int sb_num_subs = num_sub_parts_at<kNumSubParts, kMinSubTokensDefault, kSmallBatch>(part_size(0));
-            const auto sb_sub_offset = [&](const int& sub_idx) {
-                return sub_part_offset_at<kNumSubParts, kSmallBatch>(part_size(0), sub_idx);
-            };
-            const auto sb_sub_size = [&](const int& sub_idx) {
-                return sub_part_size_at<kNumSubParts, kSmallBatch>(part_size(0), sub_idx);
-            };
-            ptx::tma_store_wait();
-            __syncwarp();
-            if (lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
-                auto send_ch = scaleout_send_buffer.get_rank_buffer(lane_idx)
-                                   .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
-                const int count = stored_scaleout_tail;
-                #pragma unroll
-                for (int s = 0; s < kSBNumSubs; ++ s) {
-                    const int off = sb_sub_offset(s), size = sb_sub_size(s);
-                    if (s < sb_num_subs and (off < count or (s == 0 and count == 0))) {
-                        const int sub_count = count - off < size ? count - off : size;
-                        *send_ch.get_token_buffer(sub_slot(0, s)).get_hdr_ptr() =
-                            pack_scaleout_header(sb_seq, sub_count, /*more=*/off + size < count);
-                    }
-                }
-                // One publish fence for all headers of this channel
-                if constexpr (EP_SB_HEADER_FENCE != 0)
-                    ptx::fence_acq_rel_sys();
-            }
-            __syncwarp();
-            update_scaleout_tail(true);
-            ptx::named_barrier<kNumScaleoutSendThreads>(kSendBarrierIndex);
-
-            if (scaleout_warp_idx == 0) {
-#ifdef EP_SB_PROBE
-                if (lane_idx == 0) {
-                    const auto t = ptx::globaltimer();
-                    atomicMin(&sb_probe[sm_idx][1], t);
-                    atomicMax(&sb_probe[sm_idx][2], t);
-                }
-#endif
-                constexpr int kNumPutsPerSM = kNumChannelsPerSM * kSBNumSubs * kNumScaleoutRanks;
-                for (int p = lane_idx; p < math::constexpr_align(kNumPutsPerSM, 32); p += 32) {
-                    const int channel_in_sm_idx = p / (kSBNumSubs * kNumScaleoutRanks);
-                    const int sub_idx = (p / kNumScaleoutRanks) % kSBNumSubs;
-                    const int dst_scaleout_rank_idx = p % kNumScaleoutRanks;
-                    int count = 0; bool more = false;
-                    bool active = p < kNumPutsPerSM and dst_scaleout_rank_idx != scaleout_rank_idx and
-                                  sub_idx < sb_num_subs;
-                    const int put_channel_idx = sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
-                    const int slot = sub_slot(0, sub_idx);
-                    const auto send_tb = scaleout_send_buffer_root.get_rank_buffer(active ? dst_scaleout_rank_idx : 0)
-                        .get_channel_buffer<kNumSlotsPerChannel>(put_channel_idx).get_token_buffer(slot);
-                    const auto recv_tb = scaleout_recv_buffer_root.get_rank_buffer(scaleout_rank_idx)
-                        .get_channel_buffer<kNumSlotsPerChannel>(put_channel_idx).get_token_buffer(slot);
-                    // Only the sub-parts this channel staged for this peer carry a header of
-                    // this iteration (stale headers in this half are two iterations old)
-                    if (active)
-                        active = unpack_scaleout_header(*send_tb.get_hdr_ptr(), sb_seq, count, more);
-                    if (active) {
-                        const auto [put_qp_idx, put_sharing_mode] =
-                            comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
-                                sm_idx, channel_in_sm_idx, false);
-                        const handle::NCCLGin put_gin(nccl_dev_comm, nccl_window, put_qp_idx, put_sharing_mode);
-                        put_gin.put<ncclTeamTagRail>(
-                            recv_tb.get_base_ptr(), send_tb.get_base_ptr(),
-                            scaleout_token_layout.get_num_bytes<false>() * (count > 0 ? count : 1),
-                            dst_scaleout_rank_idx, 0,
-                            ncclGin_SignalAdd{part_signal_id_of(channel_in_sm_idx, 0), 1ull});
-                    }
-                }
-#ifdef EP_SB_PROBE
-                __syncwarp();
-                if (lane_idx == 0) {
-                    const auto t = ptx::globaltimer();
-                    atomicMin(&sb_probe[sm_idx][3], t);
-                    atomicMax(&sb_probe[sm_idx][4], t);
-                    atomicAdd(&sb_probe[sm_idx][7], t - sb_probe[sm_idx][2]);
-                }
-#endif
-            }
-            __syncwarp();
-        } else {
-            if (stored_scaleout_tail > coalesce_flushed) {
-                flush_part(stored_scaleout_tail, /*is_final=*/true);
-            } else if (stored_flushed_parts < kNumParts) {
-                flush_part(coalesce_flushed, /*is_final=*/true);
-            }
-            __syncwarp();
-
-            // Flush unflushed tails
-            update_scaleout_tail(true);
+        if (stored_scaleout_tail > coalesce_flushed) {
+            flush_part(stored_scaleout_tail, /*is_final=*/true);
+        } else if (stored_flushed_parts < kNumParts) {
+            flush_part(coalesce_flushed, /*is_final=*/true);
         }
+        __syncwarp();
 
-        // Small batch: the SM's first send warp posted every channel's puts, so the other
-        // warps must not flush their contexts before it is done
-        if constexpr (kSmallBatch) {
-            if constexpr (EP_SB_EXIT_FLUSH != 0) {
-                ptx::named_barrier<kNumScaleoutSendThreads>(kSendBarrierIndex);
-                comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
-            }
-        } else {
-            comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
-        }
+        // Flush unflushed tails
+        update_scaleout_tail(true);
+
+        comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
 
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -1102,13 +830,6 @@ hybrid_unordered_dispatch_impl(
         int stored_terminal_sub = -1;
         int anomaly_part = -1, anomaly_num_valid = 0;
         bool anomaly_detected = false;
-        // Small-batch poll shortcut: the header reads are only worth repeating when the
-        // signal moved since the last consistent snapshot
-        int64_t sb_last_landed[kNumParts];
-        bool sb_last_consistent[kNumParts];
-        #pragma unroll
-        for (int p = 0; p < kNumParts; ++ p)
-            sb_last_landed[p] = -1, sb_last_consistent[p] = false;
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
             // Pick next rank in round-robin
@@ -1118,22 +839,10 @@ hybrid_unordered_dispatch_impl(
 
             // Wait for this rank to have data (or finish)
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
-                if constexpr (kSmallBatch and EP_SB_FWD_READY != 0) {
-                    const uint32_t ready_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx);
-                    if (ready_mask != 0) {
-                        const auto ready_hi = (ready_mask >> offset) << offset;
-                        recv_scaleout_rank_idx = ready_hi ? ptx::ffs(ready_hi) : ptx::ffs(ready_mask);
-                        return true;
-                    }
-                    const int finished = stored_finish_flag > 0;
-                    if (ptx::exchange(finished, recv_scaleout_rank_idx))
-                        return true;
-                } else {
-                    const uint32_t arrived_or_finished =
-                        stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag > 0;
-                    if (ptx::exchange(arrived_or_finished, recv_scaleout_rank_idx))
-                        return true;
-                }
+                const uint32_t arrived_or_finished =
+                    stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag > 0;
+                if (ptx::exchange(arrived_or_finished, recv_scaleout_rank_idx))
+                    return true;
 
                 // Timeout
                 if (is_last_check) {
@@ -1165,16 +874,8 @@ hybrid_unordered_dispatch_impl(
                 for (int k = 0; k < kNumParts; ++ k) {
                     const int64_t landed = ptx::exchange(
                         comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
-                    if constexpr (kSmallBatch) {
-                        // Nothing new landed and the last snapshot was consistent: the headers
-                        // cannot have changed, skip their (acquire) reads
-                        const bool unchanged = landed == sb_last_landed[k] and sb_last_consistent[k];
-                        if (__all_sync(0xffffffffu, unchanged))
-                            continue;
-                        sb_last_landed[k] = landed;
-                    }
 
-                    const int num_subs = num_sub_parts_at<kNumSubParts, kMinSubTokensDefault, kSmallBatch>(part_size(k));
+                    const int num_subs = num_sub_parts_at<kNumSubParts>(part_size(k));
                     int sub_count[kNumSubParts];
                     bool sub_more[kNumSubParts];
                     bool sub_valid[kNumSubParts];
@@ -1187,13 +888,11 @@ hybrid_unordered_dispatch_impl(
                         if (s < num_subs) {
                             sub_valid[s] = is_remote_src and
                                 unpack_scaleout_header(read_batch_header(lane_idx, k, s),
-                                                       sb_seq, sub_count[s], sub_more[s]);
+                                                       dispatch_iteration, sub_count[s], sub_more[s]);
                             num_valid += __popc(ptx::gather(sub_valid[s]));
                         }
                     }
                     const bool part_landed = landed == static_cast<int64_t>(num_valid);
-                    if constexpr (kSmallBatch)
-                        sb_last_consistent[k] = part_landed;
                     if (landed > static_cast<int64_t>(num_valid) and not anomaly_detected) {
                         anomaly_detected = true;
                         anomaly_part = k;
@@ -1221,13 +920,6 @@ hybrid_unordered_dispatch_impl(
                 } else if (src_valid) {
                     if (incremental_tail > stored_scaleout_tail_idx)
                         stored_scaleout_tail_idx = incremental_tail;
-#ifdef EP_SB_PROBE
-                    if (my_finished and stored_finish_flag == 0) {
-                        const auto t = ptx::globaltimer();
-                        atomicMax(&sb_probe[sm_idx][5], t);
-                        atomicMin(&sb_probe[sm_idx][1 + 7], t);   // slot 8: first remote terminal observed
-                    }
-#endif
                     if (my_finished)
                         stored_finish_flag = 1;
                 }
@@ -1261,7 +953,7 @@ hybrid_unordered_dispatch_impl(
             };
 
             if constexpr (kDoubleBufferForward) {
-                if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
+                ptx::tma_store_wait();
                 __syncwarp();
                 if (start_slot_idx < end_slot_idx)
                     issue_fwd_load(0, start_slot_idx);
@@ -1270,12 +962,6 @@ hybrid_unordered_dispatch_impl(
             for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx; ++ slot_idx) {
                 const int cur = (slot_idx - start_slot_idx) & 1;
                 const auto& tma_buffer = fwd_bufs[kDoubleBufferForward ? cur : 0];
-                int early_dst_slot_idx = -1;
-                if constexpr (kSmallBatch and kReuseSlotIndices and EP_SB_EARLY_SLOTS != 0) {
-                    if (lane_idx < kNumTopk)
-                        early_dst_slot_idx = __ldg(dst_buffer_slot_idx +
-                            recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk + lane_idx);
-                }
 
                 if constexpr (kDoubleBufferForward) {
                     // Wait for this slot's load to complete.
@@ -1284,13 +970,13 @@ hybrid_unordered_dispatch_impl(
                     __syncwarp();
 
                     if (slot_idx + 1 < end_slot_idx) {
-                        if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
+                        ptx::tma_store_wait();
                         __syncwarp();
                         issue_fwd_load(cur ^ 1, slot_idx + 1);
                     }
                 } else {
                     // Original single-buffer path: load this slot synchronously.
-                    if constexpr (kSmallBatch) ptx::tma_store_wait_read(); else ptx::tma_store_wait();
+                    ptx::tma_store_wait();
                     __syncwarp();
                     issue_fwd_load(0, slot_idx);
                     if (ptx::elect_one_sync())
@@ -1328,9 +1014,7 @@ hybrid_unordered_dispatch_impl(
                 const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
                     recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
                 if constexpr (kReuseSlotIndices) {
-                    if constexpr (kSmallBatch and EP_SB_EARLY_SLOTS != 0)
-                        stored_dst_slot_idx = early_dst_slot_idx;
-                    else if (lane_idx < kNumTopk)
+                    if (lane_idx < kNumTopk)
                         stored_dst_slot_idx = __ldg(dst_slot_idx_ptr + lane_idx);
                 } else {
                     // Deduplicate for NVLink ranks
@@ -1393,12 +1077,10 @@ hybrid_unordered_dispatch_impl(
 
         // Update linked list's ending position
         if constexpr (not kReuseSlotIndices) {
+            const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
             #pragma unroll
             for (int i = 0; i < kNumScaleupRanksPerLane; ++ i) {
                 if (const auto j = i * 32 + lane_idx; i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks) {
-                    const auto tail_ptr = kSmallBatch
-                        ? workspace_layout.get_sb_dispatch_ll_tail_ptr(sb_parity, channel_idx, scaleup_rank_idx)
-                        : workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
                     ptx::st_relaxed_sys(
                         gin.get_sym_ptr<ncclTeamTagLsa>(tail_ptr, j),
                         layout::pack_forward_fifo_tails<kForwardListTop>(stored_scaleup_remote_counters[i], stored_scaleup_local_counters[i]));
@@ -1410,7 +1092,7 @@ hybrid_unordered_dispatch_impl(
         EP_STATIC_ASSERT(kNumParts <= 32, "One lane drains one part");
         #pragma unroll
         for (int k = 0; k < kNumParts; ++ k) {
-            const int num_subs_k = num_sub_parts_at<kNumSubParts, kMinSubTokensDefault, kSmallBatch>(part_size(k));
+            const int num_subs_k = num_sub_parts_at<kNumSubParts>(part_size(k));
             const int my_subs_k = stored_terminal_part > k  ? num_subs_k
                                 : stored_terminal_part == k ? stored_terminal_sub + 1
                                                             : 0;
@@ -1435,112 +1117,13 @@ hybrid_unordered_dispatch_impl(
         if (lane_idx < kNumScaleoutRanks)
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
         __syncwarp();
-#ifdef EP_SB_PROBE
-        if (lane_idx == 0)
-            atomicMax(&sb_probe[sm_idx][6], ptx::globaltimer());
-#endif
     }
 
-    if constexpr (kSmallBatch) {
-        // Async exit: drain this rank's own NVLink forwards, sync the grid, then publish the
-        // iteration to every scale-up peer's done flag (monotonic, never zeroed). The copy
-        // epilogue polls the flags in place of the exit barrier. Cross-iteration safety is
-        // carried by the parity halves and stream order.
-        ptx::tma_store_commit();
-        ptx::tma_store_wait();
-        __syncwarp();
-#ifdef EP_SB_PROBE
-        if (lane_idx == 0)
-            atomicMax(&sb_probe[sm_idx][10], ptx::globaltimer());   // slot 10: last warp at the exit sync
-#endif
-        if constexpr (EP_SB_EXIT_LAST != 0) {
-            // The last SM to finish publishes the done flags, the others leave. Every SM's
-            // forwards are complete before its block barrier, its warp 0 adds to a device-scope
-            // counter (acq_rel: the last add acquires all earlier ones), and the last SM's
-            // `st.release.sys` stores are cumulative over all of them
-            EP_STATIC_ASSERT(kNumScaleupRanks < layout::WorkspaceLayout::kNumMaxSBScaleupRanks and kNumScaleupRanks <= 32,
-                             "The exit counter lives in the last done-flag slot");
-            __syncthreads();
-#ifdef EP_SB_PROBE
-            if (thread_idx == 0)
-                atomicMax(&sb_probe[sm_idx][11], ptx::globaltimer());   // slot 11: after the block barrier
-#endif
-            if (warp_idx == 0) {
-                int is_last = 0;
-                if (lane_idx == 0) {
-                    int* const counter = workspace_layout.get_sb_dispatch_done_flag_ptr(
-                        layout::WorkspaceLayout::kNumMaxSBScaleupRanks - 1);
-                    int prev;
-                    asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], 1;" : "=r"(prev) : "l"(counter) : "memory");
-                    is_last = prev == kNumSMs - 1;
-                    if (is_last)
-                        asm volatile("st.relaxed.gpu.global.s32 [%0], 0;" :: "l"(counter) : "memory");
-                }
-                is_last = __shfl_sync(0xffffffffu, is_last, 0);
-                __syncwarp();
-                if (is_last and lane_idx < kNumScaleupRanks) {
-                    const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
-                        workspace_layout.get_sb_dispatch_done_flag_ptr(scaleup_rank_idx), lane_idx);
-                    ptx::st_release_sys(dst_ptr, sb_seq);
-                    // The other SMs may still be allocating slots from these counters until they
-                    // arrive, so only the last SM clears them (SM 0 does it after the grid sync)
-                    if constexpr (not kReuseSlotIndices)
-                        workspace_layout.get_scaleup_atomic_sender_counter()[lane_idx] = 0;
-                }
-            }
-        } else {
-        (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
-#ifdef EP_SB_PROBE
-        if (thread_idx == 0)
-            atomicMax(&sb_probe[sm_idx][11], ptx::globaltimer());   // slot 11: after the exit sync
-#endif
-        if constexpr (EP_SB_EXIT_FENCE != 0)
-            ptx::fence_acq_rel_sys();
-        if (sm_idx == 0 and thread_idx < kNumScaleupRanks) {
-            const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
-                workspace_layout.get_sb_dispatch_done_flag_ptr(scaleup_rank_idx), thread_idx);
-            ptx::st_release_sys(dst_ptr, sb_seq);
-        }
-        }
-#ifdef EP_SB_PROBE
-        if (sm_idx == 0 and thread_idx == 0 and (dispatch_iteration & (EP_SB_PROBE_EVERY - 1)) == 1) {
-            unsigned long long q[12];
-            #pragma unroll
-            for (int i = 0; i < 12; ++ i)
-                q[i] = (i == 0 or i == 1 or i == 3 or i == 8) ? ~0ull : 0ull;
-            for (int b = 0; b < kNumSMs; ++ b) {
-                q[0] = min(q[0], sb_probe[b][0]);
-                q[1] = min(q[1], sb_probe[b][1]);
-                q[2] = max(q[2], sb_probe[b][2]);
-                q[3] = min(q[3], sb_probe[b][3]);
-                q[4] = max(q[4], sb_probe[b][4]);
-                q[5] = max(q[5], sb_probe[b][5]);
-                q[6] = max(q[6], sb_probe[b][6]);
-                q[7] += sb_probe[b][7];
-                q[8] = min(q[8], sb_probe[b][8]);
-                q[9] = max(q[9], sb_probe[b][9]);
-                q[10] = max(q[10], sb_probe[b][10]);
-                q[11] = max(q[11], sb_probe[b][11]);
-            }
-            printf("SBQ cached=%d so=%d su=%d it=%d entry=%llu staged0=%llu staged1=%llu issued0=%llu issued1=%llu "
-                   "obslast=%llu fwddone=%llu exit=%llu issue_ns_per_sm=%llu obsfirst=%llu notify=%llu atsync=%llu postsync=%llu\n",
-                   static_cast<int>(kReuseSlotIndices), scaleout_rank_idx, scaleup_rank_idx, dispatch_iteration,
-                   q[0], q[1], q[2], q[3], q[4], q[5], q[6], ptx::globaltimer(), q[7] / kNumSMs, q[8], q[9], q[10], q[11]);
-#ifdef EP_GDA_PROBE
-            printf("GDAQ so=%d su=%d it=%d posts=%llu bp=%llu wqe=%llu rv=%llu db=%llu post=%llu setup=%llu\n",
-                   scaleout_rank_idx, scaleup_rank_idx, dispatch_iteration,
-                   nccl::gin::efa_gda::ep_gda_probe[0], nccl::gin::efa_gda::ep_gda_probe[1], nccl::gin::efa_gda::ep_gda_probe[2], nccl::gin::efa_gda::ep_gda_probe[3], nccl::gin::efa_gda::ep_gda_probe[4],
-                   nccl::gin::efa_gda::ep_gda_probe[5], nccl::gin::efa_gda::ep_gda_probe[6]);
-#endif
-        }
-#endif
-    } else {
-        // Scale-up barrier to ensure data arrival
-        // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again
-        comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
-            gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
-    }
+    // Scale-up barrier to ensure data arrival
+    // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again
+    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
+        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
 
     // Trigger the copy epilogue kernel
     cudaTriggerProgrammaticLaunchCompletion();
@@ -1548,7 +1131,7 @@ hybrid_unordered_dispatch_impl(
     // Clean scale-up counters
     // All scale-out counters should be cleaned before
     EP_STATIC_ASSERT(kNumScaleupRanks <= kNumThreads, "Insufficient threads");
-    if (not kReuseSlotIndices and not (kSmallBatch and EP_SB_EXIT_LAST != 0) and sm_idx == 0 and thread_idx < kNumScaleupRanks)
+    if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumScaleupRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
 }
 

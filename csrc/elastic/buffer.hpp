@@ -699,7 +699,7 @@ public:
     }
 
     // Small-batch (decode) mode of the unordered hybrid kernels, see
-    // `hybrid_dispatch_unordered.cuh`. Selected per call from `num_max_tokens_per_rank`, which
+    // `hybrid_dispatch_unordered_sb.cuh`. Selected per call from `num_max_tokens_per_rank`, which
     // every rank passes identically, so all ranks pick the same kernel variant. The buffer is
     // split into four regions: two combine halves (alternating per combine call) followed by
     // two dispatch halves (alternating per dispatch call). Both regions are sized by the

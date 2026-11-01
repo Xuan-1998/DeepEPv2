@@ -31,6 +31,8 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           // Ordered (upstream) recv layout: partials live at `token_idx` per rank buffer
           // instead of the unordered per-(channel, slot) map.
           bool kOrderedLayout = false,
+          // Small-batch combine: parity-indexed receive buffer and the device-side call sequence
+          bool kSmallBatch = false,
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           int kNumRanks = kNumScaleoutRanks == 1 ? kNumScaleupRanks : kNumScaleoutRanks,
@@ -87,7 +89,7 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
     // Small batch: `recv_buffer` arrives as the parity-0 half; the combine that filled it left
     // its sequence in the current-call word (read after the grid dependency, the combine may
     // still run before it under PDL). This combine is complete: record it for the next one
-    if (sb_buffer_stride > 0) {
+    if constexpr (kSmallBatch) {
         const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
         const int seq = __ldcg(workspace_layout.get_sb_seq_cur_ptr(1));
         recv_buffer = math::advance_ptr(recv_buffer, (seq & 1) * sb_buffer_stride);

@@ -44,7 +44,7 @@ public:
         // overlap is off, so overlap runs keep DeepEP's original single-buffer forward path.
         bool double_buffer_forward;
         // Small-batch (decode) variant of the unordered hybrid kernel, see
-        // `hybrid_dispatch_unordered.cuh`. Decided by the buffer from `num_max_tokens_per_rank`.
+        // `hybrid_dispatch_unordered_sb.cuh`. Decided by the buffer from `num_max_tokens_per_rank`.
         bool small_batch;
         int num_notify_warps;
         int num_dispatch_warps; // For hybrid dispatch
@@ -108,10 +108,28 @@ public:
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles);
-        } else {
-            header_name = "hybrid_dispatch_unordered";
+        } else if (args.small_batch) {
+            // The small-batch kernel lives in its own header, so the high-throughput instantiation
+            // below compiles from the unchanged header
+            header_name = "hybrid_dispatch_unordered_sb";
             func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.small_batch,
+                args.do_cpu_sync,
+                args.reuse_slot_indices,
+                args.allow_multiple_reduction,
+                args.do_expand,
+                args.double_buffer_forward,
+                args.launch_args.grid_dim.first,
+                args.num_notify_warps, args.num_scaleout_warps, args.num_forward_warps,
+                args.num_scaleout_ranks, args.num_scaleup_ranks,
+                args.num_hidden_bytes, args.num_sf_packs,
+                args.num_max_tokens_per_rank,
+                args.num_experts, args.num_topk, args.expert_alignment,
+                args.num_qps, args.num_timeout_cycles,
+                args.gin_indexed_signals_cnt);
+        } else {
+            header_name = "hybrid_dispatch_unordered";
+            func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
                 args.allow_multiple_reduction,
@@ -173,7 +191,7 @@ static void __instantiate_kernel() {{
                 args.workspace, args.mapped_host_workspace,
                 args.scaleout_rank_idx, args.scaleup_rank_idx
             ));
-        } else {
+        } else if (args.small_batch) {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
                 args.x, args.sf, args.topk_idx, args.topk_weights,
@@ -192,6 +210,26 @@ static void __instantiate_kernel() {{
                 args.workspace, args.mapped_host_workspace,
                 args.scaleout_rank_idx, args.scaleup_rank_idx,
                 args.dispatch_iteration, args.sb_buffer_stride
+            ));
+        } else {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
+                kernel, config,
+                args.x, args.sf, args.topk_idx, args.topk_weights,
+                args.copied_topk_idx,
+                args.cumulative_local_expert_recv_stats,
+                args.psum_num_recv_tokens_per_scaleup_rank,
+                args.psum_num_recv_tokens_per_expert,
+                args.num_unaligned_recv_tokens_per_expert,
+                args.dst_buffer_slot_idx,
+                args.token_metadata_at_forward,
+                args.token_map_at_dispatch,
+                args.num_tokens,
+                args.sf_token_stride, args.sf_hidden_stride,
+                args.nccl_dev_comm, args.nccl_window,
+                args.buffer,
+                args.workspace, args.mapped_host_workspace,
+                args.scaleout_rank_idx, args.scaleup_rank_idx,
+                args.dispatch_iteration
             ));
         }
     }

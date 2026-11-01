@@ -33,7 +33,7 @@ public:
         // Resolved once from `EP_HYBRID_KERNEL`; only affects the hybrid path.
         bool use_ordered_kernel;
         // Small-batch (decode) variant of the unordered hybrid kernel, paired with the
-        // small-batch dispatch (see `hybrid_combine_unordered.cuh`).
+        // small-batch dispatch (see `hybrid_combine_unordered_sb.cuh`).
         bool small_batch;
         int gin_indexed_signals_cnt;
         int num_scaleup_warps, num_forward_warps;
@@ -83,8 +83,11 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
-            header_name = args.use_ordered_kernel ? "hybrid_combine" : "hybrid_combine_unordered";
-            const auto sb_prefix = args.use_ordered_kernel ? std::string() :
+            // The small-batch kernel lives in its own header (`_sb`), so the high-throughput
+            // instantiation compiles from the unchanged header
+            header_name = args.use_ordered_kernel ? "hybrid_combine" :
+                          args.small_batch ? "hybrid_combine_unordered_sb" : "hybrid_combine_unordered";
+            const auto sb_prefix = (args.use_ordered_kernel or not args.small_batch) ? std::string() :
                 fmt::format("{}, {}, ", args.small_batch, args.gin_indexed_signals_cnt);
             func_name = fmt::format("{}<{}{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                                     args.use_ordered_kernel ? "hybrid_combine_impl" : "hybrid_unordered_combine_impl",
@@ -131,7 +134,7 @@ static void __instantiate_kernel() {{
                                                      args.buffer, args.workspace,
                                                      args.scaleout_rank_idx, args.scaleup_rank_idx,
                                                      args.num_reduced_tokens));
-        } else {
+        } else if (args.small_batch) {
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
                                                      args.x, args.topk_weights,
                                                      args.src_metadata,
@@ -145,6 +148,19 @@ static void __instantiate_kernel() {{
                                                      args.num_reduced_tokens,
                                                      args.num_combined_tokens,
                                                      args.combine_iteration, args.sb_buffer_stride));
+        } else {
+            EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(kernel, config,
+                                                     args.x, args.topk_weights,
+                                                     args.src_metadata,
+                                                     args.psum_num_recv_tokens_per_scaleup_rank,
+                                                     args.token_metadata_at_forward,
+                                                     args.channel_linked_list,
+                                                     args.token_map_at_dispatch,
+                                                     args.nccl_dev_comm, args.nccl_window,
+                                                     args.buffer, args.workspace,
+                                                     args.scaleout_rank_idx, args.scaleup_rank_idx,
+                                                     args.num_reduced_tokens,
+                                                     args.num_combined_tokens));
         }
     }
 };
@@ -257,7 +273,7 @@ static void* launch_combine(void* x,
                            "1024-thread block limit; use at least num_channels / 15 SMs");
 
             // TMA buffers and the proxy hand-off rings both live in the dynamic shmem arena; the
-            // rings are placed after the TMA region (see hybrid_combine_unordered.cuh) so no alignment pad is
+            // rings are placed after the TMA region (see hybrid_combine_unordered_sb.cuh) so no alignment pad is
             // needed. Bound by the same total the channel auto-tuner sized against. With the direct
             // reduce the forwarders have no buffer (the kernel's `kNumBufferWarps`)
             const bool fwd_direct = small_batch and allow_multiple_reduction and get_jit_define("EP_SB_FWD_DIRECT", 0) != 0;
@@ -361,7 +377,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.use_expanded_layout, args.allow_multiple_reduction,
                            args.launch_args.grid_dim.first,
@@ -371,7 +387,8 @@ static void __instantiate_kernel() {{
                            args.num_max_tokens_per_rank,
                            args.num_experts, args.num_topk,
                            args.num_channels,
-                           args.use_ordered_kernel);
+                           args.use_ordered_kernel,
+                           args.sb_buffer_stride > 0);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
