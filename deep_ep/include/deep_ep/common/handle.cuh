@@ -4,11 +4,35 @@
 #include <nccl_device.h>
 
 #include <deep_ep/common/exception.cuh>
+#include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/ptx.cuh>
 
 namespace deep_ep::elastic::handle {
 
-struct NCCLGin {
+template <bool kEnabled>
+struct GinPutCounter;
+
+template <>
+struct GinPutCounter<false> {
+    __device__ __forceinline__ void init_put_counter(const uint64_t&, const int&) {}
+    __device__ __forceinline__ static ncclGin_None put_counter_action() { return {}; }
+    __device__ __forceinline__ void count_put() const {}
+};
+
+template <>
+struct GinPutCounter<true> {
+    static constexpr ncclGinCounter_t kPutCounter = 0;
+    uint32_t* put_posted;
+
+    __device__ __forceinline__ void init_put_counter(const uint64_t& lsa_base_ptr, const int& context_idx) {
+        const auto offset = layout::WorkspaceLayout::get_gin_put_posted_offset();
+        put_posted = reinterpret_cast<uint32_t*>(lsa_base_ptr + offset) + context_idx;
+    }
+    __device__ __forceinline__ static ncclGin_WeakCounterInc put_counter_action() { return {kPutCounter}; }
+    __device__ __forceinline__ void count_put() const { atomicAdd(reinterpret_cast<unsigned int*>(put_posted), 1u); }
+};
+
+struct NCCLGin : GinPutCounter<kCountGinPuts> {
 #define IS_TEAM_WORLD(code) if constexpr (std::is_same_v<team_t, ncclTeamTagWorld>) { code }
 #define IS_TEAM_LSA(code) if constexpr (std::is_same_v<team_t, ncclTeamTagLsa>) { code }
 #define IS_TEAM_RAIL(code) if constexpr (std::is_same_v<team_t, ncclTeamTagRail>) { code }
@@ -32,6 +56,7 @@ struct NCCLGin {
         team_world(ncclTeamWorld(nccl_dev_comm)), team_lsa(ncclTeamLsa(nccl_dev_comm)), team_rail(ncclTeamRail(nccl_dev_comm)) {
         // TODO: what if we only have 1 NVLink rank
         lsa_base_ptr = reinterpret_cast<uint64_t>(ncclGetLsaPointer(nccl_window, 0, team_lsa.rank));
+        init_put_counter(lsa_base_ptr, qp_idx);
     }
 
     template <typename team_t>
@@ -188,12 +213,13 @@ struct NCCLGin {
                     nccl_window, reinterpret_cast<int64_t>(send_sym_ptr) - lsa_base_ptr,
                     num_bytes,
                     remote_action,
-                    ncclGin_None(),
+                    put_counter_action(),
                     ncclCoopThread(),
                     ncclGin_None(),
                     cuda::thread_scope_thread,
                     cuda::thread_scope_device,
                     ncclGinOptFlagsDefault | extra_options);
+            count_put();
         });
     }
 

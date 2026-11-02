@@ -356,6 +356,7 @@ The library provides some environment variables, which may be useful:
     - `EP_JIT_DUMP_SASS`: `0` or `1`, dump SASS output, `0` by default
 - Debug and profiling
     - `EP_GIN_GDAKI_DEBUG`: `0` or `1`, enable NCCL Gin GDAKI debugging output, `0` by default
+    - `EP_DEBUG_CHECKS`: bitmask of the debug checks compiled into the kernels, `0` by default. Bit 0 (value `1`) counts every GIN put, and a timeout prints how many puts of its context the NIC has not completed
     - `EP_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
     - `EP_DISABLE_BARRIER_PROFILING`: `0` or `1`, disable barrier-based communication profiling in benchmarks, `0` by default
 - Build

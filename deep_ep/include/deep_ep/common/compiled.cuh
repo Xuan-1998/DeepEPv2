@@ -66,6 +66,10 @@ __device__ __forceinline__ longlong4_t make_longlong4_t(
 #define EP_NUM_TOPK_IDX_BITS 64
 #endif
 
+#ifndef EP_DEBUG_CHECKS
+#define EP_DEBUG_CHECKS 0
+#endif
+
 namespace deep_ep {
 
 #ifndef DISABLE_SM90_FEATURES
@@ -73,6 +77,10 @@ constexpr bool kEnableSM90Features = true;
 #else
 constexpr bool kEnableSM90Features = false;
 #endif
+
+constexpr int kDebugChecks = EP_DEBUG_CHECKS;
+constexpr int kDebugCheckGinPutCounters = 1 << 0;
+constexpr bool kCountGinPuts = (kDebugChecks & kDebugCheckGinPutCounters) != 0;
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };
