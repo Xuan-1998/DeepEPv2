@@ -1073,6 +1073,23 @@ hybrid_unordered_dispatch_impl(
                     ptx::st_release_cta(mailbox + kMbDone, num_taken_chunks);
                 __syncwarp();
             }
+
+            // The helper's NVLink stores are complete: count it done on every scale-up peer, next to the
+            // forward warp of its channel
+            if constexpr (kNumScaleupRanks > 1) {
+                ptx::tma_store_commit();
+                ptx::tma_store_wait();
+                ptx::fence_acq_rel_sys();
+                __syncwarp();
+                #pragma unroll
+                for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                    if (const int i = j * 32 + lane_idx; i < kNumScaleupRanks) {
+                        ptx::red_add_rel_sys(gin.get_sym_ptr<ncclTeamTagLsa>(
+                            workspace_layout.get_dispatch_done_counter_ptr(scaleup_rank_idx), i), 1);
+                    }
+                }
+                __syncwarp();
+            }
         }
 
         comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
@@ -1655,7 +1672,7 @@ hybrid_unordered_dispatch_impl(
                     for (int i = 0; i < kNumScaleupRanks; ++ i)
                         workspace_layout.get_scaleup_atomic_sender_counter()[i] = 0;
                 }
-                *workspace_layout.get_dispatch_done_target_ptr() += kNumChannels;
+                *workspace_layout.get_dispatch_done_target_ptr() += kNumChannels * (kChunkRouting ? 2 : 1);
                 *entry_flag_ptr = 0;
                 *exit_counter_ptr = 0;
             }
