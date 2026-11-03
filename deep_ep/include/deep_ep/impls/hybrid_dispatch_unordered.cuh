@@ -314,17 +314,31 @@ hybrid_unordered_dispatch_impl(
 #endif
     constexpr int kNumLastSubParts = kShapeLastPart ? 2 * kNumSubParts : kNumSubParts;
     constexpr int kNumMaxSubParts = kNumLastSubParts > kNumSubParts ? kNumLastSubParts : kNumSubParts;
+    // Without a small first part (two parts per channel) the first part is cut the other way round,
+    // in sub-puts of rising size, so the first put leaves after a few staged tokens.
+    constexpr bool kShapeFirstPart = kShapeLastPart and kNumParts >= 2 and
+        part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
     const auto num_subs_of = [&](const int& part_idx) {
-        return part_idx == kNumParts - 1 ? num_sub_parts_at<kNumLastSubParts>(part_size(part_idx))
-                                         : num_sub_parts_at<kNumSubParts>(part_size(part_idx));
+        return (part_idx == kNumParts - 1 or (kShapeFirstPart and part_idx == 0))
+            ? num_sub_parts_at<kNumLastSubParts>(part_size(part_idx))
+            : num_sub_parts_at<kNumSubParts>(part_size(part_idx));
     };
     const auto sub_size_of = [&](const int& part_idx, const int& sub_idx) {
+        if (kShapeFirstPart and part_idx == 0)
+            return sub_part_size_at<kNumLastSubParts, true>(
+                part_size(0), num_sub_parts_at<kNumLastSubParts>(part_size(0)) - 1 - sub_idx);
         return part_idx == kNumParts - 1 ? sub_part_size_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
                                          : sub_part_size_at<kNumSubParts>(part_size(part_idx), sub_idx);
     };
     // First slot of sub-part `sub_idx` within part `part_idx` (slots inside a sub-part are
     // filled contiguously from here; its in-band header lives in this slot's header word).
     const auto sub_slot = [&](const int& part_idx, const int& sub_idx) {
+        if (kShapeFirstPart and part_idx == 0) {
+            int off = 0;
+            for (int s = 0; s < sub_idx; ++ s)
+                off += sub_size_of(0, s);
+            return off;
+        }
         return part_first_slot(part_idx) +
             (part_idx == kNumParts - 1 ? sub_part_offset_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
                                        : sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx));
