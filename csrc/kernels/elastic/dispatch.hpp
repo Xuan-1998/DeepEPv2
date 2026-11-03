@@ -254,6 +254,7 @@ static void launch_dispatch(void* x, void* sf,
     int num_dispatch_warps = 0;
     int num_scaleout_warps = 0, num_forward_warps = 0;
     int num_threads = 0;
+    bool fwd_double_buffer = double_buffer_forward;
 
     // Maximize shared memory utilization
     if (num_scaleout_ranks == 1) {
@@ -266,6 +267,10 @@ static void launch_dispatch(void* x, void* sf,
         num_scaleout_warps = num_channels_per_sm;
         num_forward_warps = num_channels_per_sm;
         num_threads = (num_notify_warps + num_scaleout_warps + num_forward_warps) * 32;
+        const auto token_layout = get_dispatch_token_layout(hidden, elem_size, num_sf_packs, num_topk);
+        fwd_double_buffer = fwd_double_buffer or
+            static_cast<int64_t>(kNumDispatchBuffersPerChannel) * num_channels_per_sm *
+                    token_layout.get_num_bytes<true>() + num_notify_smem_bytes <= num_smem_bytes;
     }
 
     // Generate, build and launch
@@ -276,7 +281,7 @@ static void launch_dispatch(void* x, void* sf,
         .use_ordered_kernel = use_ordered_hybrid_kernel(),
         .allow_multiple_reduction = allow_multiple_reduction,
         .do_expand = do_expand,
-        .double_buffer_forward = double_buffer_forward,
+        .double_buffer_forward = fwd_double_buffer,
         .num_notify_warps = num_notify_warps,
         .num_dispatch_warps = num_dispatch_warps,
         .num_scaleout_warps = num_scaleout_warps, .num_forward_warps = num_forward_warps,
