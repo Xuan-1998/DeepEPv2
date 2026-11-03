@@ -158,6 +158,9 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         } else if (gin_config.gin_context_cnt > 0) {
             reqs.ginContextCount = gin_config.gin_context_cnt;
         }
+        // The `counters` check of `EP_DEBUG_CHECKS`: counter 0 of each context counts the puts the NIC has
+        // completed, `comm::report_gin_queue` reads it after a timeout
+        reqs.ginCounterCount = (get_debug_checks() & kDebugCheckGinPutCounters) != 0 ? 1 : 0;
 
         // The unordered kernels synchronize through counting signals only; VA and
         // strong signals are not required.

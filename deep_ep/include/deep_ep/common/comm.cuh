@@ -79,12 +79,36 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
-template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
-__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
-    if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
-                  static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
+template <typename gin_t>
+__device__ __forceinline__ void report_gin_queue(const gin_t& gin,
+                                                 const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    if constexpr (kCountGinPuts) {
+        const auto posted = *reinterpret_cast<const volatile uint32_t*>(gin.put_posted);
+        const auto completed = static_cast<uint32_t>(
+            gin.gin.readCounter(gin_t::kPutCounter, kNumSignalBits, cuda::memory_order_relaxed));
+        printf("DeepEP GIN queue state, scale-out: %d, scale-up: %d, sm: %d, thread: %d, ctx: %d, "
+               "puts posted: %u, completed by the NIC: %u, not completed: %u\n",
+               scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
+               static_cast<int>(gin.gin.contextId), posted, completed, (posted - completed) & ((1u << kNumSignalBits) - 1));
+    }
+}
+
+__device__ __forceinline__ void report_gin_queue(const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
+                                                 const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    if constexpr (kCountGinPuts)
+        report_gin_queue(handle::NCCLGin(nccl_dev_comm, nccl_window, 0, NCCL_GIN_RESOURCE_SHARING_CTA),
+                         scaleout_rank_idx, scaleup_rank_idx);
+}
+
+template <int64_t kNumTimeoutCycles, typename coop_t>
+__device__ __forceinline__ void flush_with_timeout(const handle::NCCLGin& gin, const coop_t& coop,
+                                                   const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    if (gin.gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
+                      static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
         printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
                static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+        if (threadIdx.x % 32 == __ffs(__activemask()) - 1)
+            report_gin_queue(gin, scaleout_rank_idx, scaleup_rank_idx);
         ptx::trap();
     }
 }
@@ -204,9 +228,10 @@ template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNum
           bool kFlushStores = true,
           int kNumWarps = kNumThreads / 32>
 __forceinline__ __device__ void gin_barrier_wo_local_sync(
-    const ncclDevComm_t& nccl_dev_comm,
+    const handle::NCCLGin& handle_gin,
     const int& scaleout_rank_idx, const int& scaleup_rank_idx, 
     const int& sm_idx, const int& thread_idx) {
+    const ncclDevComm_t& nccl_dev_comm = handle_gin.nccl_dev_comm;
     const auto global_warp_idx = sm_idx * kNumWarps + (thread_idx / 32);
     const int& rank_idx = (std::is_same_v<team_t, ncclTeamTagWorld>) ? scaleup_rank_idx : scaleout_rank_idx;
     const int num_qps = kNumQPs == kFlushAllAllocatedQPs ? nccl_dev_comm.ginContextCount : kNumQPs;
@@ -259,6 +284,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
                 printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
                        "slot: %d, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx,
                        static_cast<int>(signal_idx), target);
+                report_gin_queue(nccl_dev_comm, handle_gin.nccl_window, scaleout_rank_idx, scaleup_rank_idx);
                 // Wait another 1 second to let all threads print information and
                 // trap similar to timeout_while
                 const auto stop = clock64() + kNumOneSecCycles;
@@ -280,7 +306,7 @@ __forceinline__ __device__ void scaleup_barrier_wo_local_sync(
             gin, workspace, rank_idx, sm_idx, thread_idx);
     } else {
         gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagWorld, kTag, kFlushStores>(
-            gin.nccl_dev_comm, 1, rank_idx, sm_idx, thread_idx);
+            gin, 1, rank_idx, sm_idx, thread_idx);
     }
 }
 
@@ -291,7 +317,7 @@ __forceinline__ __device__ void scaleout_barrier_wo_local_sync(
     const int& scaleout_rank_idx, const int& scaleup_rank_idx,
     const int& sm_idx, const int& thread_idx) {
     gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagRail, kTag, kFlushStores>(
-        gin.nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+        gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 }
 
 template <bool kIsScaleupNVLink,

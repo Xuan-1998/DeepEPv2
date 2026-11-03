@@ -5,10 +5,12 @@
 #include <filesystem>
 #include <functional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <memory>
 #include <unistd.h>
 
+#include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
 
 #include "format.hpp"
@@ -32,6 +34,28 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
     } else {
         EP_HOST_ASSERT(false and "Unexpected type");
     }
+}
+
+static int get_debug_checks() {
+    const auto value = get_env<std::string>("EP_DEBUG_CHECKS");
+    if (value.empty() or value == "0")
+        return 0;
+
+    int bits = 0;
+    if (value == "1" or value == "all") {
+        for (const auto& check: kDebugCheckNames)
+            bits |= check.bit;
+        return bits;
+    }
+    std::stringstream names(value);
+    for (std::string name; std::getline(names, name, ',');) {
+        const auto check = std::find_if(std::begin(kDebugCheckNames), std::end(kDebugCheckNames),
+                                        [&](const DebugCheckName& c) { return name == c.name; });
+        if (check == std::end(kDebugCheckNames))
+            EP_HOST_UNREACHABLE(fmt::format("Unknown check in EP_DEBUG_CHECKS: {}", name));
+        bits |= check->bit;
+    }
+    return bits;
 }
 
 static std::tuple<int, std::string> call_external_command(std::string command) {
