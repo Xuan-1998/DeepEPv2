@@ -1153,6 +1153,13 @@ hybrid_unordered_dispatch_impl(
         bool anomaly_detected = false;
         int poll_start_part = 0;
         int num_posted_chunks = 0;
+        // Rows recorded from the own and from the remote sources. The combine replays the recorded order and
+        // sends the remote-source rows back over the network. A rising first part reaches the forwarder in small
+        // pieces, so there a local turn may run at most `kPaceSlack` rows ahead of the mean remote source while a
+        // remote source still sends
+        constexpr bool kPaceLocalTurns = kShapeFirstPart;
+        constexpr int kPaceSlack = 12, kPaceMinTurn = 8;
+        int num_local_recorded = 0, num_remote_recorded = 0;
         // The headers of the remote sources are zero only once the entry flag is open
         wait_entry();
         bool entry_open = true;
@@ -1279,12 +1286,22 @@ hybrid_unordered_dispatch_impl(
 
             // Process one chunk from the current rank
             const auto start_slot_idx = ptx::exchange(stored_scaleout_old_tail_idx, recv_scaleout_rank_idx);
+            int turn_limit = kNumSlotsPerForwardChunk;
+            if (kPaceLocalTurns and kNumScaleoutRanks > 1 and recv_scaleout_rank_idx == scaleout_rank_idx and
+                (wip_mask & ~(1u << scaleout_rank_idx)) != 0) {
+                const int lag = num_remote_recorded / (kNumScaleoutRanks - 1) + kPaceSlack - num_local_recorded;
+                turn_limit = lag < kPaceMinTurn ? kPaceMinTurn : (lag < kNumSlotsPerForwardChunk ? lag : kNumSlotsPerForwardChunk);
+            }
             const auto end_slot_idx = std::min(
                 ptx::exchange(stored_scaleout_tail_idx, recv_scaleout_rank_idx),
-                start_slot_idx + kNumSlotsPerForwardChunk
+                start_slot_idx + turn_limit
             );
             if (lane_idx == recv_scaleout_rank_idx)
                 stored_scaleout_old_tail_idx = end_slot_idx;
+            if (recv_scaleout_rank_idx == scaleout_rank_idx)
+                num_local_recorded += end_slot_idx - start_slot_idx;
+            else
+                num_remote_recorded += end_slot_idx - start_slot_idx;
 
             const auto recv_buffer = scaleout_recv_buffer.get_rank_buffer(recv_scaleout_rank_idx);
 
