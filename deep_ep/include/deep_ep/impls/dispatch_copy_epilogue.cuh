@@ -27,6 +27,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             topk_idx_t* recv_topk_idx, float* recv_topk_weights,
                             int* recv_src_metadata,
                             int* channel_linked_list,
+                            int* token_metadata_at_forward,
                             int* num_unaligned_recv_tokens_per_expert,
                             int num_recv_tokens,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
@@ -47,6 +48,7 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     const auto tma_buffer = layout::BufferLayout<true>(token_layout, kNumWarps, 1, smem)
         .get_rank_buffer(warp_idx).get_token_buffer(0);
     const auto scaleup_buffer = layout::BufferLayout<false>(token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
+    const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
 
     // Init TMA
     ptx::arrival_phase phase = 0;
@@ -128,9 +130,27 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         __syncwarp();
 
         // Maintain linked list
+        // The unordered dispatch records the tokens its forwarder got from its local scale-out rank at
+        // `kForwardListTop`, `kForwardListTop - 1`, ... of the (channel, source) list and the others at
+        // 0, 1, ...; write such a local token right after the remote ones instead, so combine walks one
+        // list with the remote tokens first
         if constexpr (kDoCreateLinkedList) {
-            if (ptx::elect_one_sync())
-                channel_linked_list[tma_buffer.get_linked_list_idx_ptr()[master_src_topk_idx]] = i;
+            if (ptx::elect_one_sync()) {
+                constexpr int kNumListEntries = kNumScaleoutRanks * kNumMaxTokensPerChannel + 1;
+                constexpr int kForwardListTop = kNumListEntries - 1;
+                constexpr int kFirstLocalEntry = (kNumScaleoutRanks - 1) * kNumMaxTokensPerChannel + 1;
+                auto flat_idx = tma_buffer.get_linked_list_idx_ptr()[master_src_topk_idx];
+                const int channel_idx = flat_idx / (kNumListEntries * kNumScaleupRanks);
+                const int rem = flat_idx - channel_idx * (kNumListEntries * kNumScaleupRanks);
+                const int entry_idx = rem / kNumScaleupRanks, src_scaleup_rank_idx = rem - entry_idx * kNumScaleupRanks;
+                if (entry_idx >= kFirstLocalEntry) {
+                    const int counts = *workspace_layout.get_channel_forward_counts_ptr(channel_idx, src_scaleup_rank_idx);
+                    if (layout::is_forward_fifo_tails(counts))
+                        flat_idx = channel_idx * (kNumListEntries * kNumScaleupRanks) +
+                            (layout::forward_fifo_num_remote(counts) + (kForwardListTop - entry_idx)) * kNumScaleupRanks + src_scaleup_rank_idx;
+                }
+                channel_linked_list[flat_idx] = i;
+            }
             __syncwarp();
         }
 
@@ -211,18 +231,89 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // Or you can understand it as writing the tail at once
     if constexpr (kDoCreateLinkedList) {
         constexpr int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32);
-        const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
         for (int i = global_warp_idx; i < kNumChannels; i += kNumSMs * kNumWarps) {
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
                 if (const auto k = j * 32 + lane_idx; j < (kNumScaleupRanksPerLane - 1) or k < kNumScaleupRanks) {
-                    channel_linked_list[
-                        *workspace_layout.get_channel_scaleup_tail_ptr(i, k)
-                    ] = -1;
+                    const int counts = *workspace_layout.get_channel_forward_counts_ptr(i, k);
+                    if (not layout::is_forward_fifo_tails(counts)) {
+                        channel_linked_list[*workspace_layout.get_channel_scaleup_tail_ptr(i, k)] = -1;
+                    } else {
+                        constexpr int kNumListEntries = kNumScaleoutRanks * kNumMaxTokensPerChannel + 1;
+                        const int num_tokens = layout::forward_fifo_num_remote(counts) + layout::forward_fifo_num_local(counts);
+                        channel_linked_list[i * (kNumListEntries * kNumScaleupRanks) + num_tokens * kNumScaleupRanks + k] = -1;
+                    }
 
                     // Clean for combine usages
                     *workspace_layout.get_channel_scaleup_tail_ptr(i, k) = 0;
                 }
+            }
+            __syncwarp();
+        }
+
+        // Compact each channel's forward metadata list, which the unordered dispatch forwarder left as two
+        // regions: remote tokens at 0, 1, ... and local tokens at `kForwardListTop`, `kForwardListTop - 1`,
+        // ... Local token `j` moves to `num_remote + j` and one `-1` ends the list, so combine replays the
+        // remote tokens first and reads the layout it always read. The destination of `j` is the source of
+        // `mirror - j`; when both are local tokens the two entries swap, done by the lane of the smaller
+        // index after reading both. Each channel is split into `kNumMoveParts` independent ranges of `j`.
+        constexpr int kNumMoveParts = 8;
+        constexpr int kNumListEntries = kNumScaleoutRanks * kNumMaxTokensPerChannel + 1;
+        constexpr int kForwardListTop = kNumListEntries - 1;
+        constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
+        EP_STATIC_ASSERT(kNumForwardMetadataDims % 2 == 0, "Metadata entries move as int2");
+        constexpr int kNumInt2PerEntry = kNumForwardMetadataDims / 2;
+        for (int unit = global_warp_idx; unit < kNumChannels * kNumMoveParts; unit += kNumSMs * kNumWarps) {
+            const int channel_idx = unit / kNumMoveParts, part = unit - channel_idx * kNumMoveParts;
+            const int totals = *workspace_layout.get_channel_forward_totals_ptr(channel_idx);
+            if (not layout::is_forward_fifo_tails(totals))
+                continue;
+            const int num_remote = layout::forward_fifo_num_remote(totals), num_local = layout::forward_fifo_num_local(totals);
+            const auto list = token_metadata_at_forward + channel_idx * (kNumListEntries * kNumForwardMetadataDims);
+            const int mirror = kForwardListTop - num_remote;
+            const int per_part = (num_local + kNumMoveParts - 1) / kNumMoveParts;
+            const int j_begin = part * per_part, j_end = min(num_local, j_begin + per_part);
+            for (int j0 = j_begin; j0 < j_end; j0 += 32) {
+                const int j = j0 + lane_idx, partner = mirror - j;
+                const bool is_pair = 0 <= partner and partner < num_local;
+                const bool do_move = j < j_end and (not is_pair or j < partner);
+                const bool do_swap = do_move and is_pair;
+                int2 own[kNumInt2PerEntry], other[kNumInt2PerEntry];
+                if (do_move) {
+                    const auto src = reinterpret_cast<const int2*>(list + (kForwardListTop - j) * kNumForwardMetadataDims);
+                    #pragma unroll
+                    for (int t = 0; t < kNumInt2PerEntry; ++ t)
+                        own[t] = src[t];
+                }
+                if (do_swap) {
+                    const auto src = reinterpret_cast<const int2*>(list + (kForwardListTop - partner) * kNumForwardMetadataDims);
+                    #pragma unroll
+                    for (int t = 0; t < kNumInt2PerEntry; ++ t)
+                        other[t] = src[t];
+                }
+                __syncwarp();
+                if (do_move) {
+                    const auto dst = reinterpret_cast<int2*>(list + (num_remote + j) * kNumForwardMetadataDims);
+                    #pragma unroll
+                    for (int t = 0; t < kNumInt2PerEntry; ++ t)
+                        dst[t] = own[t];
+                }
+                if (do_swap) {
+                    const auto dst = reinterpret_cast<int2*>(list + (num_remote + partner) * kNumForwardMetadataDims);
+                    #pragma unroll
+                    for (int t = 0; t < kNumInt2PerEntry; ++ t)
+                        dst[t] = other[t];
+                }
+                __syncwarp();
+            }
+
+            // The end mark goes to `num_remote + num_local`. That entry is the source of local token
+            // `mirror - num_local` when that is a valid token, so the part that moved it writes the mark
+            const int j_mark = mirror - num_local;
+            const bool mark_in_block = 0 <= j_mark and j_mark < num_local;
+            if (mark_in_block ? (j_begin <= j_mark and j_mark < j_end) : part == 0) {
+                if (lane_idx == 0)
+                    list[(num_remote + num_local) * kNumForwardMetadataDims] = -1;
             }
             __syncwarp();
         }
