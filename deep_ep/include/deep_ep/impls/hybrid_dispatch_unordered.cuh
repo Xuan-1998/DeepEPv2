@@ -844,15 +844,42 @@ hybrid_unordered_dispatch_impl(
         bool anomaly_detected = false;
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
-            // Pick next rank in round-robin
+            // WORKAROUND, NOT A DESIGN: drain every INTER-NODE source before the intra-node one,
+            // so combine's RDMA work comes first.
+            //
+            // Combine replays this metadata list and its destination is dispatch's source, so a
+            // remote token becomes a `gin.put` there and a local one a bypass with no put. Ordering
+            // the list remote-first therefore front-loads all of combine's rail traffic, which is
+            // what this is for -- posting descriptors as early as possible so the link drains while
+            // the forward warps do local work.
+            //
+            // Why it is a workaround: `wip_mask` marks a source that is not FINISHED, not one with
+            // data ready, so the local source is not merely deprioritised -- it is deferred until
+            // every remote peer has completely finished. That starves local work that is sitting
+            // ready, and the warp blocks in `FwWaitArrival` instead of filling the stall.
+            const uint32_t remote_mask = wip_mask & ~(1u << scaleout_rank_idx);
+            const uint32_t pick_mask = remote_mask ? remote_mask : wip_mask;
             const auto offset = (recv_scaleout_rank_idx + 1) % kNumScaleoutRanks;
-            const auto hi_mask = (wip_mask >> offset) << offset;
-            recv_scaleout_rank_idx = hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(wip_mask);
+            const auto hi_mask = (pick_mask >> offset) << offset;
+            recv_scaleout_rank_idx = hi_mask ? ptx::ffs(hi_mask) : ptx::ffs(pick_mask);
 
             // Wait for this rank to have data (or finish)
             comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                // Hold out for a FULL CHUNK rather than returning on the first slot. A one-slot
+                // turn pays a whole source switch for a single token, and `end_slot_idx` caps the
+                // turn at a chunk anyway, so short turns shred the forward pipeline.
+                //
+                // `stored_finish_flag > 0` is the escape and always eventually fires: it is set in
+                // this same predicate once the source's terminal sub-part lands, so a source with
+                // less than a chunk left still releases the wait. Nothing can deadlock on it -- a
+                // sender with more to send is never blocked by this wait, since unconsumed slots
+                // only accumulate, and a sender with nothing left declares itself finished.
+                //
+                // Costs timeout headroom: a source that trickles now sits here until it fills a
+                // chunk or finishes, where before it returned on the first slot.
                 const uint32_t arrived_or_finished =
-                    stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag > 0;
+                    stored_scaleout_tail_idx - stored_scaleout_old_tail_idx >= kNumSlotsPerForwardChunk
+                    or stored_finish_flag > 0;
                 if (ptx::exchange(arrived_or_finished, recv_scaleout_rank_idx))
                     return true;
 
