@@ -333,7 +333,7 @@ hybrid_unordered_dispatch_impl(
                     .get_rank_buffer(src_rank);
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
-                    for (int s = 0; s < num_sub_parts_at<kNumSubParts>(part_size(k)); ++ s)
+                    for (int s = 0; s < num_subs_of(k); ++ s)
                         *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
                 }
             }
