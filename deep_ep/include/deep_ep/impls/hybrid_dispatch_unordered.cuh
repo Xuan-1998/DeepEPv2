@@ -257,7 +257,13 @@ hybrid_unordered_dispatch_impl(
     // the chunk's slot base and linked-list counter per scale-up rank.
     constexpr int kNumRouteTokens = kNumSlotsPerForwardChunk;
     EP_STATIC_ASSERT(kNumRouteTokens <= 32, "One lane routes one token of a forward chunk");
-    constexpr int kNumRouteInts = kNumRouteTokens * (kNumTopk * 3 + kNumScaleupRanks) + kNumScaleupRanks * 2;
+    constexpr int kNumRouteInts = math::constexpr_align(
+        kNumRouteTokens * (kNumTopk * 3 + kNumScaleupRanks) + kNumScaleupRanks * 2, 4);
+    // Mailbox between the forward warp and its helper: posted and done chunk sequence numbers, the
+    // forwarder's finish flag, the helper's ready flag, the chunk's token count and the forwarder's
+    // share, then the helper's source-token, metadata and slot-index pointers
+    constexpr int kNumMailboxInts = 16;
+    enum { kMbPosted = 0, kMbDone, kMbFwdDone, kMbReady, kMbNumTokens, kMbFwdShare, kMbPtrs = 8 };
     constexpr int kNumSmemTokenBytes =
         math::constexpr_align(kNumHiddenBytes, ptx::kNumTMAAlignBytes) +
         math::constexpr_align(kNumSFPacks * static_cast<int>(sizeof(sf_pack_t)), ptx::kNumTMAAlignBytes) +
@@ -265,15 +271,18 @@ hybrid_unordered_dispatch_impl(
         math::constexpr_align(static_cast<int>(sizeof(ptx::mbarrier)), ptx::kNumTMAAlignBytes);
     EP_STATIC_ASSERT(kNumSmemBytesForNotify +
                          (kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps) * kNumSmemTokenBytes +
-                         kNumForwardWarps * kNumRouteInts * static_cast<int>(sizeof(int)) <= 232448,
+                         kNumForwardWarps * (kNumRouteInts + kNumMailboxInts) * static_cast<int>(sizeof(int)) <= 232448,
                      "Forward routing tables exceed the shared memory");
+    // The sender warp of a channel shares its forward warp's tables (it helps once its tokens are staged)
+    const int chan_warp_idx = is_forward_warp ? fwd_warp_idx : (warp_idx >= kNumNotifyWarps ? warp_idx - kNumNotifyWarps : 0);
     int* const route_rank = static_cast<int*>(tma_pool.get_buffer_end_ptr()) +
-        (is_forward_warp ? fwd_warp_idx : 0) * kNumRouteInts;
+        chan_warp_idx * (kNumRouteInts + kNumMailboxInts);
     int* const route_slot = route_rank + kNumRouteTokens * kNumTopk;
     int* const route_ll = route_slot + kNumRouteTokens * kNumTopk;
     int* const route_prefix = route_ll + kNumRouteTokens * kNumTopk;
     int* const route_base = route_prefix + kNumRouteTokens * kNumScaleupRanks;
     int* const route_count = route_base + kNumScaleupRanks;
+    int* const mailbox = route_rank + kNumRouteInts;
 
     constexpr int kNumSlotsPerChannel = kNumParts * kBatchSize;
     const auto part_size = [&](const int& part) {
@@ -389,7 +398,71 @@ hybrid_unordered_dispatch_impl(
         if (kDoubleBufferForward and is_forward_warp)
             ptx::mbarrier_init_with_fence(mbarrier_ptr_alt, 1);
     }
-    __syncwarp();
+    if (warp_idx >= kNumNotifyWarps and not is_forward_warp and lane_idx < kNumMailboxInts)
+        mailbox[lane_idx] = 0;
+    __syncthreads();
+
+    // Forward one token that sits in `fwd_token` (scale-out layout) with its routing at row `route_row`:
+    // widen the top-k indices, move the weights and the source index to their scale-up offsets, add the
+    // linked-list indices, store it into its scale-up ranks and record its forward metadata. Run by the
+    // forward warp and by its helper on the same channel.
+    const int fwd_channel_idx = sm_idx * kNumChannelsPerSM + chan_warp_idx;
+    const auto fwd_scaleup_buffer = scaleup_buffer.get_rank_buffer(scaleup_rank_idx);
+    const auto forward_token = [&](const layout::TokenLayout& fwd_token, const int& route_row,
+                                   int* metadata_ptr, int* dst_slot_idx_ptr, const bool& is_last)
+                                   __attribute__((always_inline)) {
+        EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
+        const auto received = layout::TokenLayout(
+            kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, fwd_token.get_base_ptr(), true);
+        const int route_idx = route_row * kNumTopk + lane_idx;
+        int dst_expert_idx = -1;
+        float topk_weight = 0;
+        int dst_scaleup_rank_idx = -1, dst_slot_idx = -1, linked_list_idx = -1;
+        if (lane_idx < kNumTopk) {
+            dst_expert_idx = received.get_scaleout_topk_idx_ptr()[lane_idx];
+            topk_weight = received.get_topk_weights_ptr()[lane_idx];
+            dst_scaleup_rank_idx = route_rank[route_idx];
+            dst_slot_idx = route_slot[route_idx];
+            linked_list_idx = route_ll[route_idx];
+        }
+        const int src_token_global_idx = *received.get_src_token_global_idx_ptr();
+        __syncwarp();
+        if (lane_idx < kNumTopk) {
+            fwd_token.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
+            fwd_token.get_topk_weights_ptr()[lane_idx] = topk_weight;
+            if constexpr (not kReuseSlotIndices) {
+                constexpr int kNumTokensInLinkedList = kNumMaxTokensPerChannel * kNumScaleoutRanks + 1;
+                fwd_token.get_linked_list_idx_ptr()[lane_idx] =
+                    fwd_channel_idx * (kNumTokensInLinkedList * kNumScaleupRanks) +
+                    linked_list_idx * kNumScaleupRanks + scaleup_rank_idx;
+            }
+        }
+        if (lane_idx == 0)
+            *fwd_token.get_src_token_global_idx_ptr() = src_token_global_idx;
+        ptx::tma_store_fence();
+        __syncwarp();
+
+        if (dst_slot_idx >= 0) {
+            const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
+                fwd_scaleup_buffer.get_token_buffer(dst_slot_idx).get_base_ptr(), dst_scaleup_rank_idx);
+            ptx::tma_store_1d(dst_ptr, fwd_token.get_base_ptr(), fwd_token.get_num_bytes<false>());
+            ptx::tma_store_commit();
+        }
+        __syncwarp();
+
+        if constexpr (not kReuseSlotIndices) {
+            if (ptx::elect_one_sync()) {
+                metadata_ptr[0] = src_token_global_idx;
+                metadata_ptr[1] = is_last;
+            }
+            if (lane_idx < kNumTopk) {
+                metadata_ptr[2 + lane_idx] = dst_scaleup_rank_idx;
+                metadata_ptr[2 + kNumTopk + lane_idx] = dst_slot_idx;
+                dst_slot_idx_ptr[lane_idx] = dst_slot_idx;
+            }
+        }
+        __syncwarp();
+    };
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
@@ -905,6 +978,61 @@ hybrid_unordered_dispatch_impl(
         // Flush unflushed tails
         update_scaleout_tail(true);
 
+        // Help the forward warp of this channel: forward the second half of every chunk it posts, from
+        // the staging buffer, which is idle once the last token is staged (its stores were waited for)
+        if constexpr (kNumScaleoutRanks > 1) {
+            if (ptx::elect_one_sync())
+                ptx::st_release_cta(mailbox + kMbReady, 1);
+            __syncwarp();
+            int num_taken_chunks = 0;
+            while (true) {
+                int posted = 0;
+                if (lane_idx == 0) {
+                    comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                        const int fwd_done = ptx::ld_acquire_cta(mailbox + kMbFwdDone);
+                        posted = ptx::ld_acquire_cta(mailbox + kMbPosted);
+                        if (posted != num_taken_chunks or fwd_done != 0)
+                            return true;
+                        if (is_last_check)
+                            printf("DeepEP hybrid dispatch (forward helper wait) timeout, channel: %d, taken: %d\n",
+                                   channel_idx, num_taken_chunks);
+                        return false;
+                    });
+                }
+                posted = __shfl_sync(0xffffffffu, posted, 0);
+                __syncwarp();
+                if (posted == num_taken_chunks)
+                    break;
+
+                const int num_chunk_tokens = mailbox[kMbNumTokens];
+                const int fwd_share = mailbox[kMbFwdShare];
+                const auto ptrs = reinterpret_cast<void* const*>(mailbox + kMbPtrs);
+                const auto src_token_ptr = static_cast<int8_t*>(ptrs[0]);
+                const auto chunk_metadata_ptr = static_cast<int*>(ptrs[1]);
+                const auto chunk_dst_slot_idx_ptr = static_cast<int*>(ptrs[2]);
+                constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
+                for (int i = fwd_share; i < num_chunk_tokens; ++ i) {
+                    ptx::tma_store_wait_read();
+                    __syncwarp();
+                    if (ptx::elect_one_sync()) {
+                        ptx::tma_load_1d(tma_buffer.get_base_ptr(),
+                                         src_token_ptr + static_cast<int64_t>(i) * scaleout_token_layout.get_num_bytes<false>(),
+                                         mbarrier_ptr, scaleout_token_layout.get_num_bytes<false>());
+                        ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, scaleout_token_layout.get_num_bytes<false>());
+                        ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                    }
+                    __syncwarp();
+                    forward_token(tma_buffer, i, chunk_metadata_ptr + i * kNumForwardMetadataDims,
+                                  chunk_dst_slot_idx_ptr + i * kNumTopk, i == num_chunk_tokens - 1);
+                }
+                num_taken_chunks = posted;
+                __syncwarp();
+                if (ptx::elect_one_sync())
+                    ptx::st_release_cta(mailbox + kMbDone, num_taken_chunks);
+                __syncwarp();
+            }
+        }
+
         comm::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
 
     } else {
@@ -950,6 +1078,7 @@ hybrid_unordered_dispatch_impl(
         int anomaly_part = -1, anomaly_num_valid = 0;
         bool anomaly_detected = false;
         int poll_start_part = 0;
+        int num_posted_chunks = 0;
         // The headers of the remote sources are zero only once the entry flag is open
         wait_entry();
         bool entry_open = true;
@@ -1104,6 +1233,21 @@ hybrid_unordered_dispatch_impl(
             if (start_slot_idx < end_slot_idx)
                 issue_fwd_load(0, start_slot_idx);
 
+            // The helper reads the tables of the chunk it took until it reports it done
+            if (num_posted_chunks > 0 and start_slot_idx < end_slot_idx) {
+                if (ptx::elect_one_sync()) {
+                    comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                        if (ptx::ld_acquire_cta(mailbox + kMbDone) == num_posted_chunks)
+                            return true;
+                        if (is_last_check)
+                            printf("DeepEP hybrid dispatch (forward helper) timeout, channel: %d, posted: %d, done: %d\n",
+                                   channel_idx, num_posted_chunks, ptx::ld_acquire_cta(mailbox + kMbDone));
+                        return false;
+                    });
+                }
+                __syncwarp();
+            }
+
             // Route the chunk while its first token loads, one token per lane: scale-up ranks, slots
             // (one slot atomic per scale-up rank and chunk) and linked-list indices
             using mask_t = std::conditional_t<kNumScaleupRanks <= 32, unsigned, unsigned long long>;
@@ -1183,9 +1327,33 @@ hybrid_unordered_dispatch_impl(
                 __syncwarp();
             }
 
-            for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx; ++ slot_idx) {
+            // Hand the second half of the chunk to the helper when it is ready
+            int fwd_end_slot_idx = end_slot_idx;
+            const int num_chunk_tokens = end_slot_idx - start_slot_idx;
+            const auto chunk_metadata_ptr = token_metadata_at_forward + num_tokens_processed * kNumForwardMetadataDims;
+            const auto chunk_dst_slot_idx_ptr = dst_buffer_slot_idx +
+                recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + start_slot_idx * kNumTopk;
+            const bool helper_ready = num_chunk_tokens >= 2 and
+                __shfl_sync(0xffffffffu, lane_idx == 0 ? ptx::ld_acquire_cta(mailbox + kMbReady) : 0, 0) != 0;
+            if (helper_ready) {
+                const int fwd_share = (num_chunk_tokens + 1) / 2;
+                fwd_end_slot_idx = start_slot_idx + fwd_share;
+                if (ptx::elect_one_sync()) {
+                    mailbox[kMbNumTokens] = num_chunk_tokens;
+                    mailbox[kMbFwdShare] = fwd_share;
+                    auto ptrs = reinterpret_cast<void**>(mailbox + kMbPtrs);
+                    ptrs[0] = recv_buffer.get_token_buffer(start_slot_idx).get_base_ptr();
+                    ptrs[1] = chunk_metadata_ptr;
+                    ptrs[2] = chunk_dst_slot_idx_ptr;
+                    __threadfence_block();
+                    ptx::st_release_cta(mailbox + kMbPosted, num_posted_chunks + 1);
+                }
+                num_posted_chunks += 1;
+                __syncwarp();
+            }
+
+            for (int slot_idx = start_slot_idx; slot_idx < fwd_end_slot_idx; ++ slot_idx) {
                 const int cur = (slot_idx - start_slot_idx) & 1;
-                const int route_idx = (slot_idx - start_slot_idx) * kNumTopk + lane_idx;
                 const auto& tma_buffer = fwd_bufs[kDoubleBufferForward ? cur : 0];
 
                 if constexpr (kDoubleBufferForward) {
@@ -1194,7 +1362,7 @@ hybrid_unordered_dispatch_impl(
                         ptx::mbarrier_wait_and_flip_phase(fwd_mbs[cur], *fwd_phases[cur]);
                     __syncwarp();
 
-                    if (slot_idx + 1 < end_slot_idx) {
+                    if (slot_idx + 1 < fwd_end_slot_idx) {
                         ptx::tma_store_wait_read();
                         __syncwarp();
                         issue_fwd_load(cur ^ 1, slot_idx + 1);
@@ -1211,69 +1379,17 @@ hybrid_unordered_dispatch_impl(
                     __syncwarp();
                 }
 
-                // Widen the received top-k indices, move the weights and the source index to their
-                // scale-up offsets and add the linked-list indices
-                EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
-                const auto received = layout::TokenLayout(
-                    kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, tma_buffer.get_base_ptr(), true);
-                int dst_expert_idx = -1;
-                float topk_weight = 0;
-                int stored_dst_scaleup_rank_idx = -1, stored_dst_slot_idx = -1, linked_list_idx = -1;
-                if (lane_idx < kNumTopk) {
-                    dst_expert_idx = received.get_scaleout_topk_idx_ptr()[lane_idx];
-                    topk_weight = received.get_topk_weights_ptr()[lane_idx];
-                    stored_dst_scaleup_rank_idx = route_rank[route_idx];
-                    stored_dst_slot_idx = route_slot[route_idx];
-                    linked_list_idx = route_ll[route_idx];
-                }
-                const int src_token_global_idx = *received.get_src_token_global_idx_ptr();
-                __syncwarp();
-                if (lane_idx < kNumTopk) {
-                    tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
-                    tma_buffer.get_topk_weights_ptr()[lane_idx] = topk_weight;
-                    if constexpr (not kReuseSlotIndices)
-                        tma_buffer.get_linked_list_idx_ptr()[lane_idx] = transform_linked_list_idx(linked_list_idx);
-                }
-                if (lane_idx == 0)
-                    *tma_buffer.get_src_token_global_idx_ptr() = src_token_global_idx;
-                ptx::tma_store_fence();
-                __syncwarp();
-
-                // Issue TMAs
-                if (stored_dst_slot_idx >= 0) {
-                    const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
-                        scaleup_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                        stored_dst_scaleup_rank_idx);
-                    ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
-                    ptx::tma_store_commit();
-                }
-                __syncwarp();
-
-                // Record metadata at forward
-                if constexpr (not kReuseSlotIndices) {
-                    EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of selections");
-                    const auto metadata_ptr = token_metadata_at_forward +
-                        num_tokens_processed * kNumForwardMetadataDims;
-                    const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
-                        recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
-
-                    // Source token index and last token index flag
-                    if (ptx::elect_one_sync()) {
-                        metadata_ptr[0] = src_token_global_idx;
-                        metadata_ptr[1] = slot_idx == (end_slot_idx - 1);
-                    }
-
-                    // Second, original top-k indices and destination slots
-                    if (lane_idx < kNumTopk) {
-                        metadata_ptr[2 + lane_idx] = stored_dst_scaleup_rank_idx;
-                        metadata_ptr[2 + kNumTopk + lane_idx] = stored_dst_slot_idx;
-                        dst_slot_idx_ptr[lane_idx] = stored_dst_slot_idx;
-                    }
-                }
-                num_tokens_processed += 1;
-                __syncwarp();
+                const int i = slot_idx - start_slot_idx;
+                forward_token(tma_buffer, i, chunk_metadata_ptr + i * kNumForwardMetadataDims,
+                              chunk_dst_slot_idx_ptr + i * kNumTopk, slot_idx == end_slot_idx - 1);
             }
+            num_tokens_processed += num_chunk_tokens;
         }
+
+        // The helper leaves once every posted chunk is taken
+        if (ptx::elect_one_sync())
+            ptx::st_release_cta(mailbox + kMbFwdDone, 1);
+        __syncwarp();
 
         // Assign the source token index part of the metadata into `-1` as an ending mark
         if (not kReuseSlotIndices and ptx::elect_one_sync())
