@@ -89,8 +89,11 @@ struct WorkspaceLayout {
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
-        // Hybrid dispatch entry flag
+        // Hybrid dispatch entry flag, exit counter and done target
         num_bytes += kNumEntryFlagBytes;
+
+        // Hybrid dispatch done counters, one per scale-up source rank
+        num_bytes += kNumMaxRanks * sizeof(int);
 
         return num_bytes;
     }
@@ -193,6 +196,18 @@ struct WorkspaceLayout {
 
     __forceinline__ __device__ __host__ int* get_dispatch_entry_flag_ptr() const {
         return get_agrs_session_signal_ptr(0) + kNumMaxRanks;
+    }
+
+    __forceinline__ __device__ __host__ int* get_dispatch_exit_counter_ptr() const {
+        return get_dispatch_entry_flag_ptr() + 1;
+    }
+
+    __forceinline__ __device__ __host__ int* get_dispatch_done_target_ptr() const {
+        return get_dispatch_entry_flag_ptr() + 2;
+    }
+
+    __forceinline__ __device__ __host__ int* get_dispatch_done_counter_ptr(const int& scaleup_rank_idx) const {
+        return math::advance_ptr<int>(get_dispatch_entry_flag_ptr(), kNumEntryFlagBytes) + scaleup_rank_idx;
     }
 };
 
