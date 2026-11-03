@@ -87,8 +87,23 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // Current rank indices should be maintained
     int current_rank_idx = -1, stored_psum_num_recv_tokens;
     int current_rank_start = 0, current_rank_end = 0;
+    // Behind the unordered hybrid dispatch, start at this rank's own segment so the warps do not all wait for
+    // the first peer, and wrap around once
+    int token_offset = 0;
+    if constexpr (kWaitDispatchDone)
+        token_offset = scaleup_rank_idx > 0 ? psum_num_recv_tokens_per_scaleup_rank[scaleup_rank_idx - 1] : 0;
     #pragma unroll
-    for (int i = global_warp_idx; i < num_recv_tokens; i += kNumWarps * kNumSMs) {
+    for (int j = global_warp_idx; j < num_recv_tokens; j += kNumWarps * kNumSMs) {
+        int i = j;
+        if constexpr (kWaitDispatchDone) {
+            i = j + token_offset;
+            if (i >= num_recv_tokens) {
+                i -= num_recv_tokens;
+                if (current_rank_start > i)
+                    current_rank_idx = -1, current_rank_start = 0, current_rank_end = 0;
+            }
+        }
+
         // Calculate token index in the buffer
         while (i >= current_rank_end) {
             current_rank_idx += 1;
