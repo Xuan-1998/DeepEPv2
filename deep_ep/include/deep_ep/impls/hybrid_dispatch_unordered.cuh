@@ -240,8 +240,11 @@ hybrid_unordered_dispatch_impl(
     const auto scaleout_token_layout = layout::TokenLayout(
         kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true);
     constexpr int kNumFwdBuffers = kDoubleBufferForward ? kNumDispatchFwdBuffers : 1;
+    // With a double-buffered forward, each sender warp also gets a second buffer for when it helps forward
+    constexpr int kNumHelperBuffers = kDoubleBufferForward ? kNumScaleoutWarps : 0;
+    constexpr int kNumPoolBuffers = kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps + kNumHelperBuffers;
     const auto tma_pool = layout::BufferLayout<true>(
-        token_layout, kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps, 1,
+        token_layout, kNumPoolBuffers, 1,
         math::advance_ptr<int>(smem, kNumSmemBytesForNotify));
     const bool is_forward_warp = warp_idx >= kNumNotifyWarps + kNumScaleoutWarps;
     const int fwd_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -250,7 +253,9 @@ hybrid_unordered_dispatch_impl(
         : (warp_idx - kNumNotifyWarps);
     const auto tma_buffer = tma_pool.get_rank_buffer(tma_pool_base).get_token_buffer(0);
     const auto tma_buffer_alt = tma_pool.get_rank_buffer(
-        tma_pool_base + (kDoubleBufferForward and is_forward_warp ? 1 : 0)).get_token_buffer(0);
+        not kDoubleBufferForward ? tma_pool_base :
+        is_forward_warp ? tma_pool_base + 1 :
+        kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps + (warp_idx - kNumNotifyWarps)).get_token_buffer(0);
 
     // Per forward warp, after the TMA pool: the routing of one forward chunk, one token per lane.
     // Rank, slot and linked-list index per (token, top-k), the token's prefix per scale-up rank,
@@ -270,7 +275,7 @@ hybrid_unordered_dispatch_impl(
         math::constexpr_align(kNumTopk * 8 + (1 + kNumTopk) * 4, ptx::kNumTMAAlignBytes) +
         math::constexpr_align(static_cast<int>(sizeof(ptx::mbarrier)), ptx::kNumTMAAlignBytes);
     EP_STATIC_ASSERT(kNumSmemBytesForNotify +
-                         (kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps) * kNumSmemTokenBytes +
+                         kNumPoolBuffers * kNumSmemTokenBytes +
                          kNumForwardWarps * (kNumRouteInts + kNumMailboxInts) * static_cast<int>(sizeof(int)) <= 232448,
                      "Forward routing tables exceed the shared memory");
     // The sender warp of a channel shares its forward warp's tables (it helps once its tokens are staged)
@@ -395,7 +400,7 @@ hybrid_unordered_dispatch_impl(
     const auto mbarrier_ptr_alt = tma_buffer_alt.get_mbarrier_ptr();
     if (warp_idx >= kNumNotifyWarps and ptx::elect_one_sync()) {
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
-        if (kDoubleBufferForward and is_forward_warp)
+        if (kDoubleBufferForward)
             ptx::mbarrier_init_with_fence(mbarrier_ptr_alt, 1);
     }
     if (warp_idx >= kNumNotifyWarps and not is_forward_warp and lane_idx < kNumMailboxInts)
@@ -1011,19 +1016,44 @@ hybrid_unordered_dispatch_impl(
                 const auto chunk_metadata_ptr = static_cast<int*>(ptrs[1]);
                 const auto chunk_dst_slot_idx_ptr = static_cast<int*>(ptrs[2]);
                 constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
-                for (int i = fwd_share; i < num_chunk_tokens; ++ i) {
-                    ptx::tma_store_wait_read();
-                    __syncwarp();
+                const auto issue_help_load = [&](const int& b, const int& i) __attribute__((always_inline)) {
                     if (ptx::elect_one_sync()) {
-                        ptx::tma_load_1d(tma_buffer.get_base_ptr(),
+                        const auto mb = b ? mbarrier_ptr_alt : mbarrier_ptr;
+                        ptx::tma_load_1d((b ? tma_buffer_alt : tma_buffer).get_base_ptr(),
                                          src_token_ptr + static_cast<int64_t>(i) * scaleout_token_layout.get_num_bytes<false>(),
-                                         mbarrier_ptr, scaleout_token_layout.get_num_bytes<false>());
-                        ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, scaleout_token_layout.get_num_bytes<false>());
-                        ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                                         mb, scaleout_token_layout.get_num_bytes<false>());
+                        ptx::mbarrier_arrive_and_set_tx(mb, scaleout_token_layout.get_num_bytes<false>());
                     }
                     __syncwarp();
-                    forward_token(tma_buffer, i, chunk_metadata_ptr + i * kNumForwardMetadataDims,
+                };
+                ptx::tma_store_wait_read();
+                __syncwarp();
+                issue_help_load(0, fwd_share);
+                for (int i = fwd_share; i < num_chunk_tokens; ++ i) {
+                    const int cur = kDoubleBufferForward ? (i - fwd_share) & 1 : 0;
+                    if (ptx::elect_one_sync()) {
+                        if (cur)
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr_alt, phase_alt);
+                        else
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                    }
+                    __syncwarp();
+                    if constexpr (kDoubleBufferForward) {
+                        if (i + 1 < num_chunk_tokens) {
+                            ptx::tma_store_wait_read();
+                            __syncwarp();
+                            issue_help_load(cur ^ 1, i + 1);
+                        }
+                    }
+                    forward_token(cur ? tma_buffer_alt : tma_buffer, i, chunk_metadata_ptr + i * kNumForwardMetadataDims,
                                   chunk_dst_slot_idx_ptr + i * kNumTopk, i == num_chunk_tokens - 1);
+                    if constexpr (not kDoubleBufferForward) {
+                        if (i + 1 < num_chunk_tokens) {
+                            ptx::tma_store_wait_read();
+                            __syncwarp();
+                            issue_help_load(0, i + 1);
+                        }
+                    }
                 }
                 num_taken_chunks = posted;
                 __syncwarp();
