@@ -1245,6 +1245,7 @@ public:
                                       recv_topk_idx_ptr, recv_topk_weights_ptr,
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
+                                      token_metadata_at_forward_ptr,
                                       num_unaligned_recv_tokens_per_expert_ptr,
                                       num_recv_tokens, num_max_tokens_per_rank,
                                       num_hidden_bytes,

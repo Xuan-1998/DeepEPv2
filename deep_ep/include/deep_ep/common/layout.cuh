@@ -162,6 +162,22 @@ struct WorkspaceLayout {
         return base_ptr + (channel_idx * num_scaleup_ranks + scaleup_rank_idx);
     }
 
+    // Per (channel, scale-up peer) word the unordered dispatch forwarder fills with its two forward-list
+    // counts (see `pack_forward_fifo_tails`). It sits in the tail region after the `kNumMaxChannels`
+    // channels of tails, so unlike the tail word nothing resets it before the copy epilogue is done
+    // reading it; a process that runs the ordered kernels never writes it and it stays zero.
+    __forceinline__ __device__ __host__ int* get_channel_forward_counts_ptr(
+        const int& channel_idx, const int& scaleup_rank_idx) const {
+        return get_channel_scaleup_tail_ptr(kNumMaxChannels + channel_idx, scaleup_rank_idx);
+    }
+
+    // Per channel word with the forwarder's own two forward-list counts (remote and local tokens of the
+    // whole channel), for the copy epilogue that compacts the channel's metadata list. Same region and
+    // lifetime rules as `get_channel_forward_counts_ptr`.
+    __forceinline__ __device__ __host__ int* get_channel_forward_totals_ptr(const int& channel_idx) const {
+        return get_channel_scaleup_tail_ptr(2 * kNumMaxChannels + channel_idx, 0);
+    }
+
     __forceinline__ __device__ __host__ int64_t* get_pp_send_count_ptr(const int& offset) const {
         const auto base_ptr = math::advance_ptr<int64_t>(
             get_channel_scaleup_tail_ptr(0, 0),
@@ -337,5 +353,34 @@ struct BufferLayout {
                            token_layout.with_scaleout_hdr);
     }
 };
+
+// Tail word of a channel's per-peer forward list when the unordered dispatch records two FIFOs
+// (an ordered-dispatch tail is a plain non-negative list index):
+//   bit 31       tag
+//   bits 30..16  number of local tokens, recorded from the list top downward
+//   bits 15..0   number of remote tokens, recorded from entry 0 upward
+constexpr unsigned kForwardFifoTag = 0x80000000u;
+constexpr int kForwardFifoRemoteMask = 0xffff;
+constexpr int kForwardFifoLocalShift = 16;
+constexpr int kForwardFifoLocalMask = 0x7fff;
+
+template <int kForwardListTop>
+__forceinline__ __device__ __host__ int pack_forward_fifo_tails(const int& num_remote, const int& num_local) {
+    EP_STATIC_ASSERT(kForwardListTop <= kForwardFifoLocalMask, "The FIFO lengths must fit in 15 bits");
+    return static_cast<int>(kForwardFifoTag | static_cast<unsigned>(num_remote) |
+                            (static_cast<unsigned>(num_local) << kForwardFifoLocalShift));
+}
+
+__forceinline__ __device__ __host__ bool is_forward_fifo_tails(const int& tail) {
+    return tail < 0;
+}
+
+__forceinline__ __device__ __host__ int forward_fifo_num_remote(const int& tail) {
+    return tail & kForwardFifoRemoteMask;
+}
+
+__forceinline__ __device__ __host__ int forward_fifo_num_local(const int& tail) {
+    return (tail >> kForwardFifoLocalShift) & kForwardFifoLocalMask;
+}
 
 }  // namespace deep_ep::elastic

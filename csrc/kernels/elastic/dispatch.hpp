@@ -328,6 +328,7 @@ public:
         topk_idx_t* recv_topk_idx; float* recv_topk_weights;
         int* recv_src_metadata;
         int* channel_linked_list;
+        int* token_metadata_at_forward;
         int* num_unaligned_recv_tokens_per_expert;
         int num_recv_tokens;
         int recv_sf_token_stride, recv_sf_hidden_stride;
@@ -362,6 +363,7 @@ static void __instantiate_kernel() {{
                                                  args.recv_x, args.recv_sf, args.recv_topk_idx, args.recv_topk_weights,
                                                  args.recv_src_metadata,
                                                  args.channel_linked_list,
+                                                 args.token_metadata_at_forward,
                                                  args.num_unaligned_recv_tokens_per_expert,
                                                  args.num_recv_tokens,
                                                  args.recv_sf_token_stride, args.recv_sf_hidden_stride,
@@ -376,6 +378,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           topk_idx_t* recv_topk_idx, float* recv_topk_weights,
                                           int* recv_src_metadata,
                                           int* channel_linked_list,
+                                          int* token_metadata_at_forward,
                                           int* num_unaligned_recv_tokens_per_expert,
                                           const int& num_recv_tokens, const int& num_max_tokens_per_rank,
                                           const int& num_hidden_bytes,
@@ -408,6 +411,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .recv_topk_idx = recv_topk_idx, .recv_topk_weights = recv_topk_weights,
         .recv_src_metadata = recv_src_metadata,
         .channel_linked_list = channel_linked_list,
+        .token_metadata_at_forward = token_metadata_at_forward,
         .num_unaligned_recv_tokens_per_expert = num_unaligned_recv_tokens_per_expert,
         .num_recv_tokens = num_recv_tokens,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
