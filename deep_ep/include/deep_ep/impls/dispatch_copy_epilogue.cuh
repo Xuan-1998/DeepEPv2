@@ -8,7 +8,7 @@
 
 namespace deep_ep::elastic {
 
-template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding,
+template <bool kDoExpand, bool kCachedMode, bool kDoZeroPadding, bool kWaitDispatchDone,
           // NOTES: this channel concept only applies for scale-out ranks
           int kNumSMs, int kNumChannels, int kNumWarps,
           int kNumScaleoutRanks, int kNumScaleupRanks,
@@ -59,6 +59,27 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // NOTES: PDL is used, please do not use `__ldg`
     cudaGridDependencySynchronize();
 
+    // Behind the unordered hybrid dispatch, the scale-up peers' segments and channel tails are ready once
+    // the peer's done counter reaches this rank's target (the dispatch has no exit barrier)
+    const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+    int done_target = 0;
+    if constexpr (kWaitDispatchDone)
+        done_target = *workspace_layout.get_dispatch_done_target_ptr();
+    const auto wait_peer_done = [&](const int& peer_idx) __attribute__((always_inline)) {
+        constexpr int64_t kNumTimeoutCycles = 200ll * 1000 * 1000 * 1000;
+        const auto start_clock = clock64();
+        while (static_cast<int>(static_cast<uint32_t>(ptx::ld_acquire_sys<int>(
+                   workspace_layout.get_dispatch_done_counter_ptr(peer_idx))) - static_cast<uint32_t>(done_target)) < 0) {
+            if (clock64() - start_clock >= kNumTimeoutCycles) {
+                printf("DeepEP dispatch copy epilogue (peer done) timeout, scale-out: %d, scale-up: %d, peer: %d, "
+                       "done: %d, target: %d\n", scaleout_rank_idx, scaleup_rank_idx, peer_idx,
+                       ptx::ld_acquire_sys<int>(workspace_layout.get_dispatch_done_counter_ptr(peer_idx)), done_target);
+                ptx::trap();
+            }
+        }
+    };
+    int waited_rank_idx = -1;
+
     // For no CPU sync case, the number of received tokens should be read from the GPU tensor
     if (num_recv_tokens == kNumMaxTokensPerRank * kNumRanks)
         num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[kNumScaleupRanks - 1];
@@ -77,6 +98,13 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                 stored_psum_num_recv_tokens = psum_num_recv_tokens_per_scaleup_rank[current_rank_idx + lane_idx];
             current_rank_start = current_rank_end;
             current_rank_end = ptx::exchange(stored_psum_num_recv_tokens, stored_lane_idx);
+        }
+        if (kWaitDispatchDone and current_rank_idx != waited_rank_idx) {
+            if (lane_idx == 0)
+                wait_peer_done(current_rank_idx);
+            __syncwarp();
+            ptx::fence_proxy_async_global();
+            waited_rank_idx = current_rank_idx;
         }
         const auto buffer_token = scaleup_buffer.get_rank_buffer(current_rank_idx).get_token_buffer(i - current_rank_start);
 
@@ -211,7 +239,11 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
     // Or you can understand it as writing the tail at once
     if constexpr (kDoCreateLinkedList) {
         constexpr int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32);
-        const auto workspace_layout = layout::WorkspaceLayout(workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
+        if (kWaitDispatchDone and global_warp_idx < kNumChannels) {
+            for (int j = lane_idx; j < kNumScaleupRanks; j += 32)
+                wait_peer_done(j);
+            __syncwarp();
+        }
         for (int i = global_warp_idx; i < kNumChannels; i += kNumSMs * kNumWarps) {
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {

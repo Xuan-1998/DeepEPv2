@@ -312,7 +312,7 @@ class DispatchCopyEpilogueRuntime final : public jit::LaunchRuntime<DispatchCopy
 public:
     struct Args {
         // Templated arguments
-        bool do_expand, cached_mode, do_zero_padding;
+        bool do_expand, cached_mode, do_zero_padding, wait_dispatch_done;
         int num_channels;
         int num_warps;
         int num_scaleout_ranks, num_scaleup_ranks;
@@ -343,10 +343,10 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&dispatch_copy_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
 }}
 )",
-                           args.do_expand, args.cached_mode, args.do_zero_padding,
+                           args.do_expand, args.cached_mode, args.do_zero_padding, args.wait_dispatch_done,
                            args.launch_args.grid_dim.first, args.num_channels, args.num_warps,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
                            args.num_hidden_bytes, args.num_sf_packs,
@@ -396,6 +396,8 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
     // Generate, build and launch
     const DispatchCopyEpilogueRuntime::Args args = {
         .do_expand = do_expand, .cached_mode = cached_mode, .do_zero_padding = do_zero_padding,
+        // The unordered hybrid dispatch replaces its exit barrier with per-peer done counters
+        .wait_dispatch_done = num_scaleout_ranks > 1 and num_scaleup_ranks > 1 and not use_ordered_hybrid_kernel(),
         .num_channels = num_channels, .num_warps = num_warps,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_hidden_bytes = num_hidden_bytes, .num_sf_packs = num_sf_packs,

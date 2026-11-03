@@ -1258,24 +1258,57 @@ hybrid_unordered_dispatch_impl(
         if (lane_idx < kNumScaleoutRanks)
             *workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx) = 0;
         __syncwarp();
+
+        // This channel's NVLink stores and tails are complete: count it done on every scale-up peer
+        if constexpr (kNumScaleupRanks > 1) {
+            ptx::tma_store_commit();
+            ptx::tma_store_wait();
+            ptx::fence_acq_rel_sys();
+            __syncwarp();
+            #pragma unroll
+            for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                if (const int i = j * 32 + lane_idx; i < kNumScaleupRanks) {
+                    ptx::red_add_rel_sys(gin.get_sym_ptr<ncclTeamTagLsa>(
+                        workspace_layout.get_dispatch_done_counter_ptr(scaleup_rank_idx), i), 1);
+                }
+            }
+            __syncwarp();
+        }
     }
 
-    // Scale-up barrier to ensure data arrival
-    // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
-
-    // Trigger the copy epilogue kernel
-    cudaTriggerProgrammaticLaunchCompletion();
-
-    // Clean scale-up counters and the entry flag (every warp passed its wait before the grid sync above)
-    // All scale-out counters should be cleaned before
-    EP_STATIC_ASSERT(kNumScaleupRanks <= kNumThreads, "Insufficient threads");
-    if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumScaleupRanks)
-        workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
-    if (sm_idx == 0 and thread_idx == 0)
-        *entry_flag_ptr = 0;
+    // The copy epilogue waits for the peers' done counters instead of an exit barrier. Each SM counts
+    // itself out, and the last one resets the slot counters and the entry flag (every warp of every SM
+    // has passed its entry wait and its slot atomics) and moves the done target by one dispatch.
+    if constexpr (kNumScaleupRanks > 1) {
+        ptx::tma_store_commit();
+        ptx::tma_store_wait();
+        __syncthreads();
+        cudaTriggerProgrammaticLaunchCompletion();
+        if (thread_idx == 0) {
+            __threadfence();
+            const auto exit_counter_ptr = workspace_layout.get_dispatch_exit_counter_ptr();
+            if (atomicAdd(exit_counter_ptr, 1) == kNumSMs - 1) {
+                __threadfence();
+                if constexpr (not kReuseSlotIndices) {
+                    #pragma unroll
+                    for (int i = 0; i < kNumScaleupRanks; ++ i)
+                        workspace_layout.get_scaleup_atomic_sender_counter()[i] = 0;
+                }
+                *workspace_layout.get_dispatch_done_target_ptr() += kNumChannels;
+                *entry_flag_ptr = 0;
+                *exit_counter_ptr = 0;
+            }
+        }
+    } else {
+        comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
+            gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
+        cudaTriggerProgrammaticLaunchCompletion();
+        if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumScaleupRanks)
+            workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+        if (sm_idx == 0 and thread_idx == 0)
+            *entry_flag_ptr = 0;
+    }
 }
 
 }  // namespace deep_ep::elastic
