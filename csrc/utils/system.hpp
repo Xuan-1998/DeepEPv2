@@ -5,10 +5,12 @@
 #include <filesystem>
 #include <functional>
 #include <random>
+#include <sstream>
 #include <string>
 #include <memory>
 #include <unistd.h>
 
+#include <deep_ep/common/compiled.cuh>
 #include <deep_ep/common/exception.cuh>
 
 #include "format.hpp"
@@ -32,6 +34,39 @@ static dtype_t get_env(const std::string& name, const dtype_t& default_value = d
     } else {
         EP_HOST_ASSERT(false and "Unexpected type");
     }
+}
+
+// `EP_DEBUG_CHECKS`: unset or `0` means no check, `1` or `all` every check, otherwise a comma-separated
+// list of the names in `kDebugCheckNames`; the kernels are compiled with the resulting bit mask.
+static int debug_check_bit(const std::string& name) {
+    for (const auto& check: kDebugCheckNames)
+        if (name == check.name)
+            return check.bit;
+    EP_HOST_UNREACHABLE(fmt::format("Unknown check in EP_DEBUG_CHECKS: {}", name));
+}
+
+static int all_debug_checks() {
+    int bits = 0;
+    for (const auto& check: kDebugCheckNames)
+        bits |= check.bit;
+    return bits;
+}
+
+static int parse_debug_checks(const std::string& value) {
+    if (value.empty() or value == "0")
+        return 0;
+    if (value == "1" or value == "all")
+        return all_debug_checks();
+
+    int bits = 0;
+    std::stringstream names(value);
+    for (std::string name; std::getline(names, name, ',');)
+        bits |= debug_check_bit(name);
+    return bits;
+}
+
+static int get_debug_checks() {
+    return parse_debug_checks(get_env<std::string>("EP_DEBUG_CHECKS"));
 }
 
 static std::tuple<int, std::string> call_external_command(std::string command) {
