@@ -358,6 +358,7 @@ The library provides some environment variables, which may be useful:
     - `EP_GIN_GDAKI_DEBUG`: `0` or `1`, enable NCCL Gin GDAKI debugging output, `0` by default
     - `EP_DEBUG_CHECKS`: debug checks compiled into the kernels, off when unset or `0`. `1` or `all` turns on every check, a comma-separated list of the names below turns on single checks
         - `counters`: counts every GIN put, and a timeout prints how many puts of its context the NIC has not completed
+        - `gridsync`: records which SMs reached each grid sync of the barriers, and a CPU-side timeout names the SMs that did not
     - `EP_USE_NVIDIA_TOOLS`: `0` or `1`, skip internal profiling when running under external NVIDIA tools, `0` by default
     - `EP_DISABLE_BARRIER_PROFILING`: `0` or `1`, disable barrier-based communication profiling in benchmarks, `0` by default
 - Build

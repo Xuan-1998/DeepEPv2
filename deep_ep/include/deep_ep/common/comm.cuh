@@ -94,9 +94,10 @@ __device__ __forceinline__ void report_gin_queue(const gin_t& gin,
 }
 
 __device__ __forceinline__ void report_gin_queue(const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
+                                                 const int& context_idx,
                                                  const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
     if constexpr (kCountGinPuts)
-        report_gin_queue(handle::NCCLGin(nccl_dev_comm, nccl_window, 0, NCCL_GIN_RESOURCE_SHARING_CTA),
+        report_gin_queue(handle::NCCLGin(nccl_dev_comm, nccl_window, context_idx, NCCL_GIN_RESOURCE_SHARING_CTA),
                          scaleout_rank_idx, scaleup_rank_idx);
 }
 
@@ -111,6 +112,36 @@ __device__ __forceinline__ void flush_with_timeout(const handle::NCCLGin& gin, c
             report_gin_queue(gin, scaleout_rank_idx, scaleup_rank_idx);
         ptx::trap();
     }
+}
+
+template <int64_t kNumTimeoutCycles, typename coop_t>
+__device__ __forceinline__ void flush_with_timeout(const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
+                                                   const int& context_idx, const coop_t& coop,
+                                                   const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
+    if (ncclGin(nccl_dev_comm, context_idx, NCCL_GIN_RESOURCE_SHARING_CTA).flush(
+            coop, cuda::memory_order_acquire, ncclGin_None{}, static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
+        printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
+               static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
+        if (threadIdx.x % 32 == __ffs(__activemask()) - 1)
+            report_gin_queue(nccl_dev_comm, nccl_window, context_idx, scaleout_rank_idx, scaleup_rank_idx);
+        ptx::trap();
+    }
+}
+
+static constexpr int kGridSyncStart = 0, kGridSyncFlush = 1, kGridSyncEnd = 2;
+
+// The `gridsync` check of `EP_DEBUG_CHECKS`: each SM records its arrival before the grid sync, so that a
+// CPU-side timeout can name the SMs that never reached it. The sync itself stays the SDK's.
+template <int kTag, int kPosition>
+__device__ __forceinline__ void grid_sync(const layout::WorkspaceLayout& workspace) {
+    if constexpr (kRecordGridSyncArrivals) {
+        EP_STATIC_ASSERT(kTag < layout::WorkspaceLayout::kNumGridSyncTags, "Barrier tag out of the arrival table");
+        if (threadIdx.x == 0) {
+            auto* words = workspace.get_grid_sync_arrival_ptr(kTag, kPosition);
+            atomicOr(reinterpret_cast<unsigned long long*>(words + blockIdx.x / 64), 1ull << (blockIdx.x % 64));
+        }
+    }
+    cooperative_groups::this_grid().sync();
 }
 
 // Channels map onto QPs with a BALANCED CONTIGUOUS (block) partition: fill a QP with
@@ -229,7 +260,8 @@ template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNum
           int kNumWarps = kNumThreads / 32>
 __forceinline__ __device__ void gin_barrier_wo_local_sync(
     const handle::NCCLGin& handle_gin,
-    const int& scaleout_rank_idx, const int& scaleup_rank_idx, 
+    const layout::WorkspaceLayout& workspace,
+    const int& scaleout_rank_idx, const int& scaleup_rank_idx,
     const int& sm_idx, const int& thread_idx) {
     const ncclDevComm_t& nccl_dev_comm = handle_gin.nccl_dev_comm;
     const auto global_warp_idx = sm_idx * kNumWarps + (thread_idx / 32);
@@ -239,7 +271,8 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
     // Flush all QPs by all SMs (only needed for release semantics)
     if constexpr (kFlushStores) {
         for (int i = global_warp_idx; i < num_qps; i += kNumSMs * kNumWarps) {
-            ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA).flush(ncclCoopWarp());
+            flush_with_timeout<kNumTimeoutCycles>(nccl_dev_comm, handle_gin.nccl_window, i, ncclCoopWarp(),
+                                                  scaleout_rank_idx, scaleup_rank_idx);
         }
 
         // World-team barriers may mix direct NVLink writes with GIN signals, so a system-scope
@@ -248,7 +281,11 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
             ptx::fence_acq_rel_sys();
 
         // NOTES: we can not use `kNumSMs` to judge, as maybe only part of the SMs will call this function
-        (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
+        if (gridDim.x > 1) {
+            grid_sync<kTag, kGridSyncFlush>(workspace);
+        } else {
+            __syncthreads();
+        }
     }
 
     if (sm_idx == 0) {
@@ -284,7 +321,7 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
                 printf("DeepEP Gin barrier timeout, tag: %d, scaleout: %d, scaleup: %d, thread: %d, "
                        "slot: %d, target: %lu\n", kTag, scaleout_rank_idx, scaleup_rank_idx, thread_idx,
                        static_cast<int>(signal_idx), target);
-                report_gin_queue(nccl_dev_comm, handle_gin.nccl_window, scaleout_rank_idx, scaleup_rank_idx);
+                report_gin_queue(nccl_dev_comm, handle_gin.nccl_window, 0, scaleout_rank_idx, scaleup_rank_idx);
                 // Wait another 1 second to let all threads print information and
                 // trap similar to timeout_while
                 const auto stop = clock64() + kNumOneSecCycles;
@@ -306,7 +343,7 @@ __forceinline__ __device__ void scaleup_barrier_wo_local_sync(
             gin, workspace, rank_idx, sm_idx, thread_idx);
     } else {
         gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagWorld, kTag, kFlushStores>(
-            gin, 1, rank_idx, sm_idx, thread_idx);
+            gin, workspace, 1, rank_idx, sm_idx, thread_idx);
     }
 }
 
@@ -314,10 +351,11 @@ template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs, int64_t kNum
           bool kFlushStores = true>
 __forceinline__ __device__ void scaleout_barrier_wo_local_sync(
     const handle::NCCLGin& gin,
+    const layout::WorkspaceLayout& workspace,
     const int& scaleout_rank_idx, const int& scaleup_rank_idx,
     const int& sm_idx, const int& thread_idx) {
     gin_barrier_wo_local_sync<kNumRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, ncclTeamTagRail, kTag, kFlushStores>(
-        gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+        gin, workspace, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 }
 
 template <bool kIsScaleupNVLink,
@@ -339,7 +377,7 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
 
     // All the SMs should wait
     if constexpr (kSyncAtStart) {
-        cooperative_groups::this_grid().sync();
+        grid_sync<kTag, kGridSyncStart>(workspace);
     } else {
         EP_STATIC_ASSERT(not kFlushStores, "No data to be flushed");
     }
@@ -356,12 +394,12 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
 
             // We need an extra grid sync, as the scaleout barrier will do a sync after flush, before the barrier
             // NOTES: this is kind of hacky
-            if constexpr (kFlushStores) 
-                cooperative_groups::this_grid().sync();
+            if constexpr (kFlushStores)
+                grid_sync<kTag, kGridSyncFlush>(workspace);
         } else {
             // The remaining SMs do the scaleout barrier
             scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs - 1, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
-                gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx - 1, thread_idx);
+                gin, workspace, scaleout_rank_idx, scaleup_rank_idx, sm_idx - 1, thread_idx);
         }
     } else if (do_scaleup) {
         // Scaleup only
@@ -370,12 +408,12 @@ __forceinline__ __device__ void gpu_barrier(const handle::NCCLGin& gin,
     } else if (do_scaleout) {
         // Scaleout only
         scaleout_barrier_wo_local_sync<kNumScaleoutRanks, kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, kTag, kFlushStores>(
-            gin, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+            gin, workspace, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
     }
 
     // All the SMs should wait
     if constexpr (kSyncAtEnd)
-        cooperative_groups::this_grid().sync();
+        grid_sync<kTag, kGridSyncEnd>(workspace);
 }
 
 }  // namespace deep_ep::elastic::comm

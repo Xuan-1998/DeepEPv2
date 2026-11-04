@@ -80,13 +80,16 @@ constexpr bool kEnableSM90Features = false;
 
 constexpr int kDebugChecks = EP_DEBUG_CHECKS;
 constexpr int kDebugCheckGinPutCounters = 1 << 0;
+constexpr int kDebugCheckGridSync = 1 << 1;
 constexpr bool kCountGinPuts = (kDebugChecks & kDebugCheckGinPutCounters) != 0;
+constexpr bool kRecordGridSyncArrivals = (kDebugChecks & kDebugCheckGridSync) != 0;
 
 struct DebugCheckName {
     const char* name;
     int bit;
 };
-constexpr DebugCheckName kDebugCheckNames[] = {{"counters", kDebugCheckGinPutCounters}};
+constexpr DebugCheckName kDebugCheckNames[] = {{"counters", kDebugCheckGinPutCounters},
+                                               {"gridsync", kDebugCheckGridSync}};
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };

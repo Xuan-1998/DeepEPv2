@@ -194,6 +194,56 @@ public:
         return {nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks};
     }
 
+    // The `gridsync` check of `EP_DEBUG_CHECKS`: the arrival bitmasks of the kernel that is about to run start
+    // from zero, so a CPU-side timeout reads only this kernel's arrivals
+    void clear_grid_sync_arrivals(const at::cuda::CUDAStream& stream) const {
+        if ((get_debug_checks() & kDebugCheckGridSync) == 0)
+            return;
+        auto* arrivals = static_cast<int8_t*>(workspace) + layout::WorkspaceLayout::get_grid_sync_arrival_offset();
+        CUDA_RUNTIME_CHECK(cudaMemsetAsync(arrivals, 0, layout::WorkspaceLayout::kNumGridSyncArrivalBytes, stream));
+    }
+
+    // Read on a stream of its own, because the communication stream is blocked behind the kernel that hangs.
+    // Reports every grid sync that some but not all SMs reached.
+    std::string get_grid_sync_report(const int& num_sms) const {
+        using Layout = layout::WorkspaceLayout;
+        if ((get_debug_checks() & kDebugCheckGridSync) == 0)
+            return "";
+        std::vector<uint64_t> words(Layout::kNumGridSyncArrivalBytes / sizeof(uint64_t));
+        cudaStream_t stream;
+        auto err = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        if (err == cudaSuccess) {
+            const auto* arrivals = static_cast<const int8_t*>(workspace) + Layout::get_grid_sync_arrival_offset();
+            err = cudaMemcpyAsync(words.data(), arrivals, Layout::kNumGridSyncArrivalBytes, cudaMemcpyDeviceToHost, stream);
+            if (err == cudaSuccess)
+                err = cudaStreamSynchronize(stream);
+            cudaStreamDestroy(stream);
+        }
+        if (err != cudaSuccess)
+            return std::string(" | grid sync arrivals unavailable: ") + cudaGetErrorString(err);
+
+        std::stringstream ss;
+        static const char* positions[Layout::kNumGridSyncPositions] = {"start", "flush", "end"};
+        for (int tag = 0; tag < Layout::kNumGridSyncTags; ++ tag) {
+            for (int position = 0; position < Layout::kNumGridSyncPositions; ++ position) {
+                const auto* mask = words.data() + (tag * Layout::kNumGridSyncPositions + position) * Layout::kNumGridSyncArrivalWords;
+                int num_arrived = 0;
+                std::string missing;
+                for (int sm = 0; sm < num_sms; ++ sm) {
+                    if ((mask[sm / 64] >> (sm % 64)) & 1) {
+                        ++ num_arrived;
+                    } else {
+                        missing += (missing.empty() ? "" : ",") + std::to_string(sm);
+                    }
+                }
+                if (num_arrived > 0 and num_arrived < num_sms)
+                    ss << " | grid sync tag " << tag << " " << positions[position] << ": " << num_arrived << " of "
+                       << num_sms << " SMs arrived, missing " << missing;
+            }
+        }
+        return ss.str();
+    }
+
     // ReSharper disable once CppMemberFunctionMayBeStatic
     void barrier(const bool& use_comm_stream, const bool& with_cpu_sync, const bool& sequential = true) const {
         const auto compute_stream = at::cuda::getCurrentCUDAStream();
@@ -206,6 +256,7 @@ public:
             CUDA_RUNTIME_CHECK(cudaDeviceSynchronize());
 
         // Launch GPU barrier
+        clear_grid_sync_arrivals(stream);
         launch_barrier(nccl_context->dev_comm, nccl_context->window,
                        workspace,
                        nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
@@ -1087,6 +1138,7 @@ public:
 
         // Do dispatch into the buffers (with SM limitation)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
+        clear_grid_sync_arrivals(comm_stream);
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
                         copied_topk_idx_ptr,
@@ -1174,7 +1226,7 @@ public:
                 // Timeout checks
                 const auto now = std::chrono::high_resolution_clock::now();
                 if (std::chrono::duration_cast<std::chrono::seconds>(now - start_cpu_time).count() > num_cpu_timeout_secs)
-                    throw EPExceptionWithLineInfo("Dispatch CPU wait", get_buffer_info());
+                    throw EPExceptionWithLineInfo("Dispatch CPU wait", get_buffer_info() + get_grid_sync_report(num_sms));
             }
         } else {
             // Non-cached mode without CPU sync, allocate with the worst case
@@ -1408,6 +1460,7 @@ public:
 
         // Push data into remote buffers
         // NOTES: we don't use `num_hidden_bytes` due to enable later quantization possibility
+        clear_grid_sync_arrivals(comm_stream);
         const auto reduce_buffer = launch_combine(
             x.data_ptr(),
             topk_weights.has_value() ? topk_weights->data_ptr() : nullptr,
