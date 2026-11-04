@@ -83,15 +83,18 @@ constexpr bool kEnableSM90Features = false;
 constexpr int kDebugChecks = EP_DEBUG_CHECKS;
 constexpr int kDebugCheckGinQueue = 1 << 0;
 constexpr int kDebugCheckGridSync = 1 << 1;
+constexpr int kDebugCheckNanny = 1 << 2;
 constexpr bool kReportGinQueue = (kDebugChecks & kDebugCheckGinQueue) != 0;
 constexpr bool kRecordGridSyncArrivals = (kDebugChecks & kDebugCheckGridSync) != 0;
+constexpr bool kGuardGinPosts = (kDebugChecks & kDebugCheckNanny) != 0;
 
 struct DebugCheckName {
     const char* name;
     int bit;
 };
 constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue},
-                                               {"gridsync", kDebugCheckGridSync}};
+                                               {"gridsync", kDebugCheckGridSync},
+                                               {"nanny", kDebugCheckNanny}};
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };
@@ -120,5 +123,9 @@ constexpr int kGinQPFlushDepth = 768;
 constexpr int kNumDispatchSendBuffers = 1;
 constexpr int kNumDispatchFwdBuffers = 2;
 constexpr int kNumDispatchBuffersPerChannel = kNumDispatchSendBuffers + kNumDispatchFwdBuffers;
+
+// The `nanny` check: 32 words at the end of the dynamic shared memory, one per warp for `comm::guarded_post`
+// (dispatch) or one per lane of the proxy warp for `comm::stamped_post` (combine)
+constexpr int kNumNannySmemBytes = 32 * sizeof(unsigned);
 
 } // namespace deep_ep
