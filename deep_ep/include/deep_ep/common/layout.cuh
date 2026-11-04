@@ -52,7 +52,7 @@ struct WorkspaceLayout {
         EP_UNIFIED_ASSERT(num_experts_per_rank <= kNumMaxExpertsPerRank);
     }
 
-    static int64_t get_num_bytes() {
+    __forceinline__ __device__ __host__ static constexpr int64_t get_grid_sync_arrival_offset() {
         // Pure NVLink scaleup barrier signals
         int64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
@@ -88,7 +88,25 @@ struct WorkspaceLayout {
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
-        return num_bytes;
+        // 64-bit atomics on the bitmasks need an 8-byte aligned start
+        return math::constexpr_align<int64_t>(num_bytes, 8);
+    }
+
+    // The `gridsync` check of `EP_DEBUG_CHECKS`: one bitmask of the arrived SMs per barrier tag and grid
+    // sync position, read by the host after a CPU-side timeout
+    static constexpr int kNumGridSyncTags = 16;
+    static constexpr int kNumGridSyncPositions = 3;
+    static constexpr int kNumGridSyncArrivalWords = 3;  // 192 SMs
+    static constexpr int64_t kNumGridSyncArrivalBytes =
+        kNumGridSyncTags * kNumGridSyncPositions * kNumGridSyncArrivalWords * sizeof(uint64_t);
+
+    static int64_t get_num_bytes() {
+        return get_grid_sync_arrival_offset() + kNumGridSyncArrivalBytes;
+    }
+
+    __forceinline__ __device__ __host__ uint64_t* get_grid_sync_arrival_ptr(const int& tag = 0, const int& position = 0) const {
+        return reinterpret_cast<uint64_t*>(static_cast<int8_t*>(workspace) + get_grid_sync_arrival_offset()) +
+            (tag * kNumGridSyncPositions + position) * kNumGridSyncArrivalWords;
     }
 
     __forceinline__ __device__ __host__ unsigned long long* get_nvl_barrier_counter_ptr() const {
