@@ -73,6 +73,10 @@ public:
         // Experiment knob (JD 23.14 E02): the unordered combine's proxy ring depth, read by the host too
         if (int ring_depth = get_env("EP_PROXY_RING_DEPTH", 0); ring_depth > 0)
             flags += fmt::format(" -DEP_PROXY_RING_DEPTH={}", ring_depth);
+        if (int batch_size = get_env("EP_COMBINE_BATCH_SIZE", 0); batch_size > 0)
+            flags += fmt::format(" -DEP_COMBINE_BATCH_SIZE={}", batch_size);
+        if (int tail_interval = get_env("EP_COMBINE_TAIL_INTERVAL", 0); tail_interval > 0)
+            flags += fmt::format(" -DEP_COMBINE_TAIL_INTERVAL={}", tail_interval);
     }
 
     virtual ~Compiler() = default;

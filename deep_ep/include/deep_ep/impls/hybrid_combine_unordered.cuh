@@ -20,6 +20,15 @@
 
 namespace deep_ep::elastic {
 
+// Experiment knobs (JD 23.14 E02), set through the JIT flags of the same names (csrc/jit/compiler.hpp):
+// tokens per RDMA put batch, and linked-list rows between two scale-up tail publications.
+#ifndef EP_COMBINE_BATCH_SIZE
+#define EP_COMBINE_BATCH_SIZE 12
+#endif
+#ifndef EP_COMBINE_TAIL_INTERVAL
+#define EP_COMBINE_TAIL_INTERVAL 3
+#endif
+
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
           int kNumScaleupWarps, int kNumForwardWarps,
@@ -29,8 +38,8 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumExperts, int kNumTopk,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
-          int kNumScaleupUpdateInterval = 3,
-          int kBatchSize = 12,
+          int kNumScaleupUpdateInterval = EP_COMBINE_TAIL_INTERVAL,
+          int kBatchSize = EP_COMBINE_BATCH_SIZE,
           int kProxyRingDepth = kProxyRingDepthDefault,
           int kNumChannelsPerSM = kNumForwardWarps,
           int kNumChannels = kNumChannelsPerSM * kNumSMs,
