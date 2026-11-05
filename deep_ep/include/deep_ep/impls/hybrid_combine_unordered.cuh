@@ -62,6 +62,13 @@ __device__ __forceinline__ int ramp_put_count(const int& num_tokens) {
     return math::ceil_div(num_tokens, kBatchSize);
 }
 
+// Experiment knob (JD 23.14 E02): a scale-up warp that has sent all its tokens helps the forward warp of its channel
+// with the tail of the local tokens (1 on, 0 off). Needs the remote-first forward list (local tokens contiguous at
+// the end) and one scale-up warp per channel.
+#ifndef EP_COMBINE_SU_HELP
+#define EP_COMBINE_SU_HELP 1
+#endif
+
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
           int kNumScaleupWarps, int kNumForwardWarps,
@@ -130,10 +137,22 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // Proxy warp hand-off rings — placed in `smem[]` right after the TMA buffers.
     const auto proxy_ring_layout = ProxyRingLayout(
         kNumForwardWarps, kProxyRingDepth, tma_buffer_layout.get_buffer_end_ptr());
+    // Hand-off words of the scale-up helper (EP_COMBINE_SU_HELP), right after the rings: per channel the forward
+    // warp's next list index, the index it may not pass (kHelpNone while no helper claimed), and the helper's done flag
+    constexpr int kHelpNone = 0x7fffffff;
+    // Not at 4 or 8 channels: there the scale-up warps run under setmaxnreg.dec 40 and the helper's reduce would spill
+    constexpr bool kSuHelp = EP_COMBINE_SU_HELP and kAllowMultipleReduction and kNumScaleupWarps == kNumChannelsPerSM and
+        not (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8);
+    int* const help_fw_next = reinterpret_cast<int*>(proxy_ring_layout.get_end_ptr());
+    int* const help_fw_limit = help_fw_next + kNumForwardWarps;
+    int* const help_done = help_fw_limit + kNumForwardWarps;
     for (int f = thread_idx; f < kNumForwardWarps; f += kNumThreads) {
         *proxy_ring_layout.get_head(f) = 0;
         *proxy_ring_layout.get_tail(f) = 0;
         *proxy_ring_layout.get_done(f) = 0;
+        help_fw_next[f] = 0;
+        help_fw_limit[f] = kHelpNone;
+        help_done[f] = 0;
     }
     __syncthreads();
 
@@ -429,6 +448,160 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Update for the unissued ones
         update_tails(true);
+
+        if constexpr (kSuHelp) {
+            // Help the forward warp of this channel: claim the upper half of what it still has to do, provided
+            // that part lies in the local tokens (no puts, each token goes to its own recv slot). The forward
+            // warp publishes its next index before reading the claim, so a claim above the published index
+            // that it then reads stops it in time; if it got past the claim first, raise the claim and retry.
+            constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
+            const int* const fwd = token_metadata_at_forward +
+                channel_idx * ((kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumForwardMetadataDims);
+            constexpr int kListLen = kNumScaleoutRanks * kNumMaxTokensPerChannel + 1;
+            const auto src_scaleout_of = [=](const int& i) {
+                if (i >= kListLen)
+                    return -1;
+                const auto g = __ldg(fwd + i * kNumForwardMetadataDims);
+                return g < 0 ? -1 : g / (kNumMaxTokensPerRank * kNumScaleupRanks);
+            };
+            // List end and first local token (the remote-first list has one boundary); lanes probe 32 entries at once
+            int end = 0, first_local = -1;
+            for (int i0 = 0; ; i0 += 32) {
+                const auto r = src_scaleout_of(i0 + lane_idx);
+                const auto end_mask = ptx::gather(r < 0);
+                const auto local_mask = ptx::gather(r == scaleout_rank_idx);
+                if (first_local < 0 and local_mask != 0)
+                    first_local = i0 + __ffs(local_mask) - 1;
+                if (end_mask != 0) {
+                    end = i0 + __ffs(end_mask) - 1;
+                    break;
+                }
+            }
+            int claim = kHelpNone;
+            if (first_local >= 0) {
+                int* const limit_ptr = help_fw_limit + warp_idx;
+                int* const next_ptr = help_fw_next + warp_idx;
+                int p = ptx::ld_acquire_cta(next_ptr);
+                while (true) {
+                    const int want = max(first_local, p + (end - p + 1) / 2);
+                    if (want >= end)
+                        break;
+                    if (ptx::elect_one_sync())
+                        ptx::st_release_cta(limit_ptr, want);
+                    __threadfence_block();
+                    __syncwarp();
+                    const int p2 = ptx::ld_acquire_cta(next_ptr);
+                    if (p2 < want) {
+                        claim = want;
+                        break;
+                    }
+                    p = p2;
+                }
+            }
+            if (claim != kHelpNone) {
+                // The forward warps read the scale-up buffer with the rank layout from its base (the scale-up
+                // loop above shifted this warp's view to its own rank)
+                const auto fw_scaleup_buffer = layout::BufferLayout<false>(
+                    token_layout, kNumTokensInScaleupLayout, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
+                // Ordinals of the claimed tokens: per source lane, the tokens before `claim` that need it; the
+                // slot of a local token is its index among the local tokens, which are contiguous from first_local
+                int cnt = 0;
+                #pragma unroll 4
+                for (int i = 0; i < claim; ++ i) {
+                    const auto rank = lane_idx < kNumTopk ? __ldg(fwd + i * kNumForwardMetadataDims + 2 + lane_idx) : -1;
+                    const auto mask = ptx::reduce_or(rank >= 0 ? (1u << rank) : 0u);
+                    cnt += lane_idx < kNumScaleupRanks ? static_cast<int>((mask >> lane_idx) & 1u) : 0;
+                }
+                int cached_tail = 0;
+                bool store_pending = false;
+                const auto wait_store = [&]() {
+                    if (ptx::elect_one_sync())
+                        ptx::tma_store_wait();
+                    __syncwarp();
+                };
+                for (int i = claim; i < end; ++ i) {
+                    EP_DEVICE_ASSERT(src_scaleout_of(i) == scaleout_rank_idx);
+                    auto stored_src_scaleup_rank_idx = lane_idx < kNumTopk ?
+                        __ldg(fwd + i * kNumForwardMetadataDims + 2 + lane_idx) : -1;
+                    auto stored_src_slot_idx = lane_idx < kNumTopk ?
+                        __ldg(fwd + i * kNumForwardMetadataDims + 2 + kNumTopk + lane_idx) : -1;
+                    const auto scaleup_mask = ptx::reduce_or(
+                        stored_src_scaleup_rank_idx >= 0 ? (1u << stored_src_scaleup_rank_idx) : 0u);
+                    const bool needed = lane_idx < kNumScaleupRanks and ((scaleup_mask >> lane_idx) & 1u);
+                    comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                        if (ptx::all(not needed or cnt < cached_tail))
+                            return true;
+                        cached_tail = lane_idx < kNumScaleupRanks ?
+                            ptx::ld_acquire_sys(workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, lane_idx)) : 0;
+                        if (is_last_check)
+                            printf("DeepEP combine (helper scale-up wait) timeout, scale-out: %d, scale-up: %d, channel: %d, "
+                                   "lane: %d, token: %d, ordinal: %d, tail: %d\n", scaleout_rank_idx, scaleup_rank_idx,
+                                   channel_idx, lane_idx, i, cnt, cached_tail);
+                        return false;
+                    });
+                    cnt += needed;
+
+                    auto reduce_valid_mask = ptx::gather(
+                        ptx::deduplicate(stored_src_scaleup_rank_idx, lane_idx) and stored_src_scaleup_rank_idx >= 0);
+                    int stored_src_buffer_idx = 0;
+                    if constexpr (kUseScaleupRankLayout) {
+                        stored_src_buffer_idx =
+                            stored_src_scaleup_rank_idx * fw_scaleup_buffer.num_max_tokens_per_rank + stored_src_slot_idx;
+                    } else {
+                        const auto g = __ldg(fwd + i * kNumForwardMetadataDims);
+                        const auto src_slot_idx = (g / (kNumMaxTokensPerRank * kNumScaleupRanks)) * kNumMaxTokensPerRank +
+                            g % kNumMaxTokensPerRank;
+                        stored_src_buffer_idx = stored_src_slot_idx == -1 ? -1 :
+                            lane_idx * fw_scaleup_buffer.num_max_tokens_per_rank + src_slot_idx;
+                    }
+                    int topk_slot_idx[kNumTokensInScaleupLayout];
+                    compute_topk_slots(
+                        topk_slot_idx, reduce_valid_mask,
+                        [=](const int& idx) {
+                            return ptx::exchange(stored_src_buffer_idx, idx);
+                        }
+                    );
+                    constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
+                    combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumScaleoutRanks)>(
+                        lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                        [=](const int& slot_idx) {
+                            return static_cast<combine_vec_t*>(fw_scaleup_buffer.get_token_buffer(slot_idx, true).get_base_ptr());
+                        },
+                        [=]() {
+                            wait_store();
+                        }
+                    );
+                    stored_src_buffer_idx = ptx::exchange(
+                        stored_src_buffer_idx, ptx::get_master_lane_idx(ptx::match(stored_src_scaleup_rank_idx)));
+                    if (stored_src_scaleup_rank_idx >= 0) {
+                        tma_buffer.get_topk_weights_ptr()[lane_idx] =
+                            fw_scaleup_buffer.get_token_buffer(stored_src_buffer_idx, true)
+                                        .get_topk_weights_ptr()[lane_idx];
+                    }
+                    ptx::tma_store_fence();
+                    __syncwarp();
+                    // Local token: its recv slot is its index among the local tokens
+                    constexpr int kNumSlotsPerChannel = kNumMaxTokensPerChannel * (kAllowMultipleReduction ? 1 : kNumTopk);
+                    const auto recv_token_buffer = scaleout_recv_buffer
+                        .get_channel_buffer<kNumSlotsPerChannel>(channel_idx)
+                        .get_rank_buffer(scaleout_rank_idx)
+                        .get_token_buffer(i - first_local);
+                    if (ptx::elect_one_sync()) {
+                        ptx::tma_store_1d(recv_token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(),
+                                          token_layout.get_num_bytes<false>());
+                        ptx::tma_store_commit();
+                    }
+                    __syncwarp();
+                    store_pending = true;
+                }
+                if (store_pending)
+                    wait_store();
+            }
+            // Always signal: the forward warp waits whenever it saw a claim, also one that was raised past the end
+            if (ptx::elect_one_sync())
+                ptx::st_release_cta(help_done + warp_idx, 1);
+            __syncwarp();
+        }
     } else if (warp_idx < kNumDataWarps) {
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
@@ -545,6 +718,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + kNumTopk + lane_idx) : -1;
             if (src_token_global_idx < 0)
                 break;
+            if constexpr (kSuHelp) {
+                // Publish the index first, then read the claim: the helper claims only above a published index
+                if (ptx::elect_one_sync())
+                    ptx::st_release_cta(help_fw_next + forward_warp_idx, i);
+                __threadfence_block();
+                __syncwarp();
+                if (i >= ptx::ld_acquire_cta(help_fw_limit + forward_warp_idx))
+                    break;
+            }
 
             // Scaleup rank mask
             EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Too many scale-up peers");
@@ -727,6 +909,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 issue_batched_rdma(dst);
 
             ptx::st_release_cta(proxy_ring_layout.get_done(forward_warp_idx), 1);
+        }
+        __syncwarp();
+
+        // The helper reads the scale-up tails too: wait for it before cleaning them
+        if constexpr (kSuHelp) {
+            if (ptx::ld_acquire_cta(help_fw_limit + forward_warp_idx) != kHelpNone) {
+                comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                    if (ptx::ld_acquire_cta(help_done + forward_warp_idx) != 0)
+                        return true;
+                    if (is_last_check)
+                        printf("DeepEP combine (helper wait) timeout, scale-out: %d, scale-up: %d, channel: %d\n",
+                               scaleout_rank_idx, scaleup_rank_idx, channel_idx);
+                    return false;
+                });
+            }
         }
         __syncwarp();
 
