@@ -91,6 +91,8 @@ public:
             flags += fmt::format(" -DEP_COMBINE_SU_HELP={}", h);
         if (get_env("EP_COMBINE_EARLY_FINAL", 0))
             flags += " -DEP_COMBINE_EARLY_FINAL=1";
+        if (get_env("EP_QP_MAP_STRIDED", 0))
+            flags += " -DEP_QP_MAP_STRIDED=1";
     }
 
     virtual ~Compiler() = default;

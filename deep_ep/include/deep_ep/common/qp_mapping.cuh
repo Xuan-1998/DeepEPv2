@@ -21,6 +21,11 @@
 #define QP_MAPPING_HD inline
 #endif
 
+// Experiment knob (JD 23.14 E02): strided channel-to-QP mapping when there are fewer QPs than SMs
+#ifndef EP_QP_MAP_STRIDED
+#define EP_QP_MAP_STRIDED 0
+#endif
+
 namespace deep_ep::elastic::comm {
 
 // Result of a balanced contiguous partition: which bin an item lands in, its
@@ -90,7 +95,13 @@ QP_MAPPING_HD constexpr int channel_to_qp(int sm_idx, int channel_in_sm_idx,
         // SM's channels stay grouped and no QP is left idle.
         constexpr int kNumChannels = kNumSMs * kNumChannelsPerSM;
         const int global_channel_idx = sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+#if EP_QP_MAP_STRIDED
+        // Strided: consecutive channels go to consecutive QPs, so every QP serves channels of many SMs and the
+        // SMs' speed differences do not pile up on one QP
+        return kQPStartIdx + global_channel_idx % kNumAvailableQPs;
+#else
         return kQPStartIdx + balanced_partition(global_channel_idx, kNumChannels, kNumAvailableQPs).bin;
+#endif
     }
 }
 
@@ -116,7 +127,11 @@ QP_MAPPING_HD constexpr int channel_to_signal_id(int sm_idx, int channel_in_sm_i
     } else {
         constexpr int kNumChannels = kNumSMs * kNumChannelsPerSM;
         const int global_channel_idx = sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+#if EP_QP_MAP_STRIDED
+        return global_channel_idx / kNumAvailableQPs;
+#else
         return balanced_partition(global_channel_idx, kNumChannels, kNumAvailableQPs).local;
+#endif
     }
 }
 
