@@ -316,7 +316,7 @@ hybrid_unordered_dispatch_impl(
     constexpr int kNumMaxSubParts = kNumLastSubParts > kNumSubParts ? kNumLastSubParts : kNumSubParts;
     // Without a small first part (two parts per channel) the first part is cut the other way round,
     // in sub-puts of rising size, so the first put leaves after a few staged tokens.
-    constexpr bool kShapeFirstPart = kShapeLastPart and kNumParts >= 2 and
+    constexpr bool kShapeFirstPart = kNumParts >= 2 and
         part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
     const auto num_subs_of = [&](const int& part_idx) {
         return (part_idx == kNumParts - 1 or (kShapeFirstPart and part_idx == 0))
@@ -1157,7 +1157,7 @@ hybrid_unordered_dispatch_impl(
         // sends the remote-source rows back over the network. A rising first part reaches the forwarder in small
         // pieces, so there a local turn may run at most `kPaceSlack` rows ahead of the mean remote source while a
         // remote source still sends
-        constexpr bool kPaceLocalTurns = kShapeFirstPart;
+        constexpr bool kPaceLocalTurns = kShapeFirstPart and kNumLastSubParts > kNumSubParts;
         constexpr int kPaceSlack = 12, kPaceMinTurn = 8;
         int num_local_recorded = 0, num_remote_recorded = 0;
         // The headers of the remote sources are zero only once the entry flag is open
