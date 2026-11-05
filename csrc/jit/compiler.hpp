@@ -70,6 +70,14 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+        // Experiment knobs (JD 23.14 E03), device-only constants of hybrid_dispatch_unordered.cuh: the sub-puts per
+        // scale-out part, the SM100 token floor per sub-put, and the shaped first and last parts on SM100
+        if (int num_sub_parts = get_env("EP_NUM_SUB_PARTS", 0); num_sub_parts > 0)
+            flags += fmt::format(" -DEP_NUM_SUB_PARTS={}", num_sub_parts);
+        if (int sm100_min_sub_tokens = get_env("EP_SM100_MIN_SUB_TOKENS", 0); sm100_min_sub_tokens > 0)
+            flags += fmt::format(" -DEP_SM100_MIN_SUB_TOKENS={}", sm100_min_sub_tokens);
+        if (int sm100_shape_parts = get_env("EP_SM100_SHAPE_PARTS", 0); sm100_shape_parts > 0)
+            flags += fmt::format(" -DEP_SM100_SHAPE_PARTS={}", sm100_shape_parts);
     }
 
     virtual ~Compiler() = default;

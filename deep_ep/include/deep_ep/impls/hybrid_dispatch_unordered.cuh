@@ -52,6 +52,11 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 #define EP_SM100_MIN_SUB_TOKENS 15
 #endif
 
+// Experiment knob (JD 23.14 E03): shaped first and last parts (rising and halving sub-puts) on SM100 too
+#ifndef EP_SM100_SHAPE_PARTS
+#define EP_SM100_SHAPE_PARTS 0
+#endif
+
 #ifndef EP_MIN_TOKENS_PER_PART
 #define EP_MIN_TOKENS_PER_PART 15
 #endif
@@ -308,7 +313,7 @@ hybrid_unordered_dispatch_impl(
     // halving sizes, so few tokens are left to forward after the last landing. SM100 keeps the
     // uniform split, its sub-puts have a token floor.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    constexpr bool kShapeLastPart = false;
+    constexpr bool kShapeLastPart = (EP_SM100_SHAPE_PARTS) != 0;
 #else
     constexpr bool kShapeLastPart = true;
 #endif
