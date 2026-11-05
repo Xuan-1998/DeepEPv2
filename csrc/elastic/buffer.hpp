@@ -947,11 +947,14 @@ public:
                    static_cast<int64_t>(2 * num_channels_per_sm) *
                            combine_token_layout.get_num_bytes<true, int64_t>() +
                        elastic::ProxyRingLayout::get_num_bytes(num_channels_per_sm,
-                                                               elastic::kProxyRingDepthDefault) >
+                                                               elastic::proxy_ring_depth()) >
                    num_smem_bytes)
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
                            "shared memory cannot host a single dispatch channel at this token size");
+            // Experiment knob (JD 23.14 E02): cap the channel count below what shared memory allows
+            if (const int cap = get_env<int>("EP_MAX_CHANNELS_PER_SM", 0); cap > 0)
+                num_channels_per_sm = std::min<int>(num_channels_per_sm, cap);
             }
             num_channels = num_sms * num_channels_per_sm;
             if (get_env<int>("EP_BUFFER_DEBUG"))

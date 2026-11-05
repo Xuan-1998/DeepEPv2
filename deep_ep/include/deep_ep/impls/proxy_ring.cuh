@@ -22,7 +22,12 @@ struct ProxyPutDesc {
 };
 static_assert(sizeof(ProxyPutDesc) == 24, "ProxyPutDesc must be tightly packed (2 ptrs + 2 ints)");
 
-inline constexpr int kProxyRingDepthDefault = 20;
+// The JIT may override the depth with -DEP_PROXY_RING_DEPTH (from the environment variable of the
+// same name, csrc/jit/compiler.hpp); the host build keeps 20 and reads the variable itself.
+#ifndef EP_PROXY_RING_DEPTH
+#define EP_PROXY_RING_DEPTH 20
+#endif
+inline constexpr int kProxyRingDepthDefault = EP_PROXY_RING_DEPTH;
 inline constexpr int kProxyControlWordsPerForwardWarp = 3;   // head, tail, done
 
 // Shared-memory layout for the proxy warp hand-off rings

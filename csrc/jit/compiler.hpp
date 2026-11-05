@@ -70,6 +70,9 @@ public:
         // TODO: make it more general, e.g. `EP_JIT_EXTRA_FLAGS`
         if (int num_topk_idx_bits = get_env("EP_NUM_TOPK_IDX_BITS", 0); num_topk_idx_bits != 0)
             flags += fmt::format(" -DEP_NUM_TOPK_IDX_BITS={}", num_topk_idx_bits);
+        // Experiment knob (JD 23.14 E02): the unordered combine's proxy ring depth, read by the host too
+        if (int ring_depth = get_env("EP_PROXY_RING_DEPTH", 0); ring_depth > 0)
+            flags += fmt::format(" -DEP_PROXY_RING_DEPTH={}", ring_depth);
     }
 
     virtual ~Compiler() = default;
