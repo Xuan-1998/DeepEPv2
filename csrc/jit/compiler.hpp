@@ -87,6 +87,8 @@ public:
             flags += fmt::format(" -DEP_COMBINE_RAMP_TOKENS={} -DEP_COMBINE_RAMP_PUTS={}", n, get_env("EP_COMBINE_RAMP_PUTS", 1));
         if (int n = get_env("EP_COMBINE_EARLY_ROWS", 0); n > 0)
             flags += fmt::format(" -DEP_COMBINE_EARLY_ROWS={}", n);
+        if (int h = get_env("EP_COMBINE_SU_HELP", -1); h >= 0)
+            flags += fmt::format(" -DEP_COMBINE_SU_HELP={}", h);
     }
 
     virtual ~Compiler() = default;
