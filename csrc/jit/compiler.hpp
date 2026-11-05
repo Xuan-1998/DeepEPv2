@@ -83,6 +83,8 @@ public:
             flags += fmt::format(" -DEP_COMBINE_PROXY_IDLE_NS={}", ns);
         if (get_env("EP_COMBINE_SWEEPER", 0))
             flags += " -DEP_COMBINE_SWEEPER=1";
+        if (int n = get_env("EP_COMBINE_RAMP_TOKENS", 0); n > 0)
+            flags += fmt::format(" -DEP_COMBINE_RAMP_TOKENS={} -DEP_COMBINE_RAMP_PUTS={}", n, get_env("EP_COMBINE_RAMP_PUTS", 1));
     }
 
     virtual ~Compiler() = default;

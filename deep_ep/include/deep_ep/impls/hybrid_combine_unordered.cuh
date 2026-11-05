@@ -36,6 +36,26 @@ namespace deep_ep::elastic {
 #ifndef EP_COMBINE_PROXY_IDLE_NS
 #define EP_COMBINE_PROXY_IDLE_NS 0
 #endif
+// Put ramp: the first EP_COMBINE_RAMP_PUTS puts of every (channel, destination) carry EP_COMBINE_RAMP_TOKENS tokens,
+// the later ones kBatchSize, so the first bytes leave the GPU before 12 tokens are reduced. Every put still signals 1;
+// sender and receiver derive the put count of n tokens from the same schedule (ramp_put_count).
+#ifndef EP_COMBINE_RAMP_TOKENS
+#define EP_COMBINE_RAMP_TOKENS 0
+#endif
+#ifndef EP_COMBINE_RAMP_PUTS
+#define EP_COMBINE_RAMP_PUTS 0
+#endif
+
+template <int kBatchSize>
+__device__ __forceinline__ int ramp_put_count(const int& num_tokens) {
+    if constexpr (EP_COMBINE_RAMP_TOKENS > 0 and EP_COMBINE_RAMP_PUTS > 0) {
+        constexpr int kRampTokens = EP_COMBINE_RAMP_TOKENS * EP_COMBINE_RAMP_PUTS;
+        if (num_tokens <= kRampTokens)
+            return math::ceil_div(num_tokens, EP_COMBINE_RAMP_TOKENS);
+        return EP_COMBINE_RAMP_PUTS + math::ceil_div(num_tokens - kRampTokens, kBatchSize);
+    }
+    return math::ceil_div(num_tokens, kBatchSize);
+}
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
@@ -480,12 +500,17 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         };
 
         // Update per Channel/ScaleOutRank batch metadata and GIN PUT when threshold met
+        int puts_issued[kNumScaleoutRanks] = {};
         const auto record_slot_and_maybe_flush = [&](const int& dst, const int& slot) {
             if (batch_count[dst] == 0)
                 batch_start_slot[dst] = slot;
             batch_count[dst] += 1;
-            if (batch_count[dst] == kBatchSize)
+            const int target = (EP_COMBINE_RAMP_TOKENS > 0 and puts_issued[dst] < EP_COMBINE_RAMP_PUTS) ?
+                EP_COMBINE_RAMP_TOKENS : kBatchSize;
+            if (batch_count[dst] == target) {
                 issue_batched_rdma(dst);
+                puts_issued[dst] += 1;
+            }
         };
 
         int last_src_scaleout_rank_idx = -1;
@@ -775,7 +800,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         #pragma unroll
         for (int r = 0; r < kNumScaleoutRanks; ++ r) {
             const int rank_total = ptx::reduce_add(local_expected_count_per_rank[r]);
-            num_expected_arrivals += math::ceil_div(rank_total, kBatchSize);
+            num_expected_arrivals += ramp_put_count<kBatchSize>(rank_total);
         }
         __syncwarp();
         // Wait for the per-channel indexed signal to accumulate `num_expected_arrivals`
