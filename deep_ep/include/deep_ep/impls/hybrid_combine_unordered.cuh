@@ -28,6 +28,10 @@ namespace deep_ep::elastic {
 #ifndef EP_COMBINE_TAIL_INTERVAL
 #define EP_COMBINE_TAIL_INTERVAL 3
 #endif
+// L2 policy of the scale-up warps' NVLink stores at the peer (0 normal, 1 evict_last, 2 evict_first)
+#ifndef EP_COMBINE_SU_STORE_HINT
+#define EP_COMBINE_SU_STORE_HINT 0
+#endif
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
@@ -370,9 +374,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     }
 
                     // Issue stores
+                    constexpr auto kSuStoreHint = EP_COMBINE_SU_STORE_HINT == 1 ? ptx::TMACacheHint::kEvictLast :
+                        EP_COMBINE_SU_STORE_HINT == 2 ? ptx::TMACacheHint::kEvictFirst : ptx::TMACacheHint::kEvictNormal;
                     ptx::tma_store_1d(
                         token_buffer.get_base_ptr(), tma_buffer.get_base_ptr(),
-                        token_layout.get_num_bytes<false>());
+                        token_layout.get_num_bytes<false>(), kSuStoreHint);
                     ptx::tma_store_commit();
                 }
                 #pragma unroll

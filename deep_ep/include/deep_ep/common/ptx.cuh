@@ -129,7 +129,8 @@ __forceinline__ __device__ void tma_store_wait() {
 
 enum TMACacheHint: int64_t {
     kEvictFirst = 0x12f0000000000000ll,
-    kEvictNormal = 0x1000000000000000ll
+    kEvictNormal = 0x1000000000000000ll,
+    kEvictLast = 0x14f0000000000000ll
 };
 
 __forceinline__ __device__ void tma_load_1d(

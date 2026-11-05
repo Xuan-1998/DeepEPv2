@@ -77,6 +77,8 @@ public:
             flags += fmt::format(" -DEP_COMBINE_BATCH_SIZE={}", batch_size);
         if (int tail_interval = get_env("EP_COMBINE_TAIL_INTERVAL", 0); tail_interval > 0)
             flags += fmt::format(" -DEP_COMBINE_TAIL_INTERVAL={}", tail_interval);
+        if (int hint = get_env("EP_COMBINE_SU_STORE_HINT", 0); hint > 0)
+            flags += fmt::format(" -DEP_COMBINE_SU_STORE_HINT={}", hint);
     }
 
     virtual ~Compiler() = default;
