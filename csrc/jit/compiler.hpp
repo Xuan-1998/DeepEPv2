@@ -82,6 +82,8 @@ public:
             flags += fmt::format(" -DEP_FIRST_SUB_PARTS={}", first_sub_parts);
         if (int shape_first_part = get_env("EP_SHAPE_FIRST_PART", 1); shape_first_part == 0)
             flags += " -DEP_SHAPE_FIRST_PART=0";
+        if (int pace_local_turns = get_env("EP_PACE_LOCAL_TURNS", -1); pace_local_turns >= 0)
+            flags += fmt::format(" -DEP_PACE_LOCAL_TURNS={}", pace_local_turns);
     }
 
     virtual ~Compiler() = default;

@@ -67,6 +67,11 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 #define EP_SHAPE_FIRST_PART 1
 #endif
 
+// Experiment knob (JD 23.14 E03): -1 paces local forward turns where the first part is shaped, 0 never, 1 always
+#ifndef EP_PACE_LOCAL_TURNS
+#define EP_PACE_LOCAL_TURNS -1
+#endif
+
 #ifndef EP_MIN_TOKENS_PER_PART
 #define EP_MIN_TOKENS_PER_PART 15
 #endif
@@ -1176,7 +1181,7 @@ hybrid_unordered_dispatch_impl(
         // sends the remote-source rows back over the network. A rising first part reaches the forwarder in small
         // pieces, so there a local turn may run at most `kPaceSlack` rows ahead of the mean remote source while a
         // remote source still sends
-        constexpr bool kPaceLocalTurns = kShapeFirstPart;
+        constexpr bool kPaceLocalTurns = (EP_PACE_LOCAL_TURNS) < 0 ? kShapeFirstPart : (EP_PACE_LOCAL_TURNS) != 0;
         constexpr int kPaceSlack = 12, kPaceMinTurn = 8;
         int num_local_recorded = 0, num_remote_recorded = 0;
         // The headers of the remote sources are zero only once the entry flag is open
