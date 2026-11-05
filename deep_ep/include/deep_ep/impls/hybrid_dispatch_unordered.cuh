@@ -62,6 +62,11 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 #define EP_FIRST_SUB_PARTS 0
 #endif
 
+// Experiment knob (JD 23.14 E03): 0 keeps the first part in uniform sub-puts while the last part is shaped
+#ifndef EP_SHAPE_FIRST_PART
+#define EP_SHAPE_FIRST_PART 1
+#endif
+
 #ifndef EP_MIN_TOKENS_PER_PART
 #define EP_MIN_TOKENS_PER_PART 15
 #endif
@@ -328,7 +333,7 @@ hybrid_unordered_dispatch_impl(
     constexpr int kNumMaxSubParts = kNumLastSubParts > kNumSubParts ? kNumLastSubParts : kNumSubParts;
     // Without a small first part (two parts per channel) the first part is cut the other way round,
     // in sub-puts of rising size, so the first put leaves after a few staged tokens.
-    constexpr bool kShapeFirstPart = kShapeLastPart and kNumParts >= 2 and
+    constexpr bool kShapeFirstPart = kShapeLastPart and (EP_SHAPE_FIRST_PART) != 0 and kNumParts >= 2 and
         part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
     const auto num_subs_of = [&](const int& part_idx) {
         if (kShapeFirstPart and part_idx == 0)
