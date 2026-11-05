@@ -89,6 +89,8 @@ public:
             flags += fmt::format(" -DEP_COMBINE_EARLY_ROWS={}", n);
         if (int h = get_env("EP_COMBINE_SU_HELP", -1); h >= 0)
             flags += fmt::format(" -DEP_COMBINE_SU_HELP={}", h);
+        if (get_env("EP_COMBINE_EARLY_FINAL", 0))
+            flags += " -DEP_COMBINE_EARLY_FINAL=1";
     }
 
     virtual ~Compiler() = default;

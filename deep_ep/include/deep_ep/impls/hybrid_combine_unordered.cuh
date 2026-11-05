@@ -50,6 +50,12 @@ namespace deep_ep::elastic {
 #ifndef EP_COMBINE_EARLY_ROWS
 #define EP_COMBINE_EARLY_ROWS 0
 #endif
+// Early final flush (1 on): with the remote-first forward list, the forward warp issues the partial last put of
+// every remote destination at its first local token instead of at the end of the list, so the receiver's last
+// inbound put does not wait for the sender's local phase. The put count per destination is unchanged.
+#ifndef EP_COMBINE_EARLY_FINAL
+#define EP_COMBINE_EARLY_FINAL 0
+#endif
 
 template <int kBatchSize>
 __device__ __forceinline__ int ramp_put_count(const int& num_tokens) {
@@ -718,6 +724,21 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims + 2 + kNumTopk + lane_idx) : -1;
             if (src_token_global_idx < 0)
                 break;
+            if constexpr (EP_COMBINE_EARLY_FINAL) {
+                // First local token after the remote ones: record the last remote token and issue every remote
+                // destination's partial batch now (the list end would otherwise hold it for the whole local phase)
+                if (src_scaleout_rank_idx == scaleout_rank_idx and last_src_scaleout_rank_idx >= 0 and
+                    last_src_scaleout_rank_idx != scaleout_rank_idx) {
+                    flush_last_tma_and_record_batch();
+                    if (ptx::elect_one_sync()) {
+                        #pragma unroll
+                        for (int dst = 0; dst < kNumScaleoutRanks; ++ dst)
+                            issue_batched_rdma(dst);
+                    }
+                    __syncwarp();
+                    last_src_scaleout_rank_idx = -1;
+                }
+            }
             if constexpr (kSuHelp) {
                 // Publish the index first, then read the claim: the helper claims only above a published index
                 if (ptx::elect_one_sync())
