@@ -1076,10 +1076,11 @@ hybrid_unordered_dispatch_impl(
 
             // The helper's NVLink stores are complete: count it done on every scale-up peer, next to the
             // forward warp of its channel
+            // Each lane waits for its own bulk stores, the warp barrier orders them before every lane's
+            // release add
             if constexpr (kNumScaleupRanks > 1) {
                 ptx::tma_store_commit();
                 ptx::tma_store_wait();
-                ptx::fence_acq_rel_sys();
                 __syncwarp();
                 #pragma unroll
                 for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
@@ -1608,7 +1609,10 @@ hybrid_unordered_dispatch_impl(
         }
         __syncwarp();
 
+        // Lane k drains part k, all parts at once (one signal read round trip instead of one per part)
         EP_STATIC_ASSERT(kNumParts <= 32, "One lane drains one part");
+        int drain_expected = 0;
+        int64_t drain_base = 0;
         #pragma unroll
         for (int k = 0; k < kNumParts; ++ k) {
             const int num_subs_k = num_subs_of(k);
@@ -1616,21 +1620,24 @@ hybrid_unordered_dispatch_impl(
                                 : stored_terminal_part == k ? stored_terminal_sub + 1
                                                             : 0;
             const int expected_k = ptx::reduce_add(my_subs_k);
-            if (lane_idx == k and expected_k > 0) {
-                comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
-                    const int64_t landed =
-                        comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]);
-                    if (landed >= static_cast<int64_t>(expected_k))
-                        return true;
-                    if (is_last_check)
-                        printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, "
-                               "channel: %d, part: %d, landed: %lld, expected: %d\n",
-                               channel_idx, k, (long long)landed, expected_k);
-                    return false;
-                });
-                gin.gin.increaseSignalShadow(part_signal_id(k), static_cast<uint64_t>(expected_k));
-            }
+            drain_expected = lane_idx == k ? expected_k : drain_expected;
+            drain_base = lane_idx == k ? rx_part_base[k] : drain_base;
         }
+        const bool drains = lane_idx < kNumParts and drain_expected > 0;
+        comm::timeout_while<kNumTimeoutCycles>(drains, [&](const bool& is_last_check) {
+            // Only the count matters here (the data was consumed with acquires in the poll), so a relaxed read
+            const int64_t landed = comm::signal_delta(
+                gin.gin.readSignal(part_signal_id(lane_idx), 64, cuda::memory_order_relaxed), drain_base);
+            if (landed >= static_cast<int64_t>(drain_expected))
+                return true;
+            if (is_last_check)
+                printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, "
+                       "channel: %d, part: %d, landed: %lld, expected: %d\n",
+                       channel_idx, lane_idx, (long long)landed, drain_expected);
+            return false;
+        });
+        if (drains)
+            gin.gin.increaseSignalShadow(part_signal_id(lane_idx), static_cast<uint64_t>(drain_expected));
         __syncwarp();
 
         if (lane_idx < kNumScaleoutRanks)
@@ -1638,10 +1645,10 @@ hybrid_unordered_dispatch_impl(
         __syncwarp();
 
         // This channel's NVLink stores and tails are complete: count it done on every scale-up peer
+        // (each lane waits for its own bulk stores, the warp barrier orders them before every lane's release add)
         if constexpr (kNumScaleupRanks > 1) {
             ptx::tma_store_commit();
             ptx::tma_store_wait();
-            ptx::fence_acq_rel_sys();
             __syncwarp();
             #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
