@@ -67,6 +67,11 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 #define EP_SHAPE_FIRST_PART 1
 #endif
 
+// Experiment knob (JD 23.14 E03): 0 keeps the last part in uniform sub-puts while the first part is shaped
+#ifndef EP_SHAPE_LAST_PART
+#define EP_SHAPE_LAST_PART 1
+#endif
+
 // Experiment knob (JD 23.14 E03): -1 paces local forward turns where the first part is shaped, 0 never, 1 always
 #ifndef EP_PACE_LOCAL_TURNS
 #define EP_PACE_LOCAL_TURNS -1
@@ -328,17 +333,18 @@ hybrid_unordered_dispatch_impl(
     // halving sizes, so few tokens are left to forward after the last landing. SM100 keeps the
     // uniform split, its sub-puts have a token floor.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    constexpr bool kShapeLastPart = (EP_SM100_SHAPE_PARTS) != 0;
+    constexpr bool kShapeParts = (EP_SM100_SHAPE_PARTS) != 0;
 #else
-    constexpr bool kShapeLastPart = true;
+    constexpr bool kShapeParts = true;
 #endif
+    constexpr bool kShapeLastPart = kShapeParts and (EP_SHAPE_LAST_PART) != 0;
     constexpr int kNumLastSubParts = kShapeLastPart ? 2 * kNumSubParts : kNumSubParts;
     constexpr int kNumFirstSubParts = (EP_FIRST_SUB_PARTS) > 0 ? (EP_FIRST_SUB_PARTS) : kNumLastSubParts;
-    EP_STATIC_ASSERT(kNumFirstSubParts <= kNumLastSubParts, "The first part has at most the last part's sub-puts");
     constexpr int kNumMaxSubParts = kNumLastSubParts > kNumSubParts ? kNumLastSubParts : kNumSubParts;
+    EP_STATIC_ASSERT(kNumFirstSubParts <= kNumMaxSubParts, "The first part has at most kNumMaxSubParts sub-puts");
     // Without a small first part (two parts per channel) the first part is cut the other way round,
     // in sub-puts of rising size, so the first put leaves after a few staged tokens.
-    constexpr bool kShapeFirstPart = kShapeLastPart and (EP_SHAPE_FIRST_PART) != 0 and kNumParts >= 2 and
+    constexpr bool kShapeFirstPart = kShapeParts and (EP_SHAPE_FIRST_PART) != 0 and kNumParts >= 2 and
         part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
     const auto num_subs_of = [&](const int& part_idx) {
         if (kShapeFirstPart and part_idx == 0)
