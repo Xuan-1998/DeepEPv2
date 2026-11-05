@@ -45,6 +45,11 @@ namespace deep_ep::elastic {
 #ifndef EP_COMBINE_RAMP_PUTS
 #define EP_COMBINE_RAMP_PUTS 0
 #endif
+// Scale-up warps publish their tails after every one of the first EP_COMBINE_EARLY_ROWS rows (then every
+// kNumScaleupUpdateInterval rows), so the forward warps see their first tokens earlier.
+#ifndef EP_COMBINE_EARLY_ROWS
+#define EP_COMBINE_EARLY_ROWS 0
+#endif
 
 template <int kBatchSize>
 __device__ __forceinline__ int ramp_put_count(const int& num_tokens) {
@@ -193,13 +198,14 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Tail issuer
         // `st.release.sys` is pretty slow, so do it by an interval
-        int update_counter = 0;
+        int update_counter = 0, rows_done = 0;
         int stored_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         int stored_old_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
         const auto update_tails = [&](const bool& finish = false) {
             ++ update_counter;
-            if (finish or update_counter == kNumScaleupUpdateInterval) {
+            ++ rows_done;
+            if (finish or update_counter == kNumScaleupUpdateInterval or rows_done <= EP_COMBINE_EARLY_ROWS) {
                 // Wait all TMA stores to finish
                 ptx::tma_store_wait();
                 __syncwarp();

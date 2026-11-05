@@ -85,6 +85,8 @@ public:
             flags += " -DEP_COMBINE_SWEEPER=1";
         if (int n = get_env("EP_COMBINE_RAMP_TOKENS", 0); n > 0)
             flags += fmt::format(" -DEP_COMBINE_RAMP_TOKENS={} -DEP_COMBINE_RAMP_PUTS={}", n, get_env("EP_COMBINE_RAMP_PUTS", 1));
+        if (int n = get_env("EP_COMBINE_EARLY_ROWS", 0); n > 0)
+            flags += fmt::format(" -DEP_COMBINE_EARLY_ROWS={}", n);
     }
 
     virtual ~Compiler() = default;
