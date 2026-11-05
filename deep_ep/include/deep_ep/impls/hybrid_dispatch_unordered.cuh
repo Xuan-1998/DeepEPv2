@@ -57,6 +57,11 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 #define EP_SM100_SHAPE_PARTS 0
 #endif
 
+// Experiment knob (JD 23.14 E03): number of rising sub-puts in the first part, 0 = as many as the last part
+#ifndef EP_FIRST_SUB_PARTS
+#define EP_FIRST_SUB_PARTS 0
+#endif
+
 #ifndef EP_MIN_TOKENS_PER_PART
 #define EP_MIN_TOKENS_PER_PART 15
 #endif
@@ -318,20 +323,24 @@ hybrid_unordered_dispatch_impl(
     constexpr bool kShapeLastPart = true;
 #endif
     constexpr int kNumLastSubParts = kShapeLastPart ? 2 * kNumSubParts : kNumSubParts;
+    constexpr int kNumFirstSubParts = (EP_FIRST_SUB_PARTS) > 0 ? (EP_FIRST_SUB_PARTS) : kNumLastSubParts;
+    EP_STATIC_ASSERT(kNumFirstSubParts <= kNumLastSubParts, "The first part has at most the last part's sub-puts");
     constexpr int kNumMaxSubParts = kNumLastSubParts > kNumSubParts ? kNumLastSubParts : kNumSubParts;
     // Without a small first part (two parts per channel) the first part is cut the other way round,
     // in sub-puts of rising size, so the first put leaves after a few staged tokens.
     constexpr bool kShapeFirstPart = kShapeLastPart and kNumParts >= 2 and
         part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
     const auto num_subs_of = [&](const int& part_idx) {
-        return (part_idx == kNumParts - 1 or (kShapeFirstPart and part_idx == 0))
+        if (kShapeFirstPart and part_idx == 0)
+            return num_sub_parts_at<kNumFirstSubParts>(part_size(0));
+        return part_idx == kNumParts - 1
             ? num_sub_parts_at<kNumLastSubParts>(part_size(part_idx))
             : num_sub_parts_at<kNumSubParts>(part_size(part_idx));
     };
     const auto sub_size_of = [&](const int& part_idx, const int& sub_idx) {
         if (kShapeFirstPart and part_idx == 0)
-            return sub_part_size_at<kNumLastSubParts, true>(
-                part_size(0), num_sub_parts_at<kNumLastSubParts>(part_size(0)) - 1 - sub_idx);
+            return sub_part_size_at<kNumFirstSubParts, true>(
+                part_size(0), num_sub_parts_at<kNumFirstSubParts>(part_size(0)) - 1 - sub_idx);
         return part_idx == kNumParts - 1 ? sub_part_size_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
                                          : sub_part_size_at<kNumSubParts>(part_size(part_idx), sub_idx);
     };

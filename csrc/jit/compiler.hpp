@@ -78,6 +78,8 @@ public:
             flags += fmt::format(" -DEP_SM100_MIN_SUB_TOKENS={}", sm100_min_sub_tokens);
         if (int sm100_shape_parts = get_env("EP_SM100_SHAPE_PARTS", 0); sm100_shape_parts > 0)
             flags += fmt::format(" -DEP_SM100_SHAPE_PARTS={}", sm100_shape_parts);
+        if (int first_sub_parts = get_env("EP_FIRST_SUB_PARTS", 0); first_sub_parts > 0)
+            flags += fmt::format(" -DEP_FIRST_SUB_PARTS={}", first_sub_parts);
     }
 
     virtual ~Compiler() = default;
