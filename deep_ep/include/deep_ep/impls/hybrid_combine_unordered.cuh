@@ -815,7 +815,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Divergence cost per put step: sum(Ln for n in 0..kNumForwardWarps-1)
         // (all lanes' PC time) + lane-context-switch overhead. On B200 that beats
         // the serial sweep; on H200 the parallel throughput gain dominates.
-        #if __CUDA_ARCH__ >= 1000
+        #if __CUDA_ARCH__ >= 1000 or (defined(EP_COMBINE_SWEEPER) and EP_COMBINE_SWEEPER == 1)
         constexpr bool kSingleLaneSweeper = true;
         #else
         constexpr bool kSingleLaneSweeper = false;

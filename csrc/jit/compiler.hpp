@@ -81,6 +81,8 @@ public:
             flags += fmt::format(" -DEP_COMBINE_SU_STORE_HINT={}", hint);
         if (int ns = get_env("EP_COMBINE_PROXY_IDLE_NS", 0); ns > 0)
             flags += fmt::format(" -DEP_COMBINE_PROXY_IDLE_NS={}", ns);
+        if (get_env("EP_COMBINE_SWEEPER", 0))
+            flags += " -DEP_COMBINE_SWEEPER=1";
     }
 
     virtual ~Compiler() = default;
