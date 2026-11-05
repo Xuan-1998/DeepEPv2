@@ -79,6 +79,8 @@ public:
             flags += fmt::format(" -DEP_COMBINE_TAIL_INTERVAL={}", tail_interval);
         if (int hint = get_env("EP_COMBINE_SU_STORE_HINT", 0); hint > 0)
             flags += fmt::format(" -DEP_COMBINE_SU_STORE_HINT={}", hint);
+        if (int ns = get_env("EP_COMBINE_PROXY_IDLE_NS", 0); ns > 0)
+            flags += fmt::format(" -DEP_COMBINE_PROXY_IDLE_NS={}", ns);
     }
 
     virtual ~Compiler() = default;

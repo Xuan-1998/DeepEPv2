@@ -32,6 +32,10 @@ namespace deep_ep::elastic {
 #ifndef EP_COMBINE_SU_STORE_HINT
 #define EP_COMBINE_SU_STORE_HINT 0
 #endif
+// Proxy warp (parallel design): nanoseconds to sleep on every idle poll (0 keeps the sleep at ring boundaries only)
+#ifndef EP_COMBINE_PROXY_IDLE_NS
+#define EP_COMBINE_PROXY_IDLE_NS 0
+#endif
 
 template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumSMs,
@@ -903,6 +907,8 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                             // before `done` became visible.
                             if (tail == ptx::ld_acquire_cta(proxy_ring_layout.get_head(lane_idx)))
                                 break;
+                        } else if constexpr (EP_COMBINE_PROXY_IDLE_NS > 0) {
+                            __nanosleep(EP_COMBINE_PROXY_IDLE_NS); // release issue slots to the data warps
                         } else if (tail != 0 and (tail % static_cast<unsigned>(kNumForwardWarps)) == 0) {
                             __nanosleep(1000); // release context for data warps
                         }
