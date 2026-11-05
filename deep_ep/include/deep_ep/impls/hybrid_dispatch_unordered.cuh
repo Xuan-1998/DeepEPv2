@@ -340,12 +340,12 @@ hybrid_unordered_dispatch_impl(
     constexpr bool kShapeLastPart = kShapeParts and (EP_SHAPE_LAST_PART) != 0;
     constexpr int kNumLastSubParts = kShapeLastPart ? 2 * kNumSubParts : kNumSubParts;
     constexpr int kNumFirstSubParts = (EP_FIRST_SUB_PARTS) > 0 ? (EP_FIRST_SUB_PARTS) : kNumLastSubParts;
-    constexpr int kNumMaxSubParts = kNumLastSubParts > kNumSubParts ? kNumLastSubParts : kNumSubParts;
-    EP_STATIC_ASSERT(kNumFirstSubParts <= kNumMaxSubParts, "The first part has at most kNumMaxSubParts sub-puts");
     // Without a small first part (two parts per channel) the first part is cut the other way round,
     // in sub-puts of rising size, so the first put leaves after a few staged tokens.
     constexpr bool kShapeFirstPart = kShapeParts and (EP_SHAPE_FIRST_PART) != 0 and kNumParts >= 2 and
         part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
+    constexpr int kNumShapedSubParts = kShapeFirstPart and kNumFirstSubParts > kNumLastSubParts ? kNumFirstSubParts : kNumLastSubParts;
+    constexpr int kNumMaxSubParts = kNumShapedSubParts > kNumSubParts ? kNumShapedSubParts : kNumSubParts;
     const auto num_subs_of = [&](const int& part_idx) {
         if (kShapeFirstPart and part_idx == 0)
             return num_sub_parts_at<kNumFirstSubParts>(part_size(0));
