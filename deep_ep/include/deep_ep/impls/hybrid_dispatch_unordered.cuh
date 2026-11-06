@@ -298,6 +298,10 @@ hybrid_unordered_dispatch_impl(
     int* const mailbox = route_rank + kNumRouteInts;
 
     constexpr int kNumSlotsPerChannel = kNumParts * kBatchSize;
+    // The sender releases its local-bypass tail to the forward warp every this many tokens. On B300 the
+    // forwarders are the tail after the last byte, so they get the local tokens in blocks of 16 instead of
+    // one block of kBatchSize when the sender finishes.
+    constexpr int kLocalTailBatch = kDeviceArch == 103 ? 16 : kBatchSize;
     const auto part_size = [&](const int& part) {
         return part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(part);
     };
@@ -814,7 +818,7 @@ hybrid_unordered_dispatch_impl(
         };
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx == scaleout_rank_idx and
-                (stored_scaleout_tail >= stored_old_scaleout_tail + kBatchSize or finish_flag)) {
+                (stored_scaleout_tail >= stored_old_scaleout_tail + kLocalTailBatch or finish_flag)) {
                 const auto signaled_tail = math::pack2<int, int64_t>(finish_flag, stored_scaleout_tail);
                 const auto ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx);
                 const auto old_signaled_tail = math::pack2<int, int64_t>(0, stored_old_scaleout_tail);
