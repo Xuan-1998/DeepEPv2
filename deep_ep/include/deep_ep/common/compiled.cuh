@@ -70,6 +70,10 @@ __device__ __forceinline__ longlong4_t make_longlong4_t(
 #define EP_DEBUG_CHECKS 0
 #endif
 
+#ifndef EP_DEVICE_ARCH
+#define EP_DEVICE_ARCH 0
+#endif
+
 namespace deep_ep {
 
 #ifndef DISABLE_SM90_FEATURES
@@ -89,6 +93,10 @@ struct DebugCheckName {
     int bit;
 };
 constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}};
+
+// Compute capability of the device the JIT compiles for, times 10 (100 on B200, 103 on B300), passed by
+// `csrc/jit/compiler.hpp`. A build without it has 0 and keeps the shapes `__CUDA_ARCH__` selects.
+constexpr int kDeviceArch = EP_DEVICE_ARCH;
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };

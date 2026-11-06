@@ -58,13 +58,13 @@ static constexpr int kMinSubTokensDefault = (EP_MIN_SUB_TOKENS) > 1 ? (EP_MIN_SU
 
 static constexpr int kMinTokensPerPart = (EP_MIN_TOKENS_PER_PART) > 1 ? (EP_MIN_TOKENS_PER_PART) : 1;
 
-template <int kNumSubParts, int kMinSubTokens = kMinSubTokensDefault>
+template <int kNumSubParts, int kMinSubTokens = kMinSubTokensDefault, bool kArchFloor = true>
 __device__ __host__ __forceinline__ int num_sub_parts_at(const int& part_tokens) {
     if constexpr (kNumSubParts <= 1) {
         return 1;
     } else {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-        constexpr int kArchMinSubTokens = (EP_SM100_MIN_SUB_TOKENS) > 1 ? (EP_SM100_MIN_SUB_TOKENS) : 1;
+        constexpr int kArchMinSubTokens = kArchFloor and (EP_SM100_MIN_SUB_TOKENS) > 1 ? (EP_SM100_MIN_SUB_TOKENS) : 1;
 #else
         constexpr int kArchMinSubTokens = 1;
 #endif
@@ -80,12 +80,12 @@ __device__ __host__ __forceinline__ int num_sub_parts_at(const int& part_tokens)
 
 // `kHalving`: every sub-part keeps one token and the remaining tokens split 2^(n-1) : ... : 2 : 1,
 // so the sizes halve from one sub-part to the next. Otherwise the split is uniform.
-template <int kNumSubParts, bool kHalving = false>
+template <int kNumSubParts, bool kHalving = false, int kMinSubTokens = kMinSubTokensDefault, bool kArchFloor = true>
 __device__ __host__ __forceinline__ int sub_part_size_at(const int& part_tokens, const int& sub) {
     if constexpr (kNumSubParts <= 1) {
         return part_tokens;
     } else {
-        const int num_subs = num_sub_parts_at<kNumSubParts>(part_tokens);
+        const int num_subs = num_sub_parts_at<kNumSubParts, kMinSubTokens, kArchFloor>(part_tokens);
         if constexpr (kHalving) {
             const int spare = part_tokens - num_subs;
             const int total = (1 << num_subs) - 1;
@@ -103,14 +103,14 @@ __device__ __host__ __forceinline__ int sub_part_size_at(const int& part_tokens,
     }
 }
 
-template <int kNumSubParts, bool kHalving = false>
+template <int kNumSubParts, bool kHalving = false, int kMinSubTokens = kMinSubTokensDefault, bool kArchFloor = true>
 __device__ __host__ __forceinline__ int sub_part_offset_at(const int& part_tokens, const int& sub) {
     if constexpr (kNumSubParts <= 1) {
         return 0;
     } else {
         int off = 0;
         for (int s = 0; s < sub; ++ s)
-            off += sub_part_size_at<kNumSubParts, kHalving>(part_tokens, s);
+            off += sub_part_size_at<kNumSubParts, kHalving, kMinSubTokens, kArchFloor>(part_tokens, s);
         return off;
     }
 }
@@ -306,29 +306,54 @@ hybrid_unordered_dispatch_impl(
     };
     // The last part lands at the end of the transfer: it splits into twice as many sub-puts with
     // halving sizes, so few tokens are left to forward after the last landing. SM100 keeps the
-    // uniform split, its sub-puts have a token floor.
+    // uniform split, its sub-puts have a token floor, except B200 (compute capability 10.0) in the flag-1
+    // shape (more than 4 channels per SM), where the sender has slack for the two extra put calls and the
+    // 4-token last sub-put shortens the tail. On B300 (10.3) every extra put call costs about 50 us, and
+    // both compile as sm_100f, so the gate is the device, not `__CUDA_ARCH__`.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-    constexpr bool kShapeLastPart = false;
+    constexpr bool kShapeLastPart = kDeviceArch == 100 and kNumChannelsPerSM > 4;
+    constexpr int kNumFirstSubParts = kNumSubParts;
+    constexpr int kLastMinSubTokens = 4;
+    constexpr bool kLastArchFloor = false;
 #else
     constexpr bool kShapeLastPart = true;
+    constexpr int kNumFirstSubParts = 2 * kNumSubParts;
+    constexpr int kLastMinSubTokens = kMinSubTokensDefault;
+    constexpr bool kLastArchFloor = true;
 #endif
     constexpr int kNumLastSubParts = kShapeLastPart ? 2 * kNumSubParts : kNumSubParts;
-    constexpr int kNumMaxSubParts = kNumLastSubParts > kNumSubParts ? kNumLastSubParts : kNumSubParts;
+    constexpr int kNumMaxSubParts = kNumLastSubParts > kNumFirstSubParts ? kNumLastSubParts : kNumFirstSubParts;
+    // Only the sm_100 flag-1 shape cuts the last part differently from the first
+    constexpr bool kLastPartOwnShape = kShapeLastPart and kNumLastSubParts != kNumFirstSubParts;
     // Without a small first part (two parts per channel) the first part is cut the other way round,
     // in sub-puts of rising size, so the first put leaves after a few staged tokens.
     constexpr bool kShapeFirstPart = kNumParts >= 2 and
         part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
     const auto num_subs_of = [&](const int& part_idx) {
-        return (part_idx == kNumParts - 1 or (kShapeFirstPart and part_idx == 0))
-            ? num_sub_parts_at<kNumLastSubParts>(part_size(part_idx))
-            : num_sub_parts_at<kNumSubParts>(part_size(part_idx));
+        if constexpr (kLastPartOwnShape) {
+            if (part_idx == kNumParts - 1)
+                return num_sub_parts_at<kNumLastSubParts, kLastMinSubTokens, kLastArchFloor>(part_size(part_idx));
+            return (kShapeFirstPart and part_idx == 0)
+                ? num_sub_parts_at<kNumFirstSubParts>(part_size(part_idx))
+                : num_sub_parts_at<kNumSubParts>(part_size(part_idx));
+        } else {
+            return (part_idx == kNumParts - 1 or (kShapeFirstPart and part_idx == 0))
+                ? num_sub_parts_at<kNumLastSubParts>(part_size(part_idx))
+                : num_sub_parts_at<kNumSubParts>(part_size(part_idx));
+        }
     };
     const auto sub_size_of = [&](const int& part_idx, const int& sub_idx) {
         if (kShapeFirstPart and part_idx == 0)
-            return sub_part_size_at<kNumLastSubParts, true>(
-                part_size(0), num_sub_parts_at<kNumLastSubParts>(part_size(0)) - 1 - sub_idx);
-        return part_idx == kNumParts - 1 ? sub_part_size_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
-                                         : sub_part_size_at<kNumSubParts>(part_size(part_idx), sub_idx);
+            return sub_part_size_at<kNumFirstSubParts, true>(
+                part_size(0), num_sub_parts_at<kNumFirstSubParts>(part_size(0)) - 1 - sub_idx);
+        if constexpr (kLastPartOwnShape) {
+            return part_idx == kNumParts - 1
+                ? sub_part_size_at<kNumLastSubParts, kShapeLastPart, kLastMinSubTokens, kLastArchFloor>(part_size(part_idx), sub_idx)
+                : sub_part_size_at<kNumSubParts>(part_size(part_idx), sub_idx);
+        } else {
+            return part_idx == kNumParts - 1 ? sub_part_size_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
+                                             : sub_part_size_at<kNumSubParts>(part_size(part_idx), sub_idx);
+        }
     };
     // First slot of sub-part `sub_idx` within part `part_idx` (slots inside a sub-part are
     // filled contiguously from here; its in-band header lives in this slot's header word).
@@ -339,9 +364,16 @@ hybrid_unordered_dispatch_impl(
                 off += sub_size_of(0, s);
             return off;
         }
-        return part_first_slot(part_idx) +
-            (part_idx == kNumParts - 1 ? sub_part_offset_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
-                                       : sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx));
+        if constexpr (kLastPartOwnShape) {
+            return part_first_slot(part_idx) +
+                (part_idx == kNumParts - 1
+                     ? sub_part_offset_at<kNumLastSubParts, kShapeLastPart, kLastMinSubTokens, kLastArchFloor>(part_size(part_idx), sub_idx)
+                     : sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx));
+        } else {
+            return part_first_slot(part_idx) +
+                (part_idx == kNumParts - 1 ? sub_part_offset_at<kNumLastSubParts, kShapeLastPart>(part_size(part_idx), sub_idx)
+                                           : sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx));
+        }
     };
     // Per-(channel, part) counting-signal id, shared by the sender and forward sides of the
     // channel this warp serves (both sides reduce to the same channel warp index).
@@ -1158,7 +1190,7 @@ hybrid_unordered_dispatch_impl(
         // sends the remote-source rows back over the network. A rising first part reaches the forwarder in small
         // pieces, so there a local turn may run at most `kPaceSlack` rows ahead of the mean remote source while a
         // remote source still sends
-        constexpr bool kPaceLocalTurns = kShapeFirstPart and kNumLastSubParts > kNumSubParts;
+        constexpr bool kPaceLocalTurns = kShapeFirstPart and kNumFirstSubParts > kNumSubParts;
         constexpr int kPaceSlack = 12, kPaceMinTurn = 8;
         int num_local_recorded = 0, num_remote_recorded = 0;
         // The headers of the remote sources are zero only once the entry flag is open
