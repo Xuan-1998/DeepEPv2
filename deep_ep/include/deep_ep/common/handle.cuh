@@ -8,6 +8,8 @@
 
 namespace deep_ep::elastic::handle {
 
+constexpr bool kGinThreadPut = NCCL_VERSION_CODE >= NCCL_VERSION(2, 32, 5);
+
 struct NCCLGin {
 #define IS_TEAM_WORLD(code) if constexpr (std::is_same_v<team_t, ncclTeamTagWorld>) { code }
 #define IS_TEAM_LSA(code) if constexpr (std::is_same_v<team_t, ncclTeamTagLsa>) { code }
