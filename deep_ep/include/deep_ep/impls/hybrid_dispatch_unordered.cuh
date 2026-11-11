@@ -581,6 +581,11 @@ hybrid_unordered_dispatch_impl(
                 stored_flushed_subs = sub_idx + 1;
             }
         };
+        const auto guarded_flush_part = [&](const bool& ready, const int& up_to, const bool& is_final) {
+            comm::guarded_post<kNumTimeoutCycles>(ready and lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx,
+                                                  [&] { flush_part(up_to, is_final); },
+                                                  "hybrid dispatch send", scaleout_rank_idx, scaleup_rank_idx);
+        };
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx == scaleout_rank_idx and
                 (stored_scaleout_tail >= stored_old_scaleout_tail + kBatchSize or finish_flag)) {
@@ -779,8 +784,11 @@ hybrid_unordered_dispatch_impl(
             // Preload the next token (overlapping with the scale-out put issues)
             preload_next_token(token_idx + kNumChannels);
 
-            if (stored_flushed_parts < kNumParts and
-                stored_scaleout_tail >= coalesce_flushed + cur_sub_size()) {
+            const bool sub_part_ready = stored_flushed_parts < kNumParts and
+                                        stored_scaleout_tail >= coalesce_flushed + cur_sub_size();
+            if constexpr (kGuardGinPosts) {
+                guarded_flush_part(sub_part_ready, stored_scaleout_tail, /*is_final=*/is_last_sub_put());
+            } else if (sub_part_ready) {
                 flush_part(stored_scaleout_tail, /*is_final=*/is_last_sub_put());
             }
             __syncwarp();
@@ -789,7 +797,11 @@ hybrid_unordered_dispatch_impl(
             update_scaleout_tail();
         }
 
-        if (stored_scaleout_tail > coalesce_flushed) {
+        if constexpr (kGuardGinPosts) {
+            const bool has_tail = stored_scaleout_tail > coalesce_flushed;
+            const bool has_final_put = has_tail or stored_flushed_parts < kNumParts;
+            guarded_flush_part(has_final_put, has_tail ? stored_scaleout_tail : coalesce_flushed, /*is_final=*/true);
+        } else if (stored_scaleout_tail > coalesce_flushed) {
             flush_part(stored_scaleout_tail, /*is_final=*/true);
         } else if (stored_flushed_parts < kNumParts) {
             flush_part(coalesce_flushed, /*is_final=*/true);
