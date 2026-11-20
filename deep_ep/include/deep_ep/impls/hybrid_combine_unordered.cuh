@@ -11,12 +11,8 @@
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-<<<<<<< HEAD
-#include <deep_ep/common/comm.cuh>
-#include <deep_ep/common/diag_gin.cuh>
-=======
 #include <deep_ep/common/comm_unordered.cuh>
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
+#include <deep_ep/common/diag_gin.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/layout_unordered.cuh>
 #include <deep_ep/common/math.cuh>
@@ -136,7 +132,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // it runs the scale-up leg, and a flush on it delays that leg. The grid sync at the start of the
     // entry barrier makes all the SMs wait for the flushes.
     if (sm_idx > 0)
-        comm::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
+        comm::unordered::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
             nccl_dev_comm, nccl_dev_comm.ginContextCount, (sm_idx - 1) * (kNumThreads / 32) + warp_idx);
 
     // Debug check: the GIN signals must be in the expected state before the entry barrier
@@ -884,14 +880,6 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if (gin_put_ops == 0)
                         __nanosleep(1000);
                 }
-<<<<<<< HEAD
-=======
-
-                #pragma unroll
-                for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
-                    comm::unordered::flush_with_timeout<kNumTimeoutCycles>(
-                        gin_ctx[forward_warp_idx].gin, ncclCoopThread());
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
             }
             __syncwarp();
         } else {
@@ -932,11 +920,6 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
                     ++ tail;
                 }
-<<<<<<< HEAD
-=======
-
-                comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread());
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
             }
         }
     }

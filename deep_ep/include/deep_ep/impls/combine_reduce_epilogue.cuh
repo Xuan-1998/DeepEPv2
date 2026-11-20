@@ -1,7 +1,6 @@
 #pragma once
 
 #include <deep_ep/common/compiled.cuh>
-#include <deep_ep/common/diag.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/common/layout.cuh>
 
@@ -17,14 +16,6 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kHidden,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
-<<<<<<< HEAD
-          int kNumChannels,
-          int kDebugChecks,
-          // Ordered (upstream) recv layout: partials live at `token_idx` per rank buffer
-          // instead of the unordered per-(channel, slot) map.
-          bool kOrderedLayout = false,
-=======
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
           int kNumThreads = kNumWarps * 32,
           int kNumHiddenBytes = kHidden * sizeof(nv_bfloat16),
           int kNumRanks = kNumScaleoutRanks == 1 ? kNumScaleupRanks : kNumScaleoutRanks,
@@ -124,18 +115,6 @@ combine_reduce_epilogue_impl(nv_bfloat16* combined_x,
         );
         ptx::tma_store_fence();
         __syncwarp();
-
-        // Debug check. The reduced token is in shared memory now. Scan it before the store
-        if constexpr (kDebugChecks & kDebugCheckTokens) {
-            const auto scan = diag::scan_nonfinite<kNumHiddenBytes, diag::kPayloadBF16>(tma_buffer.get_base_ptr(), lane_idx);
-            if (scan.num_bad > 0 and ptx::elect_one_sync()) {
-                EP_DIAG_REPORT("DeepEP debug check: non-finite token in combine, rank: %d, token: %d/%d, "
-                               "sources: %d, bad elements: %d/%d, first bad: %d (bits 0x%x)\n",
-                               scaleout_rank_idx * kNumScaleupRanks + scaleup_rank_idx, token_idx, num_combined_tokens,
-                               __popc(reduce_valid_mask), scan.num_bad, kHidden, scan.first_bad_idx, scan.first_bad_bits);
-            }
-            __syncwarp();
-        }
 
         // Issue TMA copy
         if (ptx::elect_one_sync()) {

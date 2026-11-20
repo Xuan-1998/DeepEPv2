@@ -20,6 +20,7 @@
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
 #include "dispatch_unordered.hpp"
+#include "kernel_select.hpp"
 
 namespace deep_ep::elastic {
 
@@ -104,12 +105,8 @@ public:
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles,
-<<<<<<< HEAD
-                args.gin_indexed_signals_cnt,
+                args.unordered->gin_indexed_signals_cnt,
                 args.debug_checks);
-=======
-                args.unordered->gin_indexed_signals_cnt);
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
         }
 
         return fmt::format(R"(

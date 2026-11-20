@@ -275,7 +275,7 @@ hybrid_unordered_dispatch_impl(
     // the previous kernel can use a different QP count. SM 0 does not flush, as in the hybrid barrier:
     // it runs the scale-up leg, and a flush on it delays that leg.
     if (sm_idx > 0)
-        comm::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
+        comm::unordered::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
             nccl_dev_comm, nccl_dev_comm.ginContextCount, (sm_idx - 1) * (kNumThreads / 32) + warp_idx);
 
     // Each SM flushes only some of the contexts, and the header zeroing below writes `buffer` before
@@ -299,17 +299,12 @@ hybrid_unordered_dispatch_impl(
         ptx::fence_release_sys();
     }
 
-<<<<<<< HEAD
     // Debug check: the GIN signals must be in the expected state before the entry barrier
     if constexpr (kDebugChecks & kDebugCheckTokenSync)
         diag::check_gin_signals(nccl_dev_comm, sm_idx * kNumThreads + thread_idx, kNumSMs * kNumThreads);
 
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
-=======
     comm::unordered::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                                  kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 
     // Init TMA for scale-out and forward warps
@@ -547,11 +542,6 @@ hybrid_unordered_dispatch_impl(
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
-<<<<<<< HEAD
-=======
-
-            comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
@@ -824,12 +814,6 @@ hybrid_unordered_dispatch_impl(
 
         // Flush unflushed tails
         update_scaleout_tail(true);
-<<<<<<< HEAD
-=======
-
-        comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
-
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;

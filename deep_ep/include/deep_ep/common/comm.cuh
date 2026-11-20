@@ -53,61 +53,6 @@ __device__ __forceinline__ void timeout_while(const func_t& func, const int64_t&
     timeout_while<kNumTimeoutCycles, func_t>(true, func, start_clock);
 }
 
-<<<<<<< HEAD
-template <int64_t kNumTimeoutCycles, typename gin_t, typename coop_t>
-__device__ __forceinline__ void flush_with_timeout(const gin_t& gin, const coop_t& coop) {
-    if (gin.flush(coop, cuda::memory_order_acquire, ncclGin_None{},
-                  static_cast<uint64_t>(kNumTimeoutCycles)) != ncclSuccess) {
-        if constexpr (kReportGinQueue) {
-            // Name the context and give the other warps' timeout reports a second to print before the trap
-            printf("DeepEP Gin flush timeout, sm: %d, thread: %d, ctx: %d\n",
-                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x), static_cast<int>(gin.contextId));
-            const auto stop = clock64() + kNumOneSecCycles;
-            while (clock64() < stop) {}
-        } else {
-            printf("DeepEP Gin flush timeout, sm: %d, thread: %d\n",
-                   static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x));
-        }
-        ptx::trap();
-    }
-}
-
-// Flush the Gin contexts [0, num_contexts), one warp per context, spread over `kNumWorkers` warps
-template <int kNumWorkers, int64_t kNumTimeoutCycles>
-__device__ __forceinline__ void flush_gin_contexts(const ncclDevComm_t& nccl_dev_comm,
-                                                   const int& num_contexts, const int& worker_idx) {
-    for (int i = worker_idx; i < num_contexts; i += kNumWorkers)
-        flush_with_timeout<kNumTimeoutCycles>(ncclGin(nccl_dev_comm, i), ncclCoopWarp());
-}
-
-// With the `queue` check on, a timed flush after a network-wait timeout tells whether this rank's NIC still
-// holds writes. Compiled out otherwise, since the inlined flush changes the register allocation of the kernels.
-__device__ __forceinline__ void report_gin_queue(const ncclGin& gin,
-                                                 const int& scaleout_rank_idx, const int& scaleup_rank_idx) {
-    if constexpr (kReportGinQueue) {
-        const auto mask = __activemask();
-        if (threadIdx.x % 32 == __ffs(mask) - 1) {
-            const bool drained = gin.flush(ncclCoopThread(), cuda::memory_order_acquire, ncclGin_None{},
-                                           static_cast<uint64_t>(kNumOneSecCycles / 10)) == ncclSuccess;
-            printf("DeepEP GIN queue state, scale-out: %d, scale-up: %d, sm: %d, thread: %d, ctx: %d, NIC drained: %d\n",
-                   scaleout_rank_idx, scaleup_rank_idx, static_cast<int>(blockIdx.x), static_cast<int>(threadIdx.x),
-                   static_cast<int>(gin.contextId), static_cast<int>(drained));
-        }
-        __syncwarp(mask);
-    }
-}
-
-// Channels map onto QPs with a BALANCED CONTIGUOUS (block) partition: fill a QP with
-// consecutive channels before spilling to the next (so an SM's channels stay grouped
-// on the same GIN context), and when the channels do not divide the QPs evenly,
-// spread the remainder one-per-QP across the leading QPs instead of leaving a
-// trailing QP idle. Used by all callers (dispatch, hybrid_dispatch, combine,
-// hybrid_combine). The integer partition lives in `qp_mapping.cuh` (host-testable);
-// this wrapper only adds the NCCL resource-sharing mode.
-//   e.g. 48 channels / 4 QPs  -> {12,12,12,12}  (even; identical to before)
-//        4  channels / 3 QPs  -> QP0<-2, QP1<-1, QP2<-1  (was {2,2,0}, QP2 idle)
-=======
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
 template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM, bool kWithNotifyWarps = false>
 __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mode(
     const int& sm_idx, const int& channel_in_sm_idx, const bool& is_notify_warp = false) {
@@ -197,13 +142,9 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
 
     // Flush all QPs by all SMs (only needed for release semantics)
     if constexpr (kFlushStores) {
-<<<<<<< HEAD
-        flush_gin_contexts<kNumSMs * kNumWarps, kNumTimeoutCycles>(nccl_dev_comm, num_qps, global_warp_idx);
-=======
         for (int i = global_warp_idx; i < num_qps; i += kNumSMs * kNumWarps) {
             ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA).flush(ncclCoopWarp());
         }
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
 
         // World-team barriers may mix direct NVLink writes with GIN signals, so a system-scope
         // threadfence is required to make the NVLink writes visible before publishing the barrier

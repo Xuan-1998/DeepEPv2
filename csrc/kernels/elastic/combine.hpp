@@ -20,6 +20,7 @@
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
 #include "combine_unordered.hpp"
+#include "kernel_select.hpp"
 
 namespace deep_ep::elastic {
 
@@ -73,15 +74,9 @@ public:
                                     args.num_topk,
                                     args.num_qps, args.num_timeout_cycles);
         } else {
-<<<<<<< HEAD
-            header_name = args.use_ordered_kernel ? "hybrid_combine" : "hybrid_combine_unordered";
-            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>",
-                                    args.use_ordered_kernel ? "hybrid_combine_impl" : "hybrid_unordered_combine_impl",
-=======
             header_name = args.unordered.has_value() ? "hybrid_combine_unordered" : "hybrid_combine";
-            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>",
                                     args.unordered.has_value() ? "hybrid_unordered_combine_impl" : "hybrid_combine_impl",
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
                                     args.num_scaleup_warps, args.num_forward_warps,
@@ -92,7 +87,7 @@ public:
                                     args.num_topk,
                                     args.num_qps,
                                     args.num_timeout_cycles,
-                                    args.use_ordered_kernel ? std::string() : fmt::format(", {}", args.debug_checks));
+                                    args.unordered.has_value() ? fmt::format(", {}", args.debug_checks) : std::string());
         }
         return fmt::format(R"(
 #include <deep_ep/impls/{}.cuh>
@@ -256,11 +251,7 @@ public:
         int hidden;
         int num_max_tokens_per_rank;
         int num_experts, num_topk;
-<<<<<<< HEAD
-        int num_channels;
         int debug_checks;
-=======
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
 
         // Parameters
         nv_bfloat16* combined_x;
@@ -283,11 +274,7 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-<<<<<<< HEAD
-    auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>);
-=======
     auto ptr = reinterpret_cast<void*>(&combine_reduce_epilogue_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>);
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
 }}
 )",                        args.unordered.has_value() ? "combine_reduce_epilogue_unordered.cuh" : "combine_reduce_epilogue.cuh",
                            args.use_expanded_layout, args.allow_multiple_reduction,
@@ -297,13 +284,9 @@ static void __instantiate_kernel() {{
                            args.hidden,
                            args.num_max_tokens_per_rank,
                            args.num_experts, args.num_topk,
-<<<<<<< HEAD
-                           args.num_channels,
-                           args.debug_checks,
-                           args.use_ordered_kernel);
-=======
-                           args.unordered.has_value() ? fmt::format(", {}", args.unordered->num_channels) : "");
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
+                           args.unordered.has_value()
+                               ? fmt::format(", {}, {}", args.unordered->num_channels, args.debug_checks)
+                               : "");
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -358,11 +341,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk,
-<<<<<<< HEAD
-        .num_channels = num_channels,
         .debug_checks = get_debug_check_mask(),
-=======
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
         .combined_x = static_cast<nv_bfloat16*>(combined_x),
         .combined_topk_weights = combined_topk_weights,
         .combined_topk_idx = combined_topk_idx,

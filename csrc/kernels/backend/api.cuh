@@ -91,13 +91,8 @@ public:
     // RDMA service level, passed to NCCL as the GIN traffic class
     int sl_idx;
     int num_allocated_qps;
-<<<<<<< HEAD
-    // Zero-initialized: the GIN block never writes it on a single NVLink domain
-    elastic::gin_alloc::GinResourceConfig gin_config{};
-=======
     bool use_unordered_hybrid_kernel;
     elastic::gin_alloc::GinResourceConfig gin_config_unordered = {};
->>>>>>> 9f86f31 (refactor(hybrid): move the unordered EP communication kernels into a separate path)
 
     // Buffer size
     int64_t num_gpu_bytes;
