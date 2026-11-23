@@ -131,6 +131,11 @@ __forceinline__ __device__ void tma_store_wait() {
     asm volatile("cp.async.bulk.wait_group %0;" ::"n"(kNumRemainingWaits) : "memory");
 }
 
+template <int kNumRemainingWaits = 0>
+__forceinline__ __device__ void tma_store_wait_read() {
+    asm volatile("cp.async.bulk.wait_group.read %0;" ::"n"(kNumRemainingWaits) : "memory");
+}
+
 enum TMACacheHint: int64_t {
     kEvictFirst = 0x12f0000000000000ll,
     kEvictNormal = 0x1000000000000000ll
