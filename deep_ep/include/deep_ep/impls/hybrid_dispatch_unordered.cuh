@@ -250,6 +250,7 @@ hybrid_unordered_dispatch_impl(
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
     constexpr int kNumExpertsPerScaleout = kNumExperts / kNumScaleoutRanks;
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
+    EP_STATIC_ASSERT(kNumExperts <= 32767, "Scale-out tokens carry 16-bit expert indices");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
     EP_STATIC_ASSERT(kNumParts <= layout::WorkspaceLayout::kNumMaxParts,
@@ -291,7 +292,8 @@ hybrid_unordered_dispatch_impl(
 
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
     const auto scaleout_token_layout = layout::TokenLayout(
-        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true);
+        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true,
+        /*compact_scaleout=*/true);
     constexpr int kNumFwdBuffers = kDoubleBufferForward ? kNumDispatchFwdBuffers : 1;
     const auto tma_pool = layout::BufferLayout<true>(
         token_layout, kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps, 1,
@@ -716,6 +718,10 @@ hybrid_unordered_dispatch_impl(
             __syncwarp();
         };
 
+        const auto staged_token = layout::TokenLayout(
+            kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, tma_buffer.get_base_ptr(),
+            /*with_scaleout_hdr=*/true, /*compact_scaleout=*/true);
+
         // Preload next token
         const auto preload_next_token = [&](const int& token_idx) {
             if (token_idx >= num_tokens)
@@ -761,9 +767,9 @@ hybrid_unordered_dispatch_impl(
                 const auto dst_expert_idx = static_cast<int>(uncasted_dst_expert_idx);
                 stored_dst_scaleout_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerScaleout : -1;
                 stored_dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
-                tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
+                staged_token.get_scaleout_topk_idx_ptr()[lane_idx] = static_cast<int16_t>(dst_expert_idx);
                 if (topk_weights != nullptr)
-                    tma_buffer.get_topk_weights_ptr()[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
+                    staged_token.get_topk_weights_ptr()[lane_idx] = __ldg(topk_weights + token_idx * kNumTopk + lane_idx);
                 if (copied_topk_idx != nullptr)
                     copied_topk_idx[token_idx * kNumTopk + lane_idx] = uncasted_dst_expert_idx;
             }
@@ -771,7 +777,7 @@ hybrid_unordered_dispatch_impl(
 
             // Add source metadata (rank index and token index)
             if (ptx::elect_one_sync())
-                *tma_buffer.get_src_token_global_idx_ptr() = rank_idx * kNumMaxTokensPerRank + token_idx;
+                *staged_token.get_src_token_global_idx_ptr() = rank_idx * kNumMaxTokensPerRank + token_idx;
             ptx::tma_store_fence();
             __syncwarp();
 
@@ -883,14 +889,14 @@ hybrid_unordered_dispatch_impl(
                 auto send_ch = scaleout_send_buffer.get_rank_buffer(stored_dst_scaleout_rank_idx)
                                    .get_channel_buffer<kNumSlotsPerChannel>(channel_idx);
                 ptx::tma_store_1d(send_ch.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                                  tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                                  tma_buffer.get_base_ptr(), scaleout_token_layout.get_num_bytes<false>());
             }
             __syncwarp();
 
             // Local rank can be bypassed
             if (stored_dst_slot_idx >= 0 and stored_dst_scaleout_rank_idx == scaleout_rank_idx) {
                 ptx::tma_store_1d(scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                                  tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                                  tma_buffer.get_base_ptr(), scaleout_token_layout.get_num_bytes<false>());
             }
             ptx::tma_store_commit();
             ptx::tma_store_wait();
@@ -1092,8 +1098,8 @@ hybrid_unordered_dispatch_impl(
                 const auto tb = recv_buffer.get_token_buffer(slot);
                 if (ptx::elect_one_sync()) {
                     ptx::tma_load_1d(fwd_bufs[b].get_base_ptr(), tb.get_base_ptr(),
-                                     fwd_mbs[b], token_layout.get_num_bytes<false>());
-                    ptx::mbarrier_arrive_and_set_tx(fwd_mbs[b], token_layout.get_num_bytes<false>());
+                                     fwd_mbs[b], scaleout_token_layout.get_num_bytes<false>());
+                    ptx::mbarrier_arrive_and_set_tx(fwd_mbs[b], scaleout_token_layout.get_num_bytes<false>());
                 }
                 __syncwarp();
             };
@@ -1133,7 +1139,24 @@ hybrid_unordered_dispatch_impl(
                 // Read top-k indices
                 EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
                 int stored_dst_scaleup_rank_idx = -1;
-                auto dst_expert_idx = lane_idx < kNumTopk ? tma_buffer.get_topk_idx_ptr()[lane_idx] : -1;
+                const auto received = layout::TokenLayout(
+                    kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, tma_buffer.get_base_ptr(), true, true);
+                int dst_expert_idx = -1;
+                float topk_weight = 0;
+                if (lane_idx < kNumTopk) {
+                    dst_expert_idx = received.get_scaleout_topk_idx_ptr()[lane_idx];
+                    topk_weight = received.get_topk_weights_ptr()[lane_idx];
+                }
+                const int src_token_global_idx = *received.get_src_token_global_idx_ptr();
+                __syncwarp();
+                if (lane_idx < kNumTopk) {
+                    tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
+                    tma_buffer.get_topk_weights_ptr()[lane_idx] = topk_weight;
+                }
+                if (lane_idx == 0)
+                    *tma_buffer.get_src_token_global_idx_ptr() = src_token_global_idx;
+                ptx::tma_store_fence();
+                __syncwarp();
                 dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout;
                 stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
                     dst_expert_idx / kNumExpertsPerRank : -1;
