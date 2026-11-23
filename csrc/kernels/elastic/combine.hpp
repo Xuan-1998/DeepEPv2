@@ -20,6 +20,7 @@
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
 #include "combine_unordered.hpp"
+#include "kernel_select.hpp"
 
 namespace deep_ep::elastic {
 
@@ -37,6 +38,7 @@ public:
         int num_topk;
         int num_qps;
         int64_t num_timeout_cycles;
+        int debug_checks;
 
         // Parameters
         nv_bfloat16* x;
@@ -73,7 +75,7 @@ public:
                                     args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = args.unordered.has_value() ? "hybrid_combine_unordered" : "hybrid_combine";
-            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+            func_name = fmt::format("{}<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}{}>",
                                     args.unordered.has_value() ? "hybrid_unordered_combine_impl" : "hybrid_combine_impl",
                                     args.use_expanded_layout, args.allow_multiple_reduction,
                                     args.launch_args.grid_dim.first,
@@ -84,7 +86,8 @@ public:
                                     args.num_experts,
                                     args.num_topk,
                                     args.num_qps,
-                                    args.num_timeout_cycles);
+                                    args.num_timeout_cycles,
+                                    args.unordered.has_value() ? fmt::format(", {}", args.debug_checks) : std::string());
         }
         return fmt::format(R"(
 #include <deep_ep/impls/{}.cuh>
@@ -205,6 +208,7 @@ static void* launch_combine(void* x,
         .num_experts = num_experts,
         .num_topk = num_topk,
         .num_qps = num_qps, .num_timeout_cycles = num_timeout_cycles,
+        .debug_checks = get_debug_check_mask(),
         .x = static_cast<nv_bfloat16*>(x),
         .topk_weights = static_cast<float*>(topk_weights),
         .src_metadata = src_metadata,
@@ -247,6 +251,7 @@ public:
         int hidden;
         int num_max_tokens_per_rank;
         int num_experts, num_topk;
+        int debug_checks;
 
         // Parameters
         nv_bfloat16* combined_x;
@@ -279,7 +284,9 @@ static void __instantiate_kernel() {{
                            args.hidden,
                            args.num_max_tokens_per_rank,
                            args.num_experts, args.num_topk,
-                           args.unordered.has_value() ? fmt::format(", {}", args.unordered->num_channels) : "");
+                           args.unordered.has_value()
+                               ? fmt::format(", {}, {}", args.unordered->num_channels, args.debug_checks)
+                               : "");
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -334,6 +341,7 @@ static void launch_combine_reduce_epilogue(void* combined_x,
         .hidden = hidden,
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .num_experts = num_experts, .num_topk = num_topk,
+        .debug_checks = get_debug_check_mask(),
         .combined_x = static_cast<nv_bfloat16*>(combined_x),
         .combined_topk_weights = combined_topk_weights,
         .combined_topk_idx = combined_topk_idx,

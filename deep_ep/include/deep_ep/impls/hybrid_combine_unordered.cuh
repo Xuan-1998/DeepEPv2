@@ -12,6 +12,7 @@
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <deep_ep/common/comm_unordered.cuh>
+#include <deep_ep/common/diag_gin.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/layout_unordered.cuh>
 #include <deep_ep/common/math.cuh>
@@ -29,6 +30,7 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
           int kNumQPs, int64_t kNumTimeoutCycles,
+          int kDebugChecks,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumScaleupUpdateInterval = 3,
           int kBatchSize = 12,
@@ -124,6 +126,18 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     const auto [qp_idx, sharing_mode] =
         comm::unordered::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+
+    // Flush the previous kernel's puts before this kernel writes `buffer`. Flush all the contexts, as
+    // the previous kernel can use a different QP count. SM 0 does not flush, as in the hybrid barrier:
+    // it runs the scale-up leg, and a flush on it delays that leg. The grid sync at the start of the
+    // entry barrier makes all the SMs wait for the flushes.
+    if (sm_idx > 0)
+        comm::unordered::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
+            nccl_dev_comm, nccl_dev_comm.ginContextCount, (sm_idx - 1) * (kNumThreads / 32) + warp_idx);
+
+    // Debug check: the GIN signals must be in the expected state before the entry barrier
+    if constexpr (kDebugChecks & kDebugCheckTokenSync)
+        diag::check_gin_signals(nccl_dev_comm, sm_idx * kNumThreads + thread_idx, kNumSMs * kNumThreads);
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
@@ -866,11 +880,6 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if (gin_put_ops == 0)
                         __nanosleep(1000);
                 }
-
-                #pragma unroll
-                for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
-                    comm::unordered::flush_with_timeout<kNumTimeoutCycles>(
-                        gin_ctx[forward_warp_idx].gin, ncclCoopThread());
             }
             __syncwarp();
         } else {
@@ -911,8 +920,6 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
                     ++ tail;
                 }
-
-                comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread());
             }
         }
     }

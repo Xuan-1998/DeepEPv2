@@ -19,16 +19,16 @@
 
 namespace deep_ep::elastic {
 
-// `EP_HYBRID_KERNEL` selects the hybrid (scale-out) kernels: "ordered" (default) assumes in-order
-// delivery and uses GIN strong signals, "unordered" does not and uses GIN weak signals
+// `EP_HYBRID_KERNEL` selects the hybrid (scale-out) kernels: "unordered" (default) does not assume
+// in-order delivery and uses GIN weak signals, "ordered" does and uses GIN strong signals
 inline bool use_unordered_hybrid_kernel() {
     static const bool unordered = [] {
         const auto value = get_env<std::string>("EP_HYBRID_KERNEL");
-        bool result = false;
-        if (value.empty() or value == "ordered") {
-            result = false;
-        } else if (value == "unordered") {
+        bool result = true;
+        if (value.empty() or value == "unordered") {
             result = true;
+        } else if (value == "ordered") {
+            result = false;
         } else {
             EP_HOST_ASSERT(false and "EP_HYBRID_KERNEL must be `ordered` or `unordered`");
         }
@@ -37,6 +37,13 @@ inline bool use_unordered_hybrid_kernel() {
         return result;
     }();
     return unordered;
+}
+
+// The mask of `EP_DEBUG_CHECKS` (see `deep_ep/common/compiled.cuh`), read once per process. The JIT
+// generators pass it to the kernels as the template argument `kDebugChecks`
+static int get_debug_check_mask() {
+    static const int mask = get_debug_checks();
+    return mask;
 }
 
 } // namespace deep_ep::elastic

@@ -77,7 +77,8 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
                                                        const int64_t& num_bytes, const int64_t& num_cpu_bytes,
                                                        const bool& allow_hybrid_mode,
                                                        const int& sl_idx, const int& num_allocated_qps):
-    rank_idx(rank_idx), num_ranks(num_ranks), num_allocated_qps(num_allocated_qps),
+    rank_idx(rank_idx), num_ranks(num_ranks),
+    allow_hybrid_mode(allow_hybrid_mode), sl_idx(sl_idx), num_allocated_qps(num_allocated_qps),
     use_unordered_hybrid_kernel(allow_hybrid_mode and elastic::use_unordered_hybrid_kernel()) {
     int nccl_runtime_version;
     NCCL_CHECK(ncclGetVersion(&nccl_runtime_version));
@@ -93,38 +94,14 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
     if (get_env<int>("EP_BUFFER_DEBUG"))
         printf("EP NCCL device communicator has %d allocated QPs\n", num_allocated_qps);
 
-    // Initialize NCCL device communicator
-    ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
-    NCCL_CHECK(ncclCommQueryProperties(comm, &props));
-    ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
-    if (num_ranks > 1 and get_env("EP_DISABLE_GIN", 0) == 0) {
-        EP_HOST_ASSERT(
-            (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
-            "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
-            "such as `allow_hybrid_mode=0` (disable direct RDMA kernels) in multi-plane network.");
-
-        reqs.ginContextCount = num_allocated_qps;
-        reqs.ginExclusiveContexts = true;
-        reqs.ginQueueDepth = kGinQPDepth;
-        reqs.ginTrafficClass = sl_idx;
-        // Customized RDMA barrier needs extra signals
-        reqs.ginSignalCount = num_ranks + 2 * 2;
-        reqs.ginConnectionType = allow_hybrid_mode ? NCCL_GIN_CONNECTION_RAIL: NCCL_GIN_CONNECTION_FULL;
-    }
-    if (use_unordered_hybrid_kernel) {
-        gin_config_unordered = elastic::configure_unordered_gin(comm, reqs, num_ranks,
-                                                                num_ranks > 1 and get_env("EP_DISABLE_GIN", 0) == 0,
-                                                                this->num_allocated_qps);
-    }
-#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
-    reqs.useRuntimeVersion = true;
-    dev_comm.ptr = malloc(props.devCommRuntimeVersionSize);
-#else
-    EP_HOST_ASSERT(NCCL_VERSION_CODE == nccl_runtime_version and "Prior to NCCL 2.31, NCCL compile-time and runtime versions must be the same. Please re-compile DeepEP.");
-    dev_comm.ptr = malloc(sizeof(ncclDevComm_t));
-#endif
-    EP_HOST_ASSERT(dev_comm.ptr != nullptr);
-    NCCL_CHECK(ncclDevCommCreate(comm, &reqs, static_cast<ncclDevComm_t*>(dev_comm.ptr)));
+    // GIN is only needed when a peer is unreachable over NVLink. The rail team size is
+    // that test in both modes: hybrid sets `num_scaleup_ranks = num_nvl_ranks`, and
+    // direct has `num_ranks = num_nvl_ranks * num_rail_ranks`. PP and Engram issue GIN
+    // even inside one NVLink domain, so there they create `gin_dev_comm` on first use.
+    const bool ep_needs_gin = ncclTeamRail(comm).nRanks > 1;
+    create_dev_comm(dev_comm, ep_needs_gin);
+    if (ep_needs_gin)
+        gin_dev_comm = dev_comm;
 
     // Now we know the NVLink domain size
     ncclTeam_t lsaTeam = ncclTeamLsa(comm);
@@ -166,6 +143,58 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         NCCL_CHECK(ncclGetLsaDevicePointer(window, 0, i, &nvl_window_ptrs[i]));
 }
 
+void NCCLSymmetricMemoryContext::create_dev_comm(jit::NoRefPtr& out, const bool& with_gin) {
+    if (out.ptr != nullptr)
+        return;
+
+    // NOTES: a second call (for `gin_dev_comm`) only happens when the constructor skipped
+    // GIN, so `gin_config_unordered` has no signal budget and `num_allocated_qps` was at most
+    // resolved from 0 to its default, which the GIN block maps to itself. Both therefore end
+    // up with the values the constructor produced before the gate existed.
+
+    const bool gin_disabled = get_env("EP_DISABLE_GIN", 0) != 0;
+
+    // Initialize NCCL device communicator
+    ncclCommProperties props = NCCL_COMM_PROPERTIES_INITIALIZER;
+    NCCL_CHECK(ncclCommQueryProperties(comm, &props));
+    ncclDevCommRequirements_t reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    if (with_gin and not gin_disabled) {
+        EP_HOST_ASSERT(
+            (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
+            "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
+            "such as `allow_hybrid_mode=0` (disable direct RDMA kernels) in multi-plane network.");
+
+        // Direct mode and the ordered hybrid kernels give each QP its own exclusive GIN context
+        reqs.ginContextCount = num_allocated_qps;
+        reqs.ginExclusiveContexts = true;
+        reqs.ginQueueDepth = kGinQPDepth;
+        reqs.ginTrafficClass = sl_idx;
+        // Customized RDMA barrier needs extra signals
+        reqs.ginSignalCount = num_ranks + 2 * 2;
+        reqs.ginConnectionType = allow_hybrid_mode ? NCCL_GIN_CONNECTION_RAIL: NCCL_GIN_CONNECTION_FULL;
+    }
+    if (use_unordered_hybrid_kernel) {
+        gin_config_unordered = elastic::configure_unordered_gin(comm, reqs, num_ranks, with_gin and not gin_disabled,
+                                                                this->num_allocated_qps);
+    }
+
+    // With no GIN contexts provisioned the value is unused, but it still has to be in range
+    if (this->num_allocated_qps == 0)
+        this->num_allocated_qps = elastic::gin_alloc::kDefaultGinContextCnt;
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
+    reqs.useRuntimeVersion = true;
+    out.ptr = malloc(props.devCommRuntimeVersionSize);
+#else
+    int nccl_runtime_version;
+    NCCL_CHECK(ncclGetVersion(&nccl_runtime_version));
+    EP_HOST_ASSERT(NCCL_VERSION_CODE == nccl_runtime_version and "Prior to NCCL 2.31, NCCL compile-time and runtime versions must be the same. Please re-compile DeepEP.");
+    out.ptr = malloc(sizeof(ncclDevComm_t));
+#endif
+    EP_HOST_ASSERT(out.ptr != nullptr);
+    NCCL_CHECK(ncclDevCommCreate(comm, &reqs, static_cast<ncclDevComm_t*>(out.ptr)));
+}
+
 void* NCCLSymmetricMemoryContext::get_sym_ptr(void* ptr, const int& dst_rank_idx) const {
     const auto offset = static_cast<uint8_t*>(ptr) - static_cast<uint8_t*>(mapped_window_ptr);
     return static_cast<uint8_t*>(nvl_window_ptrs[dst_rank_idx]) + offset;
@@ -176,7 +205,11 @@ void NCCLSymmetricMemoryContext::finalize() {
     NCCL_CHECK(ncclCommWindowDeregister(comm, window));
     symmetric_memory.reset();
 
-    // Destroy device communicator
+    // Destroy device communicators
+    if (gin_dev_comm.ptr != nullptr and gin_dev_comm.ptr != dev_comm.ptr) {
+        NCCL_CHECK(ncclDevCommDestroy(comm, static_cast<ncclDevComm_t*>(gin_dev_comm.ptr)));
+        free(gin_dev_comm.ptr);
+    }
     NCCL_CHECK(ncclDevCommDestroy(comm, static_cast<ncclDevComm_t*>(dev_comm.ptr)));
     free(dev_comm.ptr);
 }

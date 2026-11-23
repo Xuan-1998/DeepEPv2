@@ -49,12 +49,15 @@ static gin_alloc::GinResourceConfig configure_unordered_gin(const ncclComm_t& co
     EP_HOST_ASSERT(num_ranks == ncclTeamLsa(comm).nRanks * num_rdma_ranks);
 
     const ncclDevCommRequirements_t default_reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
+    // The unordered kernels share each GIN context between the SMs and channels mapped to its QP
     reqs.ginContextCount = ctx;
     reqs.ginExclusiveContexts = false;
     if (num_rdma_ranks > 1) {
         gin_config = gin_alloc::make_gin_resources(ctx);
+        // One indexed signal per channel and token part of the scale-out layout
         reqs.ginSignalCount = gin_config.gin_indexed_signals_cnt;
     } else {
+        // No scale-out peer: only PP and Engram request GIN here, and NCCL's default count serves them
         reqs.ginSignalCount = default_reqs.ginSignalCount;
     }
     EP_HOST_ASSERT(gin_config.gin_indexed_signals_cnt >= (num_rdma_ranks - 1) and
@@ -62,6 +65,7 @@ static gin_alloc::GinResourceConfig configure_unordered_gin(const ncclComm_t& co
                    "signal; reduce num_allocated_qps to raise the per-context signal count");
 
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 2)
+    // The unordered kernels only count signal arrivals, so they need neither VA nor strong signals
     reqs.ginVaSignalsRequired = false;
     reqs.ginStrongSignalsRequired = false;
 #endif

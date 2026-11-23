@@ -13,6 +13,7 @@
 
 #include <deep_ep/common/comm_unordered.cuh>
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/diag_gin.cuh>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/gin_resource_alloc_unordered.cuh>
 #include <deep_ep/common/layout.cuh>
@@ -145,6 +146,7 @@ template <bool kDoCPUSync,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumGinSignals,
+          int kDebugChecks,
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumChannelsPerSM = kNumScaleoutWarps,
           int kNumChannels = kNumScaleoutWarps * kNumSMs,
@@ -269,6 +271,17 @@ hybrid_unordered_dispatch_impl(
     auto scaleout_recv_buffer = layout::BufferLayoutUnordered<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
+    // Flush the previous kernel's puts before this kernel writes `buffer`. Flush all the contexts, as
+    // the previous kernel can use a different QP count. SM 0 does not flush, as in the hybrid barrier:
+    // it runs the scale-up leg, and a flush on it delays that leg.
+    if (sm_idx > 0)
+        comm::unordered::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
+            nccl_dev_comm, nccl_dev_comm.ginContextCount, (sm_idx - 1) * (kNumThreads / 32) + warp_idx);
+
+    // Each SM flushes only some of the contexts, and the header zeroing below writes `buffer` before
+    // the entry barrier. Thus all the SMs must finish their flushes before any SM writes.
+    cooperative_groups::this_grid().sync();
+
     // Zero the in-band headers of the remote sources before the entry barrier. The header words
     // live in `buffer`, which the combine and other kernels also write between two dispatches, so
     // they hold arbitrary data here. No remote sender writes them before it passes the barrier.
@@ -285,6 +298,10 @@ hybrid_unordered_dispatch_impl(
         }
         ptx::fence_release_sys();
     }
+
+    // Debug check: the GIN signals must be in the expected state before the entry barrier
+    if constexpr (kDebugChecks & kDebugCheckTokenSync)
+        diag::check_gin_signals(nccl_dev_comm, sm_idx * kNumThreads + thread_idx, kNumSMs * kNumThreads);
 
     comm::unordered::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                                  kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
@@ -525,8 +542,6 @@ hybrid_unordered_dispatch_impl(
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
-
-            comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
@@ -799,9 +814,6 @@ hybrid_unordered_dispatch_impl(
 
         // Flush unflushed tails
         update_scaleout_tail(true);
-
-        comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
-
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
