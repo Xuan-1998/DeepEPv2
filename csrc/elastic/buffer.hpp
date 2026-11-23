@@ -952,7 +952,9 @@ public:
                    static_cast<int64_t>(2 * num_channels_per_sm) *
                            combine_token_layout.get_num_bytes<true, int64_t>() +
                        elastic::ProxyRingLayout::get_num_bytes(num_channels_per_sm,
-                                                               elastic::kProxyRingDepthDefault) >
+                                                               elastic::kProxyRingDepthDefault) +
+                       static_cast<int64_t>(num_channels_per_sm) *
+                           elastic::kCombineHelperWordsPerForwardWarp * sizeof(int) >
                    num_smem_bytes)
                 -- num_channels_per_sm;
             EP_HOST_ASSERT(num_channels_per_sm >= 1 and
