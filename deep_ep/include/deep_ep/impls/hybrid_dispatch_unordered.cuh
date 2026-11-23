@@ -1073,7 +1073,7 @@ hybrid_unordered_dispatch_impl(
                     }
                     __syncwarp();
                 };
-                ptx::tma_store_wait();
+                ptx::tma_store_wait_read();
                 __syncwarp();
                 issue_help_load(0, fwd_share);
                 for (int i = fwd_share; i < num_chunk_tokens; ++ i) {
@@ -1087,7 +1087,7 @@ hybrid_unordered_dispatch_impl(
                     __syncwarp();
                     if constexpr (kHelperDoubleBuffer) {
                         if (i + 1 < num_chunk_tokens) {
-                            ptx::tma_store_wait();
+                            ptx::tma_store_wait_read();
                             __syncwarp();
                             issue_help_load(cur ^ 1, i + 1);
                         }
@@ -1096,7 +1096,7 @@ hybrid_unordered_dispatch_impl(
                                   chunk_dst_slot_idx_ptr + i * kNumTopk, i == num_chunk_tokens - 1);
                     if constexpr (not kHelperDoubleBuffer) {
                         if (i + 1 < num_chunk_tokens) {
-                            ptx::tma_store_wait();
+                            ptx::tma_store_wait_read();
                             __syncwarp();
                             issue_help_load(0, i + 1);
                         }
@@ -1166,6 +1166,7 @@ hybrid_unordered_dispatch_impl(
         int stored_terminal_sub = -1;
         int anomaly_part = -1, anomaly_num_valid = 0;
         bool anomaly_detected = false;
+        int poll_start_part = 0;
         int num_posted_chunks = 0;
         wait_entry();
         uint32_t wip_mask;
@@ -1195,8 +1196,11 @@ hybrid_unordered_dispatch_impl(
                 bool prefix_alive = is_remote_src;
                 bool my_finished = false;
                 int missing_part = -1, missing_num_valid = 0, missing_landed = 0;
+                int first_open_part = kNumParts;
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
+                    if (k < poll_start_part)
+                        continue;
                     const int64_t landed = ptx::exchange(
                         comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
 
@@ -1241,9 +1245,17 @@ hybrid_unordered_dispatch_impl(
                             stored_terminal_part = k;
                             stored_terminal_sub = s;
                         }
+                        if (prefix_alive and not through and first_open_part == kNumParts)
+                            first_open_part = k;
                         prefix_alive = through;
                     }
+
+                    if (not __any_sync(0xffffffffu, prefix_alive))
+                        break;
                 }
+                const bool src_done = my_finished or stored_finish_flag > 0;
+                poll_start_part = __reduce_min_sync(0xffffffffu,
+                    (is_remote_src and not src_done) ? first_open_part : kNumParts);
                 if (is_local_src) {
                     stored_finish_flag       = intended_finish;
                     stored_scaleout_tail_idx = intended_tail;
@@ -1298,7 +1310,7 @@ hybrid_unordered_dispatch_impl(
             };
 
             if constexpr (kChunkRouting) {
-                ptx::tma_store_wait();
+                ptx::tma_store_wait_read();
                 __syncwarp();
                 if (start_slot_idx < end_slot_idx)
                     issue_fwd_load(0, start_slot_idx);
@@ -1431,13 +1443,13 @@ hybrid_unordered_dispatch_impl(
                         __syncwarp();
 
                         if (slot_idx + 1 < fwd_end_slot_idx) {
-                            ptx::tma_store_wait();
+                            ptx::tma_store_wait_read();
                             __syncwarp();
                             issue_fwd_load(cur ^ 1, slot_idx + 1);
                         }
                     } else {
                         if (slot_idx > start_slot_idx) {
-                            ptx::tma_store_wait();
+                            ptx::tma_store_wait_read();
                             __syncwarp();
                             issue_fwd_load(0, slot_idx);
                         }
@@ -1453,7 +1465,7 @@ hybrid_unordered_dispatch_impl(
                 (is_local ? num_local_processed : num_tokens_processed) += num_chunk_tokens;
             } else {
                 if constexpr (kDoubleBufferForward) {
-                    ptx::tma_store_wait();
+                    ptx::tma_store_wait_read();
                     __syncwarp();
                     if (start_slot_idx < end_slot_idx)
                         issue_fwd_load(0, start_slot_idx);
@@ -1470,13 +1482,13 @@ hybrid_unordered_dispatch_impl(
                         __syncwarp();
 
                         if (slot_idx + 1 < end_slot_idx) {
-                            ptx::tma_store_wait();
+                            ptx::tma_store_wait_read();
                             __syncwarp();
                             issue_fwd_load(cur ^ 1, slot_idx + 1);
                         }
                     } else {
                         // Original single-buffer path: load this slot synchronously.
-                        ptx::tma_store_wait();
+                        ptx::tma_store_wait_read();
                         __syncwarp();
                         issue_fwd_load(0, slot_idx);
                         if (ptx::elect_one_sync())
@@ -1614,6 +1626,8 @@ hybrid_unordered_dispatch_impl(
         __syncwarp();
 
         EP_STATIC_ASSERT(kNumParts <= 32, "One lane drains one part");
+        int drain_expected = 0;
+        int64_t drain_base = 0;
         #pragma unroll
         for (int k = 0; k < kNumParts; ++ k) {
             const int num_subs_k = Tail::kActive ? Tail::num_subs(k) : num_sub_parts_at<kNumSubParts>(part_size(k));
@@ -1621,23 +1635,25 @@ hybrid_unordered_dispatch_impl(
                                 : stored_terminal_part == k ? stored_terminal_sub + 1
                                                             : 0;
             const int expected_k = ptx::reduce_add(my_subs_k);
-            if (lane_idx == k and expected_k > 0) {
-                comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
-                    const int64_t landed =
-                        comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]);
-                    if (landed >= static_cast<int64_t>(expected_k))
-                        return true;
-                    if (is_last_check) {
-                        printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, scale-out: %d, scale-up: %d, "
-                               "channel: %d, part: %d, landed: %lld, expected: %d\n",
-                               scaleout_rank_idx, scaleup_rank_idx, channel_idx, k, (long long)landed, expected_k);
-                        comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
-                    }
-                    return false;
-                });
-                gin.gin.increaseSignalShadow(part_signal_id(k), static_cast<uint64_t>(expected_k));
-            }
+            drain_expected = lane_idx == k ? expected_k : drain_expected;
+            drain_base = lane_idx == k ? rx_part_base[k] : drain_base;
         }
+        const bool drains = lane_idx < kNumParts and drain_expected > 0;
+        comm::timeout_while<kNumTimeoutCycles>(drains, [&](const bool& is_last_check) {
+            const int64_t landed = comm::signal_delta(
+                gin.gin.readSignal(part_signal_id(lane_idx), 64, cuda::memory_order_relaxed), drain_base);
+            if (landed >= static_cast<int64_t>(drain_expected))
+                return true;
+            if (is_last_check) {
+                printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, "
+                       "channel: %d, part: %d, landed: %lld, expected: %d\n",
+                       channel_idx, lane_idx, (long long)landed, drain_expected);
+                comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+            }
+            return false;
+        });
+        if (drains)
+            gin.gin.increaseSignalShadow(part_signal_id(lane_idx), static_cast<uint64_t>(drain_expected));
         __syncwarp();
 
         if (lane_idx < kNumScaleoutRanks)
