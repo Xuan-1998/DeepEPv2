@@ -344,34 +344,67 @@ hybrid_unordered_dispatch_impl(
         comm::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
             nccl_dev_comm, nccl_dev_comm.ginContextCount, (sm_idx - 1) * (kNumThreads / 32) + warp_idx);
 
-    // Each SM flushes only some of the contexts, and the header zeroing below writes `buffer` before
-    // the entry barrier. Thus all the SMs must finish their flushes before any SM writes.
-    cooperative_groups::this_grid().sync();
-
-    // Zero the in-band headers of the remote sources before the entry barrier. The header words
-    // live in `buffer`, which the combine and other kernels also write between two dispatches, so
-    // they hold arbitrary data here. No remote sender writes them before it passes the barrier.
-    // The release fence orders the zeros before the barrier signal below, which is what lets the
-    // peers start putting into these slots. Nothing here reads what a peer wrote, so release is enough.
-    if (is_forward_warp and lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
-        const auto src_buffer = scaleout_recv_buffer
-            .get_channel_buffer<kNumSlotsPerChannel>(sm_idx * kNumChannelsPerSM + fwd_warp_idx)
-            .get_rank_buffer(lane_idx);
-        #pragma unroll
-        for (int k = 0; k < kNumParts; ++ k) {
-            for (int s = 0; s < (Tail::kActive ? Tail::num_subs(k) : num_sub_parts_at<kNumSubParts>(part_size(k))); ++ s)
-                *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
-        }
-        ptx::fence_release_sys();
-    }
-
     // Debug check: the GIN signals must be in the expected state before the entry barrier
     if constexpr (kDebugChecks & kDebugCheckTokenSync)
         diag::check_gin_signals(nccl_dev_comm, sm_idx * kNumThreads + thread_idx, kNumSMs * kNumThreads);
 
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    // Each SM flushes only some of the contexts, and the header zeroing below writes `buffer` before
+    // the entry barrier. Thus all the SMs must finish their flushes before any SM writes.
+    cooperative_groups::this_grid().sync();
+
+    constexpr int kEntryOpen = 1;
+    const auto entry_flag_ptr = workspace_layout.get_dispatch_entry_flag_ptr();
+    const auto wait_entry = [&]() {
+        comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+            if (ptx::ld_acquire_sys<int>(entry_flag_ptr) == kEntryOpen)
+                return true;
+            if (is_last_check and lane_idx == 0) {
+                printf("DeepEP hybrid dispatch (entry flag) timeout, scale-out: %d, scale-up: %d, "
+                       "sm: %d, warp: %d, flag: %d\n",
+                       scaleout_rank_idx, scaleup_rank_idx, sm_idx, warp_idx,
+                       ptx::ld_acquire_sys<int>(entry_flag_ptr));
+            }
+            return false;
+        });
+    };
+    if (sm_idx == 0 and warp_idx == kNumNotifyWarps + kNumScaleoutWarps) {
+        // Zero the in-band headers of the remote sources before the entry barrier. The header words
+        // live in `buffer`, which the combine and other kernels also write between two dispatches, so
+        // they hold arbitrary data here. No remote sender writes them before it passes the barrier.
+        // The release fence orders the zeros before the barrier signal below, which is what lets the
+        // peers start putting into these slots. Nothing here reads what a peer wrote, so release is enough.
+        if constexpr (kNumScaleoutRanks > 1) {
+            for (int i = lane_idx; i < kNumChannels * kNumScaleoutRanks; i += 32) {
+                const int src_rank = i % kNumScaleoutRanks;
+                if (src_rank == scaleout_rank_idx)
+                    continue;
+                const auto src_buffer = scaleout_recv_buffer
+                    .get_channel_buffer<kNumSlotsPerChannel>(i / kNumScaleoutRanks)
+                    .get_rank_buffer(src_rank);
+                #pragma unroll
+                for (int k = 0; k < kNumParts; ++ k) {
+                    for (int s = 0; s < (Tail::kActive ? Tail::num_subs(k) : num_sub_parts_at<kNumSubParts>(part_size(k))); ++ s)
+                        *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
+                }
+            }
+            ptx::fence_release_sys();
+        }
+        __syncwarp();
+        if constexpr (kNumScaleupRanks > 1) {
+            comm::nvlink_barrier_warp<kNumScaleupRanks, kNumScaleupRanksPerLane, kNumTimeoutCycles,
+                                      comm::kHybridDispatchTag0>(
+                gin, workspace_layout, scaleup_rank_idx, lane_idx);
+        }
+        if constexpr (kNumScaleoutRanks > 1) {
+            comm::gin_barrier_wo_local_sync<kNumScaleoutRanks, 1, 32, kNumQPs, kNumTimeoutCycles,
+                                            ncclTeamTagRail, comm::kHybridDispatchTag0, false>(
+                gin.nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, 0, lane_idx);
+        }
+        __syncwarp();
+        if (lane_idx == 0)
+            ptx::st_release_sys(entry_flag_ptr, kEntryOpen);
+        __syncwarp();
+    }
 
     // Init TMA for scale-out and forward warps
     ptx::arrival_phase phase = 0;
@@ -452,6 +485,8 @@ hybrid_unordered_dispatch_impl(
                 });
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+
+            wait_entry();
 
             // Issue scaleout writes to peers
             EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
@@ -628,6 +663,8 @@ hybrid_unordered_dispatch_impl(
         int coalesce_flushed = 0;
         int stored_flushed_parts = 0;
         int stored_flushed_subs = 0;
+        bool entry_open = false;
+        const bool is_remote_dst = lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx;
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
             return Tail::kActive ? Tail::sub_size(p, stored_flushed_subs)
@@ -639,7 +676,7 @@ hybrid_unordered_dispatch_impl(
             return stored_flushed_subs + 1 >=
                 (Tail::kActive ? Tail::num_subs(kNumParts - 1) : num_sub_parts_at<kNumSubParts>(part_size(kNumParts - 1)));
         };
-        const auto flush_part = [&](const int& up_to, const bool& is_final) {
+        const auto flush_part = [&](const int& up_to, const bool& is_final) __attribute__((always_inline)) {
             if (lane_idx >= kNumScaleoutRanks or lane_idx == scaleout_rank_idx)
                 return;
             const int part_idx = stored_flushed_parts;
@@ -862,9 +899,12 @@ hybrid_unordered_dispatch_impl(
             // Preload the next token (overlapping with the scale-out put issues)
             preload_next_token(token_idx + kNumChannels);
 
-            if (stored_flushed_parts < kNumParts and
-                stored_scaleout_tail >= coalesce_flushed + cur_sub_size()) {
-                flush_part(stored_scaleout_tail, /*is_final=*/is_last_sub_put());
+            if (not entry_open)
+                entry_open = ptx::exchange(static_cast<int>(ptx::ld_acquire_sys<int>(entry_flag_ptr) == kEntryOpen), 0) != 0;
+            if (entry_open) {
+                while (is_remote_dst and stored_flushed_parts < kNumParts and
+                       stored_scaleout_tail >= coalesce_flushed + cur_sub_size())
+                    flush_part(coalesce_flushed + cur_sub_size(), /*is_final=*/is_last_sub_put());
             }
             __syncwarp();
 
@@ -872,6 +912,10 @@ hybrid_unordered_dispatch_impl(
             update_scaleout_tail();
         }
 
+        wait_entry();
+        while (is_remote_dst and stored_flushed_parts < kNumParts and
+               stored_scaleout_tail >= coalesce_flushed + cur_sub_size())
+            flush_part(coalesce_flushed + cur_sub_size(), /*is_final=*/is_last_sub_put());
         if (stored_scaleout_tail > coalesce_flushed) {
             flush_part(stored_scaleout_tail, /*is_final=*/true);
         } else if (stored_flushed_parts < kNumParts) {
@@ -924,6 +968,7 @@ hybrid_unordered_dispatch_impl(
         int stored_terminal_sub = -1;
         int anomaly_part = -1, anomaly_num_valid = 0;
         bool anomaly_detected = false;
+        wait_entry();
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
             // Pick next rank in round-robin
@@ -1236,6 +1281,8 @@ hybrid_unordered_dispatch_impl(
     EP_STATIC_ASSERT(kNumScaleupRanks <= kNumThreads, "Insufficient threads");
     if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumScaleupRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+    if (sm_idx == 0 and thread_idx == 0)
+        *entry_flag_ptr = 0;
 }
 
 }  // namespace deep_ep::elastic
