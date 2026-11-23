@@ -277,34 +277,84 @@ hybrid_unordered_dispatch_impl(
         comm::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
             nccl_dev_comm, nccl_dev_comm.ginContextCount, (sm_idx - 1) * (kNumThreads / 32) + warp_idx);
 
-    // Each SM flushes only some of the contexts, and the header zeroing below writes `buffer` before
-    // the entry barrier. Thus all the SMs must finish their flushes before any SM writes.
-    cooperative_groups::this_grid().sync();
-
-    // Zero the in-band headers of the remote sources before the entry barrier. The header words
-    // live in `buffer`, which the combine and other kernels also write between two dispatches, so
-    // they hold arbitrary data here. No remote sender writes them before it passes the barrier.
-    // The release fence orders the zeros before the barrier signal below, which is what lets the
-    // peers start putting into these slots. Nothing here reads what a peer wrote, so release is enough.
-    if (is_forward_warp and lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
-        const auto src_buffer = scaleout_recv_buffer
-            .get_channel_buffer<kNumSlotsPerChannel>(sm_idx * kNumChannelsPerSM + fwd_warp_idx)
-            .get_rank_buffer(lane_idx);
-        #pragma unroll
-        for (int k = 0; k < kNumParts; ++ k) {
-            for (int s = 0; s < num_sub_parts_at<kNumSubParts>(part_size(k)); ++ s)
-                *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
-        }
-        ptx::fence_release_sys();
-    }
-
     // Debug check: the GIN signals must be in the expected state before the entry barrier
     if constexpr (kDebugChecks & kDebugCheckTokenSync)
         diag::check_gin_signals(nccl_dev_comm, sm_idx * kNumThreads + thread_idx, kNumSMs * kNumThreads);
 
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
-        gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
+    // Each SM flushes only some of the contexts, and from here on the warps write `buffer` (header zeroing,
+    // token staging). Thus all the SMs must finish their flushes, and the check above, before any SM goes on.
+    cooperative_groups::this_grid().sync();
+
+    // The entry flag gates every write into a peer and every read of a header that a peer writes. One warp
+    // of SM 0 opens it once the headers are zeroed and both barriers are done, and SM 0 closes it at the
+    // kernel exit. Meanwhile the other warps count, stage their tokens and copy the local ones.
+    constexpr int kEntryOpen = 1;
+    const auto entry_flag_ptr = workspace_layout.get_dispatch_entry_flag_ptr();
+    const auto wait_entry = [&]() {
+        comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+            if (ptx::ld_acquire_sys<int>(entry_flag_ptr) == kEntryOpen)
+                return true;
+            if (is_last_check and lane_idx == 0) {
+                printf("DeepEP hybrid dispatch (entry flag) timeout, scale-out: %d, scale-up: %d, "
+                       "sm: %d, warp: %d, flag: %d\n",
+                       scaleout_rank_idx, scaleup_rank_idx, sm_idx, warp_idx,
+                       ptx::ld_acquire_sys<int>(entry_flag_ptr));
+            }
+            return false;
+        });
+    };
+    // With more than one remote node the rail barrier starts only after the NVLink one has completed, so it
+    // completes only after every GPU of every node has entered. Running the two in parallel there opens the
+    // flag earlier, but the nodes then start skewed and the next combine pays for it. With one remote node a
+    // second warp zeroes the headers and runs the rail barrier while the first runs the NVLink barrier.
+    constexpr int kEntryWarp = kNumNotifyWarps + kNumScaleoutWarps;
+    constexpr bool kSplitEntry = kNumScaleoutRanks == 2 and kNumScaleupRanks > 1 and kNumForwardWarps > 1;
+    constexpr int kEntryBarrierIndex = 2;
+    if (sm_idx == 0 and (warp_idx == kEntryWarp or (kSplitEntry and warp_idx == kEntryWarp + 1))) {
+        // Zero the in-band headers of the remote sources before the entry barrier. The header words
+        // live in `buffer`, which the combine and other kernels also write between two dispatches, so
+        // they hold arbitrary data here. No remote sender writes them before it passes the barrier.
+        // The release fence orders the zeros before the barrier signal below, which is what lets the
+        // peers start putting into these slots. Nothing here reads what a peer wrote, so release is enough.
+        if constexpr (kNumScaleoutRanks > 1) {
+            if (not kSplitEntry or warp_idx == kEntryWarp + 1) {
+                for (int i = lane_idx; i < kNumChannels * kNumScaleoutRanks; i += 32) {
+                    const int src_rank = i % kNumScaleoutRanks;
+                    if (src_rank == scaleout_rank_idx)
+                        continue;
+                    const auto src_buffer = scaleout_recv_buffer
+                        .get_channel_buffer<kNumSlotsPerChannel>(i / kNumScaleoutRanks)
+                        .get_rank_buffer(src_rank);
+                    #pragma unroll
+                    for (int k = 0; k < kNumParts; ++ k) {
+                        for (int s = 0; s < num_sub_parts_at<kNumSubParts>(part_size(k)); ++ s)
+                            *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
+                    }
+                }
+                ptx::fence_release_sys();
+            }
+        }
+        __syncwarp();
+        if constexpr (kNumScaleupRanks > 1) {
+            if (warp_idx == kEntryWarp) {
+                comm::nvlink_barrier_warp<kNumScaleupRanks, kNumTimeoutCycles, comm::kHybridDispatchTag0>(
+                    gin, workspace_layout, scaleup_rank_idx, lane_idx);
+            }
+        }
+        if constexpr (kNumScaleoutRanks > 1) {
+            if (not kSplitEntry or warp_idx == kEntryWarp + 1) {
+                comm::gin_barrier_wo_local_sync<kNumScaleoutRanks, 1, 32, kNumQPs, kNumTimeoutCycles,
+                                                ncclTeamTagRail, comm::kHybridDispatchTag0, false>(
+                    gin.nccl_dev_comm, scaleout_rank_idx, scaleup_rank_idx, 0, lane_idx);
+            }
+        }
+        if constexpr (kSplitEntry)
+            ptx::named_barrier<64>(kEntryBarrierIndex);
+        __syncwarp();
+        if (warp_idx == kEntryWarp and lane_idx == 0)
+            ptx::st_release_sys(entry_flag_ptr, kEntryOpen);
+        __syncwarp();
+    }
 
     // Init TMA for scale-out and forward warps
     ptx::arrival_phase phase = 0;
@@ -385,6 +435,10 @@ hybrid_unordered_dispatch_impl(
                 });
             }
             ptx::named_barrier<kNumNotifyThreads>(kNotifyBarrierIndex);
+
+            // Each peer's dispatch reads and clears the count slots written below, so the peer must have left
+            // its previous dispatch
+            wait_entry();
 
             // Issue scaleout writes to peers
             EP_STATIC_ASSERT(kReuseSlotIndices or kNumScaleoutRanks <= kNumNotifyThreads,
@@ -561,6 +615,8 @@ hybrid_unordered_dispatch_impl(
         int coalesce_flushed = 0;
         int stored_flushed_parts = 0;
         int stored_flushed_subs = 0;
+        bool entry_open = false;
+        const bool is_remote_dst = lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx;
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
             return sub_part_size_at<kNumSubParts>(part_size(p), stored_flushed_subs);
@@ -571,7 +627,7 @@ hybrid_unordered_dispatch_impl(
             return stored_flushed_subs + 1 >=
                 num_sub_parts_at<kNumSubParts>(part_size(kNumParts - 1));
         };
-        const auto flush_part = [&](const int& up_to, const bool& is_final) {
+        const auto flush_part = [&](const int& up_to, const bool& is_final) __attribute__((always_inline)) {
             if (lane_idx >= kNumScaleoutRanks or lane_idx == scaleout_rank_idx)
                 return;
             const int part_idx = stored_flushed_parts;
@@ -595,6 +651,13 @@ hybrid_unordered_dispatch_impl(
             } else {
                 stored_flushed_subs = sub_idx + 1;
             }
+        };
+        // A put carries one sub-part, because each sub-part has its own header slot and counts once on its
+        // part's signal. So the tokens staged before the entry opens leave as several puts, not one.
+        const auto flush_full_sub_parts = [&]() __attribute__((always_inline)) {
+            while (is_remote_dst and stored_flushed_parts < kNumParts and
+                   stored_scaleout_tail >= coalesce_flushed + cur_sub_size())
+                flush_part(coalesce_flushed + cur_sub_size(), /*is_final=*/is_last_sub_put());
         };
         const auto update_scaleout_tail = [&](const bool& finish_flag = false) {
             if (lane_idx == scaleout_rank_idx and
@@ -794,16 +857,19 @@ hybrid_unordered_dispatch_impl(
             // Preload the next token (overlapping with the scale-out put issues)
             preload_next_token(token_idx + kNumChannels);
 
-            if (stored_flushed_parts < kNumParts and
-                stored_scaleout_tail >= coalesce_flushed + cur_sub_size()) {
-                flush_part(stored_scaleout_tail, /*is_final=*/is_last_sub_put());
-            }
+            // Puts into a peer wait for the entry flag. Lane 0's read decides for the whole warp
+            if (not entry_open)
+                entry_open = ptx::exchange(ptx::ld_acquire_sys<int>(entry_flag_ptr), 0) == kEntryOpen;
+            if (entry_open)
+                flush_full_sub_parts();
             __syncwarp();
 
             // Issue scale-out tail update
             update_scaleout_tail();
         }
 
+        wait_entry();
+        flush_full_sub_parts();
         if (stored_scaleout_tail > coalesce_flushed) {
             flush_part(stored_scaleout_tail, /*is_final=*/true);
         } else if (stored_flushed_parts < kNumParts) {
@@ -817,6 +883,10 @@ hybrid_unordered_dispatch_impl(
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
         int64_t rx_part_base[kNumParts];
+        // Before the flag opens, the remote sources' headers may hold old data and the NVLink peers may not
+        // have entered. With one QP the part signals share context 0 with the rail barrier, so the
+        // shadows are read after it as well
+        wait_entry();
         #pragma unroll
         for (int p = 0; p < kNumParts; ++ p)
             rx_part_base[p] = static_cast<int64_t>(*gin.gin.getSignalShadowPtr(part_signal_id(p)));
@@ -1168,6 +1238,9 @@ hybrid_unordered_dispatch_impl(
     EP_STATIC_ASSERT(kNumScaleupRanks <= kNumThreads, "Insufficient threads");
     if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumScaleupRanks)
         workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+    // Close the entry flag for the next dispatch. Every warp has read it before the barrier above
+    if (sm_idx == 0 and thread_idx == 0)
+        *entry_flag_ptr = 0;
 }
 
 }  // namespace deep_ep::elastic
