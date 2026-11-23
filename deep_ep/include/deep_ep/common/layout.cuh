@@ -197,10 +197,11 @@ struct WorkspaceLayout {
 
 struct TokenLayout {
     int num_hidden_bytes, num_sf_bytes;
-    // NOTES: the top-k index is always 32-bit
+    // NOTES: the top-k index is always 32-bit, except in compact scale-out tokens (16-bit)
     bool with_metadata;
     // Per-token scale-out header present iff true. See kHdrBytes note below.
     bool with_scaleout_hdr;
+    bool compact_scaleout;
     int num_topk, num_metadata_bytes;
     void* base;
 
@@ -209,21 +210,25 @@ struct TokenLayout {
     __forceinline__ __device__ __host__
     TokenLayout(const int& num_hidden_bytes, const int& num_sf_bytes,
                 const int& num_topk, const bool& with_metadata,
-                void* base = nullptr, const bool& with_scaleout_hdr = false) :
+                void* base = nullptr, const bool& with_scaleout_hdr = false,
+                const bool& compact_scaleout = false) :
         num_hidden_bytes(num_hidden_bytes),
         num_sf_bytes(num_sf_bytes),
         with_metadata(with_metadata),
         with_scaleout_hdr(with_scaleout_hdr),
+        compact_scaleout(with_scaleout_hdr and compact_scaleout),
         num_topk(num_topk),
-        num_metadata_bytes((with_scaleout_hdr ? math::align<int>(hdrless_content_bytes(num_topk, with_metadata), sizeof(int64_t)) + kHdrBytes
+        num_metadata_bytes((with_scaleout_hdr ? math::align<int>(hdrless_content_bytes(num_topk, with_metadata, compact_scaleout), sizeof(int64_t)) + kHdrBytes
                                               : hdrless_content_bytes(num_topk, with_metadata))),
         base(base) {
         EP_STATIC_ASSERT(sizeof(int) == sizeof(float), "Invalid size assumption");
         EP_UNIFIED_ASSERT(num_hidden_bytes % ptx::kNumTMAAlignBytes == 0);
     }
 
-    __forceinline__ __device__ __host__ static int hdrless_content_bytes(const int& num_topk, const bool& with_metadata) {
-        return num_topk * (sizeof(int) + sizeof(float)) + (with_metadata ? (1 + num_topk) * sizeof(int) : 0);
+    __forceinline__ __device__ __host__ static int hdrless_content_bytes(const int& num_topk, const bool& with_metadata,
+                                                                         const bool is_scaleout = false) {
+        return num_topk * (static_cast<int>(is_scaleout ? sizeof(int16_t) : sizeof(int)) + sizeof(float)) +
+               (with_metadata ? (1 + (is_scaleout ? 0 : num_topk)) * sizeof(int) : 0);
     }
 
     template <bool kWithMBarrier, typename dtype_t = int>
@@ -259,8 +264,13 @@ struct TokenLayout {
         return get_metadata_ptr();
     }
 
+    __forceinline__ __device__ __host__ int16_t* get_scaleout_topk_idx_ptr() const {
+        return reinterpret_cast<int16_t*>(get_metadata_ptr());
+    }
+
     __forceinline__ __device__ __host__ float* get_topk_weights_ptr() const {
-        return math::advance_ptr<float>(get_topk_idx_ptr(), num_topk * sizeof(int));
+        return math::advance_ptr<float>(get_topk_idx_ptr(),
+                                        num_topk * static_cast<int>(compact_scaleout ? sizeof(int16_t) : sizeof(int)));
     }
 
     __forceinline__ __device__ __host__ int* get_src_token_global_idx_ptr() const {
@@ -272,7 +282,7 @@ struct TokenLayout {
     }
 
     __forceinline__ __device__ __host__ int64_t* get_hdr_ptr() const {
-        const int hdr_offset = math::align<int>(hdrless_content_bytes(num_topk, with_metadata), sizeof(int64_t));
+        const int hdr_offset = math::align<int>(hdrless_content_bytes(num_topk, with_metadata, compact_scaleout), sizeof(int64_t));
         return static_cast<int64_t*>(static_cast<void*>(
             math::advance_ptr<int8_t>(get_metadata_ptr(), hdr_offset)));
     }
@@ -341,7 +351,7 @@ struct BufferLayout {
         EP_UNIFIED_ASSERT(num_ranks == 1 or global);
         return TokenLayout(token_layout.num_hidden_bytes, token_layout.num_sf_bytes, token_layout.num_topk, token_layout.with_metadata,
                            static_cast<int8_t*>(base) + token_layout.get_num_bytes<kWithMBarrier, int64_t>() * token_idx,
-                           token_layout.with_scaleout_hdr);
+                           token_layout.with_scaleout_hdr, token_layout.compact_scaleout);
     }
 };
 
