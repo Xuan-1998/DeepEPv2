@@ -295,8 +295,32 @@ hybrid_unordered_dispatch_impl(
         kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true,
         /*compact_scaleout=*/true);
     constexpr int kNumFwdBuffers = kDoubleBufferForward ? kNumDispatchFwdBuffers : 1;
+
+    constexpr int kNumRouteTokens = kNumSlotsPerForwardChunk;
+    EP_STATIC_ASSERT(kNumRouteTokens <= 32, "One lane routes one token of a forward chunk");
+    constexpr int kNumRouteInts = math::constexpr_align(
+        kNumRouteTokens * (kNumTopk * 3 + kNumScaleupRanks) + kNumScaleupRanks * 2, 4);
+    constexpr int kNumMailboxInts = 16;
+    enum { kMbPosted = 0, kMbDone, kMbFwdDone, kMbReady, kMbNumTokens, kMbFwdShare, kMbMetadataStride, kMbPtrs = 8 };
+    constexpr int kNumSmemTokenBytes =
+        math::constexpr_align(kNumHiddenBytes, ptx::kNumTMAAlignBytes) +
+        math::constexpr_align(kNumSFPacks * static_cast<int>(sizeof(sf_pack_t)), ptx::kNumTMAAlignBytes) +
+        math::constexpr_align(kNumTopk * 8 + (1 + kNumTopk) * 4, ptx::kNumTMAAlignBytes) +
+        math::constexpr_align(static_cast<int>(sizeof(ptx::mbarrier)), ptx::kNumTMAAlignBytes);
+    constexpr int kNumMaxSmemBytes = 232448;
+    constexpr int kNumBasePoolBuffers = kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps;
+    constexpr int kNumRouteSmemBytes = kNumForwardWarps * (kNumRouteInts + kNumMailboxInts) * static_cast<int>(sizeof(int));
+    constexpr bool kChunkRouting =
+        kNumScaleoutRanks > 1 and
+        kNumSmemBytesForNotify + kNumBasePoolBuffers * kNumSmemTokenBytes + kNumRouteSmemBytes <= kNumMaxSmemBytes;
+    constexpr bool kHelperDoubleBuffer =
+        kChunkRouting and kDoubleBufferForward and
+        kNumSmemBytesForNotify + (kNumBasePoolBuffers + kNumScaleoutWarps) * kNumSmemTokenBytes + kNumRouteSmemBytes <=
+            kNumMaxSmemBytes;
+    constexpr int kNumPoolBuffers = kNumBasePoolBuffers + (kHelperDoubleBuffer ? kNumScaleoutWarps : 0);
+
     const auto tma_pool = layout::BufferLayout<true>(
-        token_layout, kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps, 1,
+        token_layout, kNumPoolBuffers, 1,
         math::advance_ptr<int>(smem, kNumSmemBytesForNotify));
     const bool is_forward_warp = warp_idx >= kNumNotifyWarps + kNumScaleoutWarps;
     const int fwd_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
@@ -305,7 +329,19 @@ hybrid_unordered_dispatch_impl(
         : (warp_idx - kNumNotifyWarps);
     const auto tma_buffer = tma_pool.get_rank_buffer(tma_pool_base).get_token_buffer(0);
     const auto tma_buffer_alt = tma_pool.get_rank_buffer(
-        tma_pool_base + (kDoubleBufferForward and is_forward_warp ? 1 : 0)).get_token_buffer(0);
+        kDoubleBufferForward and is_forward_warp ? tma_pool_base + 1 :
+        kHelperDoubleBuffer and not is_forward_warp ? kNumBasePoolBuffers + (warp_idx - kNumNotifyWarps) :
+        tma_pool_base).get_token_buffer(0);
+
+    const int chan_warp_idx = is_forward_warp ? fwd_warp_idx : (warp_idx >= kNumNotifyWarps ? warp_idx - kNumNotifyWarps : 0);
+    int* const route_rank = static_cast<int*>(tma_pool.get_buffer_end_ptr()) +
+        chan_warp_idx * (kNumRouteInts + kNumMailboxInts);
+    int* const route_slot = route_rank + kNumRouteTokens * kNumTopk;
+    int* const route_ll = route_slot + kNumRouteTokens * kNumTopk;
+    int* const route_prefix = route_ll + kNumRouteTokens * kNumTopk;
+    int* const route_base = route_prefix + kNumRouteTokens * kNumScaleupRanks;
+    int* const route_count = route_base + kNumScaleupRanks;
+    int* const mailbox = route_rank + kNumRouteInts;
 
     constexpr int kNumSlotsPerChannel = kNumParts * kBatchSize;
     const auto part_size = [&](const int& part) {
@@ -415,10 +451,74 @@ hybrid_unordered_dispatch_impl(
     const auto mbarrier_ptr_alt = tma_buffer_alt.get_mbarrier_ptr();
     if (warp_idx >= kNumNotifyWarps and ptx::elect_one_sync()) {
         ptx::mbarrier_init_with_fence(mbarrier_ptr, 1);
-        if (kDoubleBufferForward and is_forward_warp)
+        if ((kDoubleBufferForward and is_forward_warp) or (kHelperDoubleBuffer and not is_forward_warp))
             ptx::mbarrier_init_with_fence(mbarrier_ptr_alt, 1);
     }
-    __syncwarp();
+    if constexpr (kChunkRouting) {
+        if (warp_idx >= kNumNotifyWarps and not is_forward_warp and lane_idx < kNumMailboxInts)
+            mailbox[lane_idx] = 0;
+        __syncthreads();
+    } else {
+        __syncwarp();
+    }
+
+    const int fwd_channel_idx = sm_idx * kNumChannelsPerSM + chan_warp_idx;
+    const auto fwd_scaleup_buffer = scaleup_buffer.get_rank_buffer(scaleup_rank_idx);
+    const auto forward_token = [&](const layout::TokenLayout& fwd_token, const int& route_row,
+                                   int* metadata_ptr, int* dst_slot_idx_ptr, const bool& is_last)
+                                   __attribute__((always_inline)) {
+        EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
+        const auto received = layout::TokenLayout(
+            kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, fwd_token.get_base_ptr(), true, true);
+        const int route_idx = route_row * kNumTopk + lane_idx;
+        int dst_expert_idx = -1;
+        float topk_weight = 0;
+        int dst_scaleup_rank_idx = -1, dst_slot_idx = -1, linked_list_idx = -1;
+        if (lane_idx < kNumTopk) {
+            dst_expert_idx = received.get_scaleout_topk_idx_ptr()[lane_idx];
+            topk_weight = received.get_topk_weights_ptr()[lane_idx];
+            dst_scaleup_rank_idx = route_rank[route_idx];
+            dst_slot_idx = route_slot[route_idx];
+            linked_list_idx = route_ll[route_idx];
+        }
+        const int src_token_global_idx = *received.get_src_token_global_idx_ptr();
+        __syncwarp();
+        if (lane_idx < kNumTopk) {
+            fwd_token.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
+            fwd_token.get_topk_weights_ptr()[lane_idx] = topk_weight;
+            if constexpr (not kReuseSlotIndices) {
+                constexpr int kNumTokensInLinkedList = kNumMaxTokensPerChannel * kNumScaleoutRanks + 1;
+                fwd_token.get_linked_list_idx_ptr()[lane_idx] =
+                    fwd_channel_idx * (kNumTokensInLinkedList * kNumScaleupRanks) +
+                    linked_list_idx * kNumScaleupRanks + scaleup_rank_idx;
+            }
+        }
+        if (lane_idx == 0)
+            *fwd_token.get_src_token_global_idx_ptr() = src_token_global_idx;
+        ptx::tma_store_fence();
+        __syncwarp();
+
+        if (dst_slot_idx >= 0) {
+            const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
+                fwd_scaleup_buffer.get_token_buffer(dst_slot_idx).get_base_ptr(), dst_scaleup_rank_idx);
+            ptx::tma_store_1d(dst_ptr, fwd_token.get_base_ptr(), fwd_token.get_num_bytes<false>());
+            ptx::tma_store_commit();
+        }
+        __syncwarp();
+
+        if constexpr (not kReuseSlotIndices) {
+            if (ptx::elect_one_sync()) {
+                metadata_ptr[0] = src_token_global_idx;
+                metadata_ptr[1] = is_last;
+            }
+            if (lane_idx < kNumTopk) {
+                metadata_ptr[2 + lane_idx] = dst_scaleup_rank_idx;
+                metadata_ptr[2 + kNumTopk + lane_idx] = dst_slot_idx;
+                dst_slot_idx_ptr[lane_idx] = dst_slot_idx;
+            }
+        }
+        __syncwarp();
+    };
 
     // Different warp roles
     if (warp_idx < kNumNotifyWarps) {
@@ -931,6 +1031,98 @@ hybrid_unordered_dispatch_impl(
 
         // Flush unflushed tails
         update_scaleout_tail(true);
+
+        if constexpr (kChunkRouting) {
+            if (ptx::elect_one_sync())
+                ptx::st_release_cta(mailbox + kMbReady, 1);
+            __syncwarp();
+            int num_taken_chunks = 0;
+            while (true) {
+                int posted = 0;
+                if (lane_idx == 0) {
+                    comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                        const int fwd_done = ptx::ld_acquire_cta(mailbox + kMbFwdDone);
+                        posted = ptx::ld_acquire_cta(mailbox + kMbPosted);
+                        if (posted != num_taken_chunks or fwd_done != 0)
+                            return true;
+                        if (is_last_check)
+                            printf("DeepEP hybrid dispatch (forward helper wait) timeout, channel: %d, taken: %d\n",
+                                   channel_idx, num_taken_chunks);
+                        return false;
+                    });
+                }
+                posted = __shfl_sync(0xffffffffu, posted, 0);
+                __syncwarp();
+                if (posted == num_taken_chunks)
+                    break;
+
+                const int num_chunk_tokens = mailbox[kMbNumTokens];
+                const int fwd_share = mailbox[kMbFwdShare];
+                const int metadata_stride = mailbox[kMbMetadataStride];
+                const auto ptrs = reinterpret_cast<void* const*>(mailbox + kMbPtrs);
+                const auto src_token_ptr = static_cast<int8_t*>(ptrs[0]);
+                const auto chunk_metadata_ptr = static_cast<int*>(ptrs[1]);
+                const auto chunk_dst_slot_idx_ptr = static_cast<int*>(ptrs[2]);
+                const auto issue_help_load = [&](const int& b, const int& i) __attribute__((always_inline)) {
+                    if (ptx::elect_one_sync()) {
+                        const auto mb = b ? mbarrier_ptr_alt : mbarrier_ptr;
+                        ptx::tma_load_1d((b ? tma_buffer_alt : tma_buffer).get_base_ptr(),
+                                         src_token_ptr + static_cast<int64_t>(i) * scaleout_token_layout.get_num_bytes<false>(),
+                                         mb, scaleout_token_layout.get_num_bytes<false>());
+                        ptx::mbarrier_arrive_and_set_tx(mb, scaleout_token_layout.get_num_bytes<false>());
+                    }
+                    __syncwarp();
+                };
+                ptx::tma_store_wait();
+                __syncwarp();
+                issue_help_load(0, fwd_share);
+                for (int i = fwd_share; i < num_chunk_tokens; ++ i) {
+                    const int cur = kHelperDoubleBuffer ? (i - fwd_share) & 1 : 0;
+                    if (ptx::elect_one_sync()) {
+                        if (cur)
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr_alt, phase_alt);
+                        else
+                            ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                    }
+                    __syncwarp();
+                    if constexpr (kHelperDoubleBuffer) {
+                        if (i + 1 < num_chunk_tokens) {
+                            ptx::tma_store_wait();
+                            __syncwarp();
+                            issue_help_load(cur ^ 1, i + 1);
+                        }
+                    }
+                    forward_token(cur ? tma_buffer_alt : tma_buffer, i, chunk_metadata_ptr + i * metadata_stride,
+                                  chunk_dst_slot_idx_ptr + i * kNumTopk, i == num_chunk_tokens - 1);
+                    if constexpr (not kHelperDoubleBuffer) {
+                        if (i + 1 < num_chunk_tokens) {
+                            ptx::tma_store_wait();
+                            __syncwarp();
+                            issue_help_load(0, i + 1);
+                        }
+                    }
+                }
+                num_taken_chunks = posted;
+                __syncwarp();
+                if (ptx::elect_one_sync())
+                    ptx::st_release_cta(mailbox + kMbDone, num_taken_chunks);
+                __syncwarp();
+            }
+
+            if constexpr (kNumScaleupRanks > 1) {
+                ptx::tma_store_commit();
+                ptx::tma_store_wait();
+                __syncwarp();
+                #pragma unroll
+                for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                    if (const int i = j * 32 + lane_idx; i < kNumScaleupRanks) {
+                        ptx::red_add_rel_sys(gin.get_sym_ptr<ncclTeamTagLsa>(
+                            workspace_layout.get_dispatch_done_counter_ptr(scaleup_rank_idx), i), 1);
+                    }
+                }
+                __syncwarp();
+            }
+        }
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
@@ -974,6 +1166,7 @@ hybrid_unordered_dispatch_impl(
         int stored_terminal_sub = -1;
         int anomaly_part = -1, anomaly_num_valid = 0;
         bool anomaly_detected = false;
+        int num_posted_chunks = 0;
         wait_entry();
         uint32_t wip_mask;
         while ((wip_mask = ptx::gather(stored_scaleout_tail_idx > stored_scaleout_old_tail_idx or stored_finish_flag == 0))) {
@@ -1104,137 +1297,299 @@ hybrid_unordered_dispatch_impl(
                 __syncwarp();
             };
 
-            if constexpr (kDoubleBufferForward) {
+            if constexpr (kChunkRouting) {
                 ptx::tma_store_wait();
                 __syncwarp();
                 if (start_slot_idx < end_slot_idx)
                     issue_fwd_load(0, start_slot_idx);
-            }
 
-            for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx; ++ slot_idx) {
-                const int cur = (slot_idx - start_slot_idx) & 1;
-                const auto& tma_buffer = fwd_bufs[kDoubleBufferForward ? cur : 0];
+                if (num_posted_chunks > 0 and start_slot_idx < end_slot_idx) {
+                    if (ptx::elect_one_sync()) {
+                        comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                            if (ptx::ld_acquire_cta(mailbox + kMbDone) == num_posted_chunks)
+                                return true;
+                            if (is_last_check)
+                                printf("DeepEP hybrid dispatch (forward helper) timeout, channel: %d, posted: %d, done: %d\n",
+                                       channel_idx, num_posted_chunks, ptx::ld_acquire_cta(mailbox + kMbDone));
+                            return false;
+                        });
+                    }
+                    __syncwarp();
+                }
 
-                if constexpr (kDoubleBufferForward) {
-                    // Wait for this slot's load to complete.
-                    if (ptx::elect_one_sync())
-                        ptx::mbarrier_wait_and_flip_phase(fwd_mbs[cur], *fwd_phases[cur]);
+                using mask_t = std::conditional_t<kNumScaleupRanks <= 32, unsigned, unsigned long long>;
+                EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Invalid number of scale-up peers");
+                if (start_slot_idx < end_slot_idx) {
+                    const bool routes = lane_idx < end_slot_idx - start_slot_idx;
+                    const auto routed = recv_buffer.get_token_buffer(start_slot_idx + (routes ? lane_idx : 0));
+                    constexpr int kNumTopkVecs = math::constexpr_ceil_div(kNumTopk * static_cast<int>(sizeof(int16_t)),
+                                                                          static_cast<int>(sizeof(int4)));
+                    int4 topk_vecs[kNumTopkVecs];
+                    #pragma unroll
+                    for (int i = 0; i < kNumTopkVecs; ++ i)
+                        topk_vecs[i] = ptx::ld_with_gez_pred(
+                            reinterpret_cast<const int4*>(routed.get_scaleout_topk_idx_ptr()) + i, routes ? 0 : -1);
+                    int cached_slots[kNumTopk];
+                    if constexpr (kReuseSlotIndices) {
+                        const auto cached_slot_ptr = dst_buffer_slot_idx +
+                            recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) +
+                            (start_slot_idx + (routes ? lane_idx : 0)) * kNumTopk;
+                        #pragma unroll
+                        for (int k = 0; k < kNumTopk; ++ k)
+                            cached_slots[k] = routes ? __ldg(cached_slot_ptr + k) : -1;
+                    }
+
+                    const auto topk16 = reinterpret_cast<const int16_t*>(topk_vecs);
+                    int ranks[kNumTopk];
+                    mask_t rank_mask = 0;
+                    #pragma unroll
+                    for (int k = 0; k < kNumTopk; ++ k) {
+                        const int expert_idx = (routes ? static_cast<int>(topk16[k]) : -1) - scaleout_rank_idx * kNumExpertsPerScaleout;
+                        ranks[k] = 0 <= expert_idx and expert_idx < kNumExpertsPerScaleout ? expert_idx / kNumExpertsPerRank : -1;
+                        rank_mask |= ranks[k] >= 0 ? (mask_t(1) << ranks[k]) : mask_t(0);
+                    }
+
+                    int chunk_counts[kNumScaleupRanksPerLane] = {};
+                    const unsigned lanes_below = (1u << lane_idx) - 1u;
+                    #pragma unroll
+                    for (int r = 0; r < kNumScaleupRanks; ++ r) {
+                        const unsigned tokens_to_r = ptx::gather((rank_mask >> r) & 1);
+                        if (routes)
+                            route_prefix[lane_idx * kNumScaleupRanks + r] = __popc(tokens_to_r & lanes_below);
+                        if (lane_idx == r % 32)
+                            chunk_counts[r / 32] = __popc(tokens_to_r);
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                        if (const int r = j * 32 + lane_idx; r < kNumScaleupRanks) {
+                            if constexpr (not kReuseSlotIndices) {
+                                route_base[r] = chunk_counts[j] > 0 ?
+                                    atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + r, chunk_counts[j]) : 0;
+                            }
+                            int& counter = is_local ? stored_scaleup_local_counters[j] : stored_scaleup_remote_counters[j];
+                            route_count[r] = counter;
+                            counter += chunk_counts[j];
+                        }
+                    }
                     __syncwarp();
 
-                    if (slot_idx + 1 < end_slot_idx) {
-                        ptx::tma_store_wait();
-                        __syncwarp();
-                        issue_fwd_load(cur ^ 1, slot_idx + 1);
+                    if (routes) {
+                        mask_t owned = 0;
+                        #pragma unroll
+                        for (int k = kNumTopk - 1; k >= 0; -- k) {
+                            const int r = ranks[k];
+                            int slot = kReuseSlotIndices ? cached_slots[k] : -1, ll = -1;
+                            if (r >= 0) {
+                                const int prefix = route_prefix[lane_idx * kNumScaleupRanks + r];
+                                ll = is_local ? kForwardListTop - (route_count[r] + prefix) : route_count[r] + prefix;
+                                if (not kReuseSlotIndices and not ((owned >> r) & 1))
+                                    slot = route_base[r] + prefix;
+                                owned |= mask_t(1) << r;
+                            }
+                            route_rank[lane_idx * kNumTopk + k] = r;
+                            route_slot[lane_idx * kNumTopk + k] = slot;
+                            route_ll[lane_idx * kNumTopk + k] = ll;
+                        }
                     }
-                } else {
-                    // Original single-buffer path: load this slot synchronously.
+                    __syncwarp();
+                }
+
+                int fwd_end_slot_idx = end_slot_idx;
+                const int num_chunk_tokens = end_slot_idx - start_slot_idx;
+                const int metadata_stride = is_local ? -kNumForwardMetadataDims : kNumForwardMetadataDims;
+                const auto chunk_metadata_ptr = token_metadata_at_forward +
+                    (is_local ? kForwardListTop - num_local_processed : num_tokens_processed) * kNumForwardMetadataDims;
+                const auto chunk_dst_slot_idx_ptr = dst_buffer_slot_idx +
+                    recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + start_slot_idx * kNumTopk;
+                const bool helper_ready = num_chunk_tokens >= 2 and
+                    __shfl_sync(0xffffffffu, lane_idx == 0 ? ptx::ld_acquire_cta(mailbox + kMbReady) : 0, 0) != 0;
+                if (helper_ready) {
+                    const int fwd_share = (num_chunk_tokens + 1) / 2;
+                    fwd_end_slot_idx = start_slot_idx + fwd_share;
+                    if (ptx::elect_one_sync()) {
+                        mailbox[kMbNumTokens] = num_chunk_tokens;
+                        mailbox[kMbFwdShare] = fwd_share;
+                        mailbox[kMbMetadataStride] = metadata_stride;
+                        auto ptrs = reinterpret_cast<void**>(mailbox + kMbPtrs);
+                        ptrs[0] = recv_buffer.get_token_buffer(start_slot_idx).get_base_ptr();
+                        ptrs[1] = chunk_metadata_ptr;
+                        ptrs[2] = chunk_dst_slot_idx_ptr;
+                        __threadfence_block();
+                        ptx::st_release_cta(mailbox + kMbPosted, num_posted_chunks + 1);
+                    }
+                    num_posted_chunks += 1;
+                    __syncwarp();
+                }
+
+                for (int slot_idx = start_slot_idx; slot_idx < fwd_end_slot_idx; ++ slot_idx) {
+                    const int cur = (slot_idx - start_slot_idx) & 1;
+                    const auto& tma_buffer = fwd_bufs[kDoubleBufferForward ? cur : 0];
+
+                    if constexpr (kDoubleBufferForward) {
+                        if (ptx::elect_one_sync())
+                            ptx::mbarrier_wait_and_flip_phase(fwd_mbs[cur], *fwd_phases[cur]);
+                        __syncwarp();
+
+                        if (slot_idx + 1 < fwd_end_slot_idx) {
+                            ptx::tma_store_wait();
+                            __syncwarp();
+                            issue_fwd_load(cur ^ 1, slot_idx + 1);
+                        }
+                    } else {
+                        if (slot_idx > start_slot_idx) {
+                            ptx::tma_store_wait();
+                            __syncwarp();
+                            issue_fwd_load(0, slot_idx);
+                        }
+                        if (ptx::elect_one_sync())
+                            ptx::mbarrier_wait_and_flip_phase(fwd_mbs[0], *fwd_phases[0]);
+                        __syncwarp();
+                    }
+
+                    const int i = slot_idx - start_slot_idx;
+                    forward_token(tma_buffer, i, chunk_metadata_ptr + i * metadata_stride,
+                                  chunk_dst_slot_idx_ptr + i * kNumTopk, slot_idx == end_slot_idx - 1);
+                }
+                (is_local ? num_local_processed : num_tokens_processed) += num_chunk_tokens;
+            } else {
+                if constexpr (kDoubleBufferForward) {
                     ptx::tma_store_wait();
                     __syncwarp();
-                    issue_fwd_load(0, slot_idx);
-                    if (ptx::elect_one_sync())
-                        ptx::mbarrier_wait_and_flip_phase(fwd_mbs[0], *fwd_phases[0]);
+                    if (start_slot_idx < end_slot_idx)
+                        issue_fwd_load(0, start_slot_idx);
+                }
+
+                for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx; ++ slot_idx) {
+                    const int cur = (slot_idx - start_slot_idx) & 1;
+                    const auto& tma_buffer = fwd_bufs[kDoubleBufferForward ? cur : 0];
+
+                    if constexpr (kDoubleBufferForward) {
+                        // Wait for this slot's load to complete.
+                        if (ptx::elect_one_sync())
+                            ptx::mbarrier_wait_and_flip_phase(fwd_mbs[cur], *fwd_phases[cur]);
+                        __syncwarp();
+
+                        if (slot_idx + 1 < end_slot_idx) {
+                            ptx::tma_store_wait();
+                            __syncwarp();
+                            issue_fwd_load(cur ^ 1, slot_idx + 1);
+                        }
+                    } else {
+                        // Original single-buffer path: load this slot synchronously.
+                        ptx::tma_store_wait();
+                        __syncwarp();
+                        issue_fwd_load(0, slot_idx);
+                        if (ptx::elect_one_sync())
+                            ptx::mbarrier_wait_and_flip_phase(fwd_mbs[0], *fwd_phases[0]);
+                        __syncwarp();
+                    }
+
+                    // Read top-k indices
+                    EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
+                    int stored_dst_scaleup_rank_idx = -1;
+                    const auto received = layout::TokenLayout(
+                        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, tma_buffer.get_base_ptr(), true, true);
+                    int dst_expert_idx = -1;
+                    float topk_weight = 0;
+                    if (lane_idx < kNumTopk) {
+                        dst_expert_idx = received.get_scaleout_topk_idx_ptr()[lane_idx];
+                        topk_weight = received.get_topk_weights_ptr()[lane_idx];
+                    }
+                    const int src_token_global_idx = *received.get_src_token_global_idx_ptr();
+                    __syncwarp();
+                    if (lane_idx < kNumTopk) {
+                        tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
+                        tma_buffer.get_topk_weights_ptr()[lane_idx] = topk_weight;
+                    }
+                    if (lane_idx == 0)
+                        *tma_buffer.get_src_token_global_idx_ptr() = src_token_global_idx;
+                    ptx::tma_store_fence();
+                    __syncwarp();
+                    dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout;
+                    stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
+                        dst_expert_idx / kNumExpertsPerRank : -1;
+
+                    // Write the per-scaleup channel index for this token
+                    int linked_list_idx = -1;
+                    #pragma unroll
+                    for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
+                        const auto src_lane_idx = stored_dst_scaleup_rank_idx - j * 32;
+                        const bool valid = 0 <= src_lane_idx and src_lane_idx < 32;
+                        const auto exchanged = ptx::exchange(
+                            is_local ? kForwardListTop - stored_scaleup_local_counters[j] : stored_scaleup_remote_counters[j],
+                            valid ? src_lane_idx : 0);
+                        linked_list_idx = valid ? exchanged : linked_list_idx;
+                    }
+                    if (not kReuseSlotIndices and lane_idx < kNumTopk) {
+                        tma_buffer.get_linked_list_idx_ptr()[lane_idx] = transform_linked_list_idx(linked_list_idx);
+                        ptx::tma_store_fence();
+                    }
+                    __syncwarp();
+
+                    // Deduplicate for scale-up ranks
+                    int stored_dst_slot_idx = -1;
+                    const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
+                        recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
+                    if constexpr (kReuseSlotIndices) {
+                        if (lane_idx < kNumTopk)
+                            stored_dst_slot_idx = __ldg(dst_slot_idx_ptr + lane_idx);
+                    } else {
+                        // Deduplicate for NVLink ranks
+                        if (ptx::deduplicate(stored_dst_scaleup_rank_idx, lane_idx) and stored_dst_scaleup_rank_idx >= 0)
+                            stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_scaleup_rank_idx, 1);
+                    }
+                    __syncwarp();
+
+                    // Issue TMAs
+                    if (stored_dst_slot_idx >= 0) {
+                        const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
+                            scaleup_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
+                            stored_dst_scaleup_rank_idx);
+                        ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+                        ptx::tma_store_commit();
+                    }
+                    __syncwarp();
+
+                    // Add per-scale-up counter
+                    EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Invalid number of scale-up peers");
+                    using mask_t = std::conditional_t<kNumScaleupRanks <= 32, unsigned, unsigned long long>;
+                    const auto scaleup_send_mask = ptx::reduce_or(
+                        stored_dst_scaleup_rank_idx >= 0 ?
+                        (mask_t(1) << stored_dst_scaleup_rank_idx) : mask_t(0));
+                    #pragma unroll
+                    for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
+                        (is_local ? stored_scaleup_local_counters[j] : stored_scaleup_remote_counters[j]) +=
+                            (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
+
+                    // Record metadata at forward
+                    if constexpr (not kReuseSlotIndices) {
+                        EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of selections");
+                        const auto metadata_ptr = token_metadata_at_forward +
+                            (is_local ? kForwardListTop - num_local_processed : num_tokens_processed) * kNumForwardMetadataDims;
+
+                        // Source token index and last token index flag
+                        if (ptx::elect_one_sync()) {
+                            metadata_ptr[0] = tma_buffer.get_src_token_global_idx_ptr()[0];
+                            metadata_ptr[1] = slot_idx == (end_slot_idx - 1);
+                        }
+
+                        // Second, original top-k indices and destination slots
+                        if (lane_idx < kNumTopk) {
+                            metadata_ptr[2 + lane_idx] = stored_dst_scaleup_rank_idx;
+                            metadata_ptr[2 + kNumTopk + lane_idx] = stored_dst_slot_idx;
+                            dst_slot_idx_ptr[lane_idx] = stored_dst_slot_idx;
+                        }
+                    }
+                    (is_local ? num_local_processed : num_tokens_processed) += 1;
                     __syncwarp();
                 }
-
-                // Read top-k indices
-                EP_STATIC_ASSERT(kNumTopk <= 32, "Too many top-k selections");
-                int stored_dst_scaleup_rank_idx = -1;
-                const auto received = layout::TokenLayout(
-                    kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, tma_buffer.get_base_ptr(), true, true);
-                int dst_expert_idx = -1;
-                float topk_weight = 0;
-                if (lane_idx < kNumTopk) {
-                    dst_expert_idx = received.get_scaleout_topk_idx_ptr()[lane_idx];
-                    topk_weight = received.get_topk_weights_ptr()[lane_idx];
-                }
-                const int src_token_global_idx = *received.get_src_token_global_idx_ptr();
-                __syncwarp();
-                if (lane_idx < kNumTopk) {
-                    tma_buffer.get_topk_idx_ptr()[lane_idx] = dst_expert_idx;
-                    tma_buffer.get_topk_weights_ptr()[lane_idx] = topk_weight;
-                }
-                if (lane_idx == 0)
-                    *tma_buffer.get_src_token_global_idx_ptr() = src_token_global_idx;
-                ptx::tma_store_fence();
-                __syncwarp();
-                dst_expert_idx -= scaleout_rank_idx * kNumExpertsPerScaleout;
-                stored_dst_scaleup_rank_idx = 0 <= dst_expert_idx and dst_expert_idx < kNumExpertsPerScaleout ?
-                    dst_expert_idx / kNumExpertsPerRank : -1;
-
-                // Write the per-scaleup channel index for this token
-                int linked_list_idx = -1;
-                #pragma unroll
-                for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
-                    const auto src_lane_idx = stored_dst_scaleup_rank_idx - j * 32;
-                    const bool valid = 0 <= src_lane_idx and src_lane_idx < 32;
-                    const auto exchanged = ptx::exchange(
-                        is_local ? kForwardListTop - stored_scaleup_local_counters[j] : stored_scaleup_remote_counters[j],
-                        valid ? src_lane_idx : 0);
-                    linked_list_idx = valid ? exchanged : linked_list_idx;
-                }
-                if (not kReuseSlotIndices and lane_idx < kNumTopk) {
-                    tma_buffer.get_linked_list_idx_ptr()[lane_idx] = transform_linked_list_idx(linked_list_idx);
-                    ptx::tma_store_fence();
-                }
-                __syncwarp();
-
-                // Deduplicate for scale-up ranks
-                int stored_dst_slot_idx = -1;
-                const auto dst_slot_idx_ptr = dst_buffer_slot_idx +
-                    recv_scaleout_rank_idx * (kNumMaxTokensPerChannel * kNumTopk) + slot_idx * kNumTopk;
-                if constexpr (kReuseSlotIndices) {
-                    if (lane_idx < kNumTopk)
-                        stored_dst_slot_idx = __ldg(dst_slot_idx_ptr + lane_idx);
-                } else {
-                    // Deduplicate for NVLink ranks
-                    if (ptx::deduplicate(stored_dst_scaleup_rank_idx, lane_idx) and stored_dst_scaleup_rank_idx >= 0)
-                        stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_scaleup_rank_idx, 1);
-                }
-                __syncwarp();
-
-                // Issue TMAs
-                if (stored_dst_slot_idx >= 0) {
-                    const auto dst_ptr = gin.get_sym_ptr<ncclTeamTagLsa>(
-                        scaleup_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(),
-                        stored_dst_scaleup_rank_idx);
-                    ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
-                    ptx::tma_store_commit();
-                }
-                __syncwarp();
-
-                // Add per-scale-up counter
-                EP_STATIC_ASSERT(kNumScaleupRanks <= 64, "Invalid number of scale-up peers");
-                using mask_t = std::conditional_t<kNumScaleupRanks <= 32, unsigned, unsigned long long>;
-                const auto scaleup_send_mask = ptx::reduce_or(
-                    stored_dst_scaleup_rank_idx >= 0 ?
-                    (mask_t(1) << stored_dst_scaleup_rank_idx) : mask_t(0));
-                #pragma unroll
-                for (int j = 0; j < kNumScaleupRanksPerLane; ++ j)
-                    (is_local ? stored_scaleup_local_counters[j] : stored_scaleup_remote_counters[j]) +=
-                        (scaleup_send_mask >> (j * 32 + lane_idx)) & 1;
-
-                // Record metadata at forward
-                if constexpr (not kReuseSlotIndices) {
-                    EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid number of selections");
-                    const auto metadata_ptr = token_metadata_at_forward +
-                        (is_local ? kForwardListTop - num_local_processed : num_tokens_processed) * kNumForwardMetadataDims;
-
-                    // Source token index and last token index flag
-                    if (ptx::elect_one_sync()) {
-                        metadata_ptr[0] = tma_buffer.get_src_token_global_idx_ptr()[0];
-                        metadata_ptr[1] = slot_idx == (end_slot_idx - 1);
-                    }
-
-                    // Second, original top-k indices and destination slots
-                    if (lane_idx < kNumTopk) {
-                        metadata_ptr[2 + lane_idx] = stored_dst_scaleup_rank_idx;
-                        metadata_ptr[2 + kNumTopk + lane_idx] = stored_dst_slot_idx;
-                        dst_slot_idx_ptr[lane_idx] = stored_dst_slot_idx;
-                    }
-                }
-                (is_local ? num_local_processed : num_tokens_processed) += 1;
-                __syncwarp();
             }
+        }
+
+        if constexpr (kChunkRouting) {
+            if (ptx::elect_one_sync())
+                ptx::st_release_cta(mailbox + kMbFwdDone, 1);
+            __syncwarp();
         }
 
         // Assign the source token index part of the metadata into `-1` as an ending mark
@@ -1318,7 +1673,7 @@ hybrid_unordered_dispatch_impl(
                     for (int i = 0; i < kNumScaleupRanks; ++ i)
                         workspace_layout.get_scaleup_atomic_sender_counter()[i] = 0;
                 }
-                *workspace_layout.get_dispatch_done_target_ptr() += kNumChannels;
+                *workspace_layout.get_dispatch_done_target_ptr() += kNumChannels * (kChunkRouting ? 2 : 1);
                 *entry_flag_ptr = 0;
                 *exit_counter_ptr = 0;
                 __threadfence();
