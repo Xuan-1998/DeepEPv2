@@ -29,6 +29,8 @@ constexpr int kCombineRampTokens = kDeviceArch == 90 or kDeviceArch == 100 ? 2 :
 constexpr int kCombineRampPuts = kDeviceArch == 90 ? 2 : kDeviceArch == 100 ? 4 : 0;
 constexpr bool kCombinePutRamp = kCombineRampTokens > 0 and kCombineRampPuts > 0;
 constexpr bool kCombineSuHelp = kDeviceArch == 90;
+constexpr int kCombineEarlyRows = kDeviceArch == 90 ? 4 : 0;
+constexpr int kCombineProxyEagerPuts = kDeviceArch == 90 ? 7 : 0;
 
 template <int kBatchSize>
 __device__ __forceinline__ int combine_put_tokens(const int& num_puts_issued) {
@@ -306,12 +308,16 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Tail issuer
         // `st.release.sys` is pretty slow, so do it by an interval
         int update_counter = 0;
+        [[maybe_unused]] int num_rows_done = 0;
         int stored_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         int stored_old_num_tokens_sent[kNumScaleupRanksPerLane] = {};
         const auto tail_ptr = workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, scaleup_rank_idx);
         const auto update_tails = [&](const bool& finish = false) {
             ++ update_counter;
-            if (finish or update_counter == kNumScaleupUpdateInterval) {
+            bool early_row = false;
+            if constexpr (kCombineEarlyRows > 0)
+                early_row = ++ num_rows_done <= kCombineEarlyRows;
+            if (finish or update_counter == kNumScaleupUpdateInterval or early_row) {
                 // Wait all TMA stores to finish
                 ptx::tma_store_wait();
                 __syncwarp();
@@ -1161,8 +1167,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                 // Wait for one descriptor per forward warp, then send them all under one
                 // doorbell. A floor, not a cap. Exempt in the tail, which would wait forever.
-                const bool drain_now = total_pending > 0 and
-                                       (total_pending >= kNumForwardWarps or any_ring_finished);
+                bool drain_now = total_pending > 0 and
+                                 (total_pending >= kNumForwardWarps or any_ring_finished);
+                if constexpr (kCombineProxyEagerPuts > 0) {
+                    unsigned num_puts_issued = 0;
+                    #pragma unroll
+                    for (int f = 0; f < kNumForwardWarps; ++ f)
+                        num_puts_issued += tail[f];
+                    drain_now |= total_pending > 0 and num_puts_issued < static_cast<unsigned>(kCombineProxyEagerPuts);
+                }
 
                 const auto issue_put = [&](const ProxyPutDesc& d, const int& ring_idx,
                                            const bool& ring_doorbell) {
