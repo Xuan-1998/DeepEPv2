@@ -38,7 +38,6 @@ class Buffer:
                  num_qps_per_rank: int = 24,
                  allow_nvlink_for_low_latency_mode: bool = True,
                  allow_mnnvl: bool = False,
-                 use_fabric: Optional[bool] = None,
                  explicitly_destroy: bool = False,
                  enable_shrink: bool = False,
                  comm: Optional["mpi4py.MPI.Comm"] = None) -> None:  # noqa: F821
@@ -57,6 +56,7 @@ class Buffer:
                 Warning: PCIe connections may lead to errors due to memory ordering issues,
                 please make sure all connections are via NVLink.
             allow_mnnvl: whether to allow MNNVL
+            use_fabric: whether to use fabric API for memory buffers.
             enable_shrink: whether to enable shrink mode. The enable mode allocates a mask buffer to support masking ranks dynamically.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
@@ -554,9 +554,7 @@ class Buffer:
                              num_max_dispatch_tokens_per_rank: int, num_experts: int,
                              cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
                              dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
-                             x_global_scale: Optional[torch.Tensor] = None,
                              use_fp8: bool = True, round_scale: bool = False, use_ue8m0: bool = False,
-                             use_nvfp4: bool = False,
                              async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         """
@@ -579,11 +577,9 @@ class Buffer:
             dispatch_wait_recv_cost_stats: a cumulative time spent waiting to receive each token tensor for statistics,
                 which should have shape `[num_ranks, num_ranks]` and be typed as `torch.int64`.
                 This is useful for detecting and precisely localizing slow anomalies.
-            x_global_scale: a float32 tensor with dim() == 0, the scaling factors for the entire dispatch.
             use_fp8: whether to enable FP8 casting, with this, the received data will be a tuple of FP8 tensor and scaling factors.
             round_scale: whether round the scaling factors into power of 2.
-            use_ue8m0: whether use UE8M0 as scaling factor format. FP8 requires `round_scale=True`.
-            use_nvfp4: whether to enable NVFP4 casting, with this, the received data will be a tuple of NVFP4 tensor and scaling factors.
+            use_ue8m0: whether use UE8M0 as scaling factor format (available only with `round_scale=True`).
             async_finish: the current stream will not wait for the communication kernels to be finished if set.
             return_recv_hook: return a receiving hook if set. If set, the kernel will just do the RDMA request issues,
                 but **without actually receiving the data**. You must call the received hook to make sure the data's arrival.
@@ -598,11 +594,7 @@ class Buffer:
                 if `use_ue8m0=False`. With `use_ue8m0=True`, the second one is packed and shaped as
                 `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 512]` with type `torch.int`.
                 Notice that, the last-two-dimension of the scaling tensors are in column-major for TMA compatibility.
-                with `use_nvfp4=True`: the first element is a `torch.Tensor` shaped as
-                `[num_local_experts, hidden // 2, num_max_dispatch_tokens_per_rank * num_ranks]` with `torch.uint8`.
-                The second tensor is the corresponding scales for the first element with shape
-                `[32, 4, num_max_dispatch_tokens_per_rank * num_ranks // 128, 4, hidden // 64, num_local_experts]` with `torch.uint8`.
-                With `use_fp8=False and use_nvfp4=False`, the result would be a tensor shaped as
+                With `use_fp8=False`, the result would be a tensor shaped as
                 `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden]` with `torch.bfloat16`.
                 Moreover, not all tokens are valid, only some of the `num_max_dispatch_tokens_per_rank * num_ranks` are,
                 as we do not synchronize CPU received count with GPU (also not incompatible with CUDA graph if synced).
@@ -619,94 +611,20 @@ class Buffer:
             self.runtime.low_latency_dispatch(x, topk_idx,
                                               cumulative_local_expert_recv_stats,
                                               dispatch_wait_recv_cost_stats,
-                                              x_global_scale,
                                               num_max_dispatch_tokens_per_rank, num_experts,
                                               use_fp8, round_scale, use_ue8m0,
-                                              use_nvfp4,
                                               async_finish, return_recv_hook)
         handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1), num_experts)
-        tensors_to_record = (x, topk_idx,
-                             packed_recv_x, packed_recv_x_scales, packed_recv_count,
-                             packed_recv_src_info, packed_recv_layout_range,
-                             cumulative_local_expert_recv_stats,
-                             x_global_scale)
-        if use_fp8 or use_nvfp4:
-            packed_recv_x = (packed_recv_x, packed_recv_x_scales)
-        return packed_recv_x, packed_recv_count, handle, \
-            EventOverlap(event, tensors_to_record if async_finish else None), hook
-
-    # noinspection PyTypeChecker
-    def low_latency_dispatch_fp4(self, x: torch.Tensor, x_scales: torch.Tensor, topk_idx: torch.Tensor,
-                                 num_max_dispatch_tokens_per_rank: int, num_experts: int,
-                                 per_token_scale: Optional[torch.Tensor] = None,
-                                 cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
-                                 dispatch_wait_recv_cost_stats: Optional[torch.Tensor] = None,
-                                 async_finish: bool = False, return_recv_hook: bool = False,
-                                 swizzle_scales: bool = False) -> \
-            Tuple[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]], torch.Tensor, Tuple, EventOverlap, Callable]:
-        """
-        Low-latency dispatch of pre-quantized NVFP4 activations with optional per-token FP32 scales.
-        Unlike `low_latency_dispatch(use_nvfp4=True)`, which casts BF16 inputs with one global scale, the caller
-            quantizes the activations. Packed values, block scales and per-token scales are transported bitwise.
-        The same restrictions as `low_latency_dispatch` apply (IBGDA, double buffering, all ranks using the same
-            `num_max_dispatch_tokens_per_rank`). The buffer must be sized with the original (unpacked) hidden size.
-
-        Arguments:
-            x: `torch.Tensor` with `torch.uint8`, shaped as `[num_tokens, hidden // 2]`, two E2M1 values per byte.
-            x_scales: `torch.Tensor` with `torch.uint8` or `torch.float8_e4m3fn` (E4M3 values), shaped as
-                `[num_tokens, hidden // 16]`, one scale per 16 elements in row-major (linear) layout.
-            topk_idx: same as `low_latency_dispatch`.
-            num_max_dispatch_tokens_per_rank: same as `low_latency_dispatch`.
-            num_experts: same as `low_latency_dispatch`.
-            per_token_scale: optional `torch.Tensor` with `torch.float`, shaped as `[num_tokens]`. If not set, the received
-                per-token scales are not returned.
-            cumulative_local_expert_recv_stats: same as `low_latency_dispatch`.
-            dispatch_wait_recv_cost_stats: same as `low_latency_dispatch`.
-            async_finish: same as `low_latency_dispatch`.
-            return_recv_hook: same as `low_latency_dispatch`.
-            swizzle_scales: whether to write the received block scales in the swizzled layout consumed by
-                Blackwell block-scaled GEMMs (the same layout as `low_latency_dispatch(use_nvfp4=True)`).
-
-        Returns:
-            recv_x: a tuple of received packed values shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 2]` with `torch.uint8`,
-                block scales with the dtype of `x_scales`, and per-token scales shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks]` with `torch.float` (or `None` if
-                `per_token_scale` is not set). Only the first `recv_count[i]` rows of expert `i` are valid.
-                Without `swizzle_scales`, block scales are shaped as
-                `[num_local_experts, num_max_dispatch_tokens_per_rank * num_ranks, hidden // 16]` (linear layout).
-                With `swizzle_scales`, block scales are a `(32, 4, rm, 4, rk, num_local_experts)` view of the
-                physical `(num_local_experts, rm, rk, 32, 4, 4)` layout, where `rm` is the receive capacity divided by
-                128 (rounded up) and `rk = hidden // 64`; rows past `recv_count[i]` are left uninitialized.
-            recv_count: same as `low_latency_dispatch`.
-            handle: the communication handle, compatible with BF16 `low_latency_combine`.
-            event: same as `low_latency_dispatch`.
-            hook: same as `low_latency_dispatch`.
-        """
-        check_torch_deterministic()
-
-        assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
-        packed_recv_x, packed_recv_x_scales, packed_recv_per_token_scale, packed_recv_count, \
-            packed_recv_src_info, packed_recv_layout_range, event, hook = \
-            self.runtime.low_latency_dispatch_fp4(x, x_scales, per_token_scale, topk_idx,
-                                                  cumulative_local_expert_recv_stats,
-                                                  dispatch_wait_recv_cost_stats,
-                                                  num_max_dispatch_tokens_per_rank, num_experts,
-                                                  async_finish, return_recv_hook, swizzle_scales)
-        handle = (packed_recv_src_info, packed_recv_layout_range, num_max_dispatch_tokens_per_rank, x.size(1) * 2, num_experts)
-        tensors_to_record = (x, x_scales, per_token_scale, topk_idx,
-                             packed_recv_x, packed_recv_x_scales, packed_recv_per_token_scale, packed_recv_count,
-                             packed_recv_src_info, packed_recv_layout_range,
-                             cumulative_local_expert_recv_stats)
-        return (packed_recv_x, packed_recv_x_scales, packed_recv_per_token_scale), packed_recv_count, handle, \
+        tensors_to_record = (x, topk_idx, packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info,
+                             packed_recv_layout_range, cumulative_local_expert_recv_stats)
+        return (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x, packed_recv_count, handle, \
             EventOverlap(event, tensors_to_record if async_finish else None), hook
 
     # noinspection PyTypeChecker
     def low_latency_combine(self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: tuple, use_logfmt: bool = False, zero_copy: bool = False, async_finish: bool = False,
                             return_recv_hook: bool = False, out: Optional[torch.Tensor] = None,
-                            combine_wait_recv_cost_stats: Optional[torch.Tensor] = None,
-                            overlap: bool = False, src_signals: Optional[torch.Tensor] = None, src_signal_expect_value: int = 0) -> \
+                            combine_wait_recv_cost_stats: Optional[torch.Tensor] = None) -> \
             Tuple[torch.Tensor, EventOverlap, Callable]:
         """
         A low-latency implementation for combining tokens (reduce **with weights**) with IBGDA.
@@ -746,11 +664,8 @@ class Buffer:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         assert self.nvshmem_qp_depth >= (num_max_dispatch_tokens_per_rank + 1) * 2
         combined_x, event, hook = self.runtime.low_latency_combine(x, topk_idx, topk_weights, src_info, layout_range,
-                                                                   combine_wait_recv_cost_stats,
-                                                                   num_max_dispatch_tokens_per_rank, num_experts,
-                                                                   use_logfmt, zero_copy, async_finish, return_recv_hook,
-                                                                   out,
-                                                                   overlap, src_signals, src_signal_expect_value)
+                                                                   combine_wait_recv_cost_stats, num_max_dispatch_tokens_per_rank,
+                                                                   num_experts, use_logfmt, zero_copy, async_finish, return_recv_hook, out)
         tensors_to_record = (x, topk_idx, topk_weights, src_info, layout_range, combined_x)
         return combined_x, EventOverlap(event, tensors_to_record if async_finish else None), hook
 

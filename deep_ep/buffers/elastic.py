@@ -65,11 +65,7 @@ class EPHandle:
         token_metadata_at_forward: per-channel forwarded token metadata (hybrid mode only).
         channel_linked_list: per-channel per-scaleup-peer linked list (hybrid mode only).
         token_map_at_dispatch: per-(token, k) recv slot for combine's return trip, `[num_max_tokens_per_rank, num_topk]`
-<<<<<<< c81a983
-            (hybrid mode only). Populated by dispatch; consumed by the combine epilogue to look up
-=======
             (unordered hybrid mode only). Populated by dispatch; consumed by the combine epilogue to look up
->>>>>>> 9f86f31
             each partial's location under the queue-based recv layout.
         num_recv_tokens: the total number of received tokens.
     """
@@ -90,11 +86,7 @@ class EPHandle:
                  dst_buffer_slot_idx: torch.Tensor,
                  token_metadata_at_forward: Optional[torch.Tensor],
                  channel_linked_list: Optional[torch.Tensor],
-<<<<<<< c81a983
-                 token_map_at_dispatch: Optional[torch.Tensor]):
-=======
                  token_map_at_dispatch: Optional[torch.Tensor] = None):
->>>>>>> 9f86f31
         # NOTES: remember to copy the original users' input to prevent uncasual modifications on them
         assert topk_idx is not None
 
@@ -285,16 +277,7 @@ class ElasticBuffer:
             allow_multiple_reduction: whether to allow multiple reductions in combine.
             prefer_overlap_with_compute: whether to prefer overlapping communication with compute.
             sl_idx: the RDMA service level index, can be overridden by `EP_OVERRIDE_RDMA_SL` env var.
-            num_allocated_qps: the number of QPs to allocate for RDMA. One GIN context supplies
-                one QP, so this is also the GIN context count. Pass 0 for automatic, which
-                resolves per hybrid kernel mode (see `EP_HYBRID_KERNEL`):
-                  - unordered (default): 11 QPs and 21 signals per QP, for the balance
-                    between token batch size and the number of QPs. An explicit value
-                    is clamped into [2, 17] with a warning. Requesting fewer
-                    QPs gives each context more signals.
-                  - ordered: 129 QPs. This mode signals through VA/strong signals rather than
-                    the indexed-signal budget, so any explicit value passes through
-                    without restriction.
+            num_allocated_qps: the number of QPs to allocate for RDMA (0 for automatic).
             num_cpu_timeout_secs: CPU-side timeout in seconds for CPU sync.
             num_gpu_timeout_secs: GPU-side timeout in seconds for GPU operations.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
@@ -356,15 +339,8 @@ class ElasticBuffer:
         if 'EP_OVERRIDE_RDMA_SL' in os.environ:
             sl_idx = int(os.environ['EP_OVERRIDE_RDMA_SL'])
 
-<<<<<<< c81a983
-        # Automatic QP count
-        if num_allocated_qps == 0 and (not self.allow_hybrid_mode or os.environ.get('EP_HYBRID_KERNEL', 'unordered') == 'ordered'):
-            # Hybrid mode will consume more QPs; the extra QP is for notify warps.
-            # The unordered hybrid kernels (`EP_HYBRID_KERNEL=unordered`) instead
-            # resolve the QP count in C++ from the GIN signal budget.
-=======
         # Hybrid kernel variant
-        hybrid_kernel = os.environ.get('EP_HYBRID_KERNEL') or 'ordered'
+        hybrid_kernel = os.environ.get('EP_HYBRID_KERNEL') or 'unordered'
         assert hybrid_kernel in ('ordered', 'unordered'), \
             f'EP_HYBRID_KERNEL must be `ordered` or `unordered`, got `{hybrid_kernel}`'
 
@@ -374,21 +350,10 @@ class ElasticBuffer:
         if num_allocated_qps == 0 and (not self.allow_hybrid_mode or hybrid_kernel == 'ordered'):
             # Hybrid mode will consume more QPs
             # The extra QP is for notify warps
->>>>>>> 9f86f31
             if self.allow_hybrid_mode:
                 num_allocated_qps = 65 if check_fast_rdma_atomic_support() else 129
             else:
                 num_allocated_qps = 17
-<<<<<<< c81a983
-        elif num_allocated_qps > 0 and self.allow_hybrid_mode and os.environ.get('EP_HYBRID_KERNEL', 'unordered') != 'ordered':
-            clamped_qps = max(_C.min_unordered_gin_qps, min(num_allocated_qps, _C.max_unordered_gin_qps))
-            if clamped_qps != num_allocated_qps:
-                print(f'[WARN] DeepEP clamped num_allocated_qps from {num_allocated_qps} to {clamped_qps}: '
-                      f'the unordered GIN layout supports [{_C.min_unordered_gin_qps}, {_C.max_unordered_gin_qps}] '
-                      f'contexts (one GIN context supplies one QP)', flush=True)
-                num_allocated_qps = clamped_qps
-=======
->>>>>>> 9f86f31
 
         # Create CPU communicator (exchange POSIX FD handles for CPU segments)
         cpu_comm = []
@@ -410,12 +375,6 @@ class ElasticBuffer:
                                         self.explicitly_destroy)
 
         self.num_allocated_qps = self.runtime.get_num_allocated_qps()
-<<<<<<< c81a983
-        # The unordered hybrid path intentionally passes 0 down and relies on C++ to
-        # resolve it (see the automatic QP count above). A 0 read back here means that
-        # delegation did not happen; it would surface far downstream as `kNumQPs == 0`.
-=======
->>>>>>> 9f86f31
         assert self.num_allocated_qps >= 1, \
             f'runtime returned num_allocated_qps={self.num_allocated_qps}: the QP count was never resolved'
 

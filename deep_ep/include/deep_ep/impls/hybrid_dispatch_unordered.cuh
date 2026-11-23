@@ -11,21 +11,13 @@
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-<<<<<<< c81a983
-#include <deep_ep/common/comm.cuh>
-#include <deep_ep/common/compiled.cuh>
-#include <deep_ep/common/diag_gin.cuh>
-#include <deep_ep/common/exception.cuh>
-#include <deep_ep/common/gin_resource_alloc.cuh>
-#include <deep_ep/common/layout.cuh>
-=======
 #include <deep_ep/common/comm_unordered.cuh>
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/diag_gin.cuh>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/gin_resource_alloc_unordered.cuh>
 #include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/layout_unordered.cuh>
->>>>>>> 9f86f31
 #include <deep_ep/common/math.cuh>
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/impls/combine_utils.cuh>
@@ -154,10 +146,7 @@ template <bool kDoCPUSync,
           int kNumExperts, int kNumTopk, int kExpertAlignment,
           int kNumQPs, int64_t kNumTimeoutCycles,
           int kNumGinSignals,
-<<<<<<< c81a983
           int kDebugChecks,
-=======
->>>>>>> 9f86f31
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumChannelsPerSM = kNumScaleoutWarps,
           int kNumChannels = kNumScaleoutWarps * kNumSMs,
@@ -200,13 +189,8 @@ hybrid_unordered_dispatch_impl(
     EP_STATIC_ASSERT(kNumExperts % kNumScaleupRanks == 0, "Invalid number of experts or ranks");
     EP_STATIC_ASSERT(kNumNotifyWarps % 4 == 0, "Invalid warpgroup size");
     EP_STATIC_ASSERT(kNumScaleoutWarps == kNumForwardWarps, "Invalid warp size");
-<<<<<<< c81a983
-    EP_STATIC_ASSERT(kNumParts <= layout::WorkspaceLayout::kNumMaxParts,
-                     "kNumParts exceeds the per-part header workspace capacity");
-=======
     EP_STATIC_ASSERT(kNumParts <= layout::kNumMaxParts,
                      "kNumParts exceeds the maximum number of parts");
->>>>>>> 9f86f31
     EP_STATIC_ASSERT(kNumParts >= 1, "Invalid part count");
     EP_STATIC_ASSERT(kNumSubParts >= 1, "Invalid sub-part count");
     EP_STATIC_ASSERT(kNumSubParts <= kBatchSize,
@@ -238,22 +222,13 @@ hybrid_unordered_dispatch_impl(
 
     // NCCL Gin handle
     // Each warp is a channel
-<<<<<<< c81a983
-    const auto [qp_idx, sharing_mode] = comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
-=======
     const auto [qp_idx, sharing_mode] = comm::unordered::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, kDataChannelsAboveQP0>(
->>>>>>> 9f86f31
         sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, warp_idx < kNumNotifyWarps);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
     const auto token_layout = layout::TokenLayout(kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
-<<<<<<< c81a983
-    const auto scaleout_token_layout = layout::TokenLayout(
-        kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true, nullptr, /*with_scaleout_hdr=*/true);
-=======
     const auto scaleout_token_layout = layout::TokenLayoutUnordered(
         kNumHiddenBytes, kNumSFPacks * sizeof(sf_pack_t), kNumTopk, true);
->>>>>>> 9f86f31
     constexpr int kNumFwdBuffers = kDoubleBufferForward ? kNumDispatchFwdBuffers : 1;
     const auto tma_pool = layout::BufferLayout<true>(
         token_layout, kNumScaleoutWarps + kNumFwdBuffers * kNumForwardWarps, 1,
@@ -284,42 +259,29 @@ hybrid_unordered_dispatch_impl(
     // channel this warp serves (both sides reduce to the same channel warp index).
     const auto part_signal_id = [&](const int& part_idx) {
         return static_cast<ncclGinSignal_t>(
-<<<<<<< c81a983
-            comm::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
-                                         kNumParts, kDataChannelsAboveQP0>(
-=======
             comm::unordered::get_per_part_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM,
                                                     kNumParts, kDataChannelsAboveQP0>(
->>>>>>> 9f86f31
                 sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM, part_idx));
     };
 
     auto scaleup_buffer = layout::BufferLayout<false>(
         token_layout, kNumScaleupRanks, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
-<<<<<<< c81a983
-    auto scaleout_send_buffer = layout::BufferLayout<false>(
+    auto scaleout_send_buffer = layout::BufferLayoutUnordered<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleup_buffer.get_buffer_end_ptr());
-    auto scaleout_recv_buffer = layout::BufferLayout<false>(
+    auto scaleout_recv_buffer = layout::BufferLayoutUnordered<false>(
         scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
 
     // Flush the previous kernel's puts before this kernel writes `buffer`. Flush all the contexts, as
     // the previous kernel can use a different QP count. SM 0 does not flush, as in the hybrid barrier:
     // it runs the scale-up leg, and a flush on it delays that leg.
     if (sm_idx > 0)
-        comm::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
+        comm::unordered::flush_gin_contexts<(kNumSMs - 1) * (kNumThreads / 32), kNumTimeoutCycles>(
             nccl_dev_comm, nccl_dev_comm.ginContextCount, (sm_idx - 1) * (kNumThreads / 32) + warp_idx);
 
     // Each SM flushes only some of the contexts, and the header zeroing below writes `buffer` before
     // the entry barrier. Thus all the SMs must finish their flushes before any SM writes.
     cooperative_groups::this_grid().sync();
 
-=======
-    auto scaleout_send_buffer = layout::BufferLayoutUnordered<false>(
-        scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleup_buffer.get_buffer_end_ptr());
-    auto scaleout_recv_buffer = layout::BufferLayoutUnordered<false>(
-        scaleout_token_layout, kNumScaleoutRanks, kNumChannels * kNumSlotsPerChannel, scaleout_send_buffer.get_buffer_end_ptr());
-
->>>>>>> 9f86f31
     // Zero the in-band headers of the remote sources before the entry barrier. The header words
     // live in `buffer`, which the combine and other kernels also write between two dispatches, so
     // they hold arbitrary data here. No remote sender writes them before it passes the barrier.
@@ -337,17 +299,12 @@ hybrid_unordered_dispatch_impl(
         ptx::fence_release_sys();
     }
 
-<<<<<<< c81a983
     // Debug check: the GIN signals must be in the expected state before the entry barrier
     if constexpr (kDebugChecks & kDebugCheckTokenSync)
         diag::check_gin_signals(nccl_dev_comm, sm_idx * kNumThreads + thread_idx, kNumSMs * kNumThreads);
 
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
-=======
     comm::unordered::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                                  kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag0, false, true, true>(
->>>>>>> 9f86f31
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 
     // Init TMA for scale-out and forward warps
@@ -467,11 +424,7 @@ hybrid_unordered_dispatch_impl(
                                    is_expert_reduction ? "expert" : "rank",
                                    scaleout_rank_idx, scaleup_rank_idx, thread_idx, j,
                                    decoded);
-<<<<<<< c81a983
-                            comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
-=======
                             comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
->>>>>>> 9f86f31
                         }
                         return false;
                     });
@@ -589,22 +542,12 @@ hybrid_unordered_dispatch_impl(
                 // Exclusive prefix sum for later expanding
                 do_psum(expert_count, psum_num_recv_tokens_per_expert, kNumExpertsPerRank, 1);
             }
-<<<<<<< c81a983
-=======
-
-            comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
->>>>>>> 9f86f31
         }
     } else if (warp_idx < kNumNotifyWarps + kNumScaleoutWarps) {
         const int scaleout_warp_idx = warp_idx - kNumNotifyWarps;
         const int channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
-<<<<<<< c81a983
-        const auto stage_part_header = [&](layout::BufferLayout<false>& send_ch,
-                                           const int& slot, const int& count, const bool& more) {
-=======
         const auto stage_part_header = [&](layout::BufferLayoutUnordered<false>& send_ch,
                                                     const int& slot, const int& count, const bool& more) {
->>>>>>> 9f86f31
             auto* hdr = send_ch.get_token_buffer(slot).get_hdr_ptr();
             *hdr = pack_scaleout_header(count, more);
             ptx::fence_acq_rel_sys();
@@ -871,12 +814,6 @@ hybrid_unordered_dispatch_impl(
 
         // Flush unflushed tails
         update_scaleout_tail(true);
-<<<<<<< c81a983
-=======
-
-        comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopWarp());
-
->>>>>>> 9f86f31
     } else {
         const int forward_warp_idx = warp_idx - (kNumNotifyWarps + kNumScaleoutWarps);
         const int channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
@@ -949,11 +886,7 @@ hybrid_unordered_dispatch_impl(
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
                     const int64_t landed = ptx::exchange(
-<<<<<<< c81a983
-                        comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
-=======
                         comm::unordered::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
->>>>>>> 9f86f31
 
                     const int num_subs = num_sub_parts_at<kNumSubParts>(part_size(k));
                     int sub_count[kNumSubParts];
@@ -1022,11 +955,7 @@ hybrid_unordered_dispatch_impl(
                                stored_finish_flag, stored_scaleout_tail_idx,
                                static_cast<int>(anomaly_detected), anomaly_part, anomaly_num_valid,
                                static_cast<int>(missing_part >= 0), missing_part, missing_num_valid, missing_landed);
-<<<<<<< c81a983
-                    comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
-=======
                     comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
->>>>>>> 9f86f31
                 }
                 return false;
             });
@@ -1199,22 +1128,14 @@ hybrid_unordered_dispatch_impl(
             if (lane_idx == k and expected_k > 0) {
                 comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
                     const int64_t landed =
-<<<<<<< c81a983
-                        comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]);
-=======
                         comm::unordered::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]);
->>>>>>> 9f86f31
                     if (landed >= static_cast<int64_t>(expected_k))
                         return true;
                     if (is_last_check) {
                         printf("DeepEP hybrid dispatch (epilogue shadow drain) timeout, scale-out: %d, scale-up: %d, "
                                "channel: %d, part: %d, landed: %lld, expected: %d\n",
                                scaleout_rank_idx, scaleup_rank_idx, channel_idx, k, (long long)landed, expected_k);
-<<<<<<< c81a983
-                        comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
-=======
                         comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
->>>>>>> 9f86f31
                     }
                     return false;
                 });
@@ -1230,13 +1151,8 @@ hybrid_unordered_dispatch_impl(
 
     // Scale-up barrier to ensure data arrival
     // As scale-out tokens have already been consumed by forwarders, no need to do scale-out barrier again
-<<<<<<< c81a983
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
-                      kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
-=======
     comm::unordered::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                                  kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridDispatchTag1, true, true, false>(
->>>>>>> 9f86f31
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx, /* do not scale-out */ false, true);
 
     // Trigger the copy epilogue kernel
