@@ -28,6 +28,7 @@ namespace deep_ep::elastic {
 constexpr int kCombineRampTokens = kDeviceArch == 90 or kDeviceArch == 100 ? 2 : 0;
 constexpr int kCombineRampPuts = kDeviceArch == 90 ? 2 : kDeviceArch == 100 ? 4 : 0;
 constexpr bool kCombinePutRamp = kCombineRampTokens > 0 and kCombineRampPuts > 0;
+constexpr bool kCombineSuHelp = kDeviceArch == 90;
 
 template <int kBatchSize>
 __device__ __forceinline__ int combine_put_tokens(const int& num_puts_issued) {
@@ -47,6 +48,43 @@ __device__ __forceinline__ int combine_num_puts(const int& num_tokens) {
         return kCombineRampPuts + math::ceil_div(num_tokens - kNumRampTokens, kBatchSize);
     }
     return math::ceil_div(num_tokens, kBatchSize);
+}
+
+template <int kNumForwardMetadataDims, int kMaxEntries>
+__device__ __forceinline__ int count_forward_fifo_entries(const int* list, const int& first, const int& stride,
+                                                          const int& lane_idx) {
+    for (int base = 0; ; base += 32) {
+        const int idx = base + lane_idx;
+        const bool alive = idx < kMaxEntries and __ldg(list + (first + stride * idx) * kNumForwardMetadataDims) >= 0;
+        const unsigned alive_mask = ptx::gather(alive);
+        if (alive_mask != 0xffffffffu)
+            return base + __ffs(static_cast<int>(~alive_mask)) - 1;
+    }
+}
+
+template <int kNumForwardMetadataDims, int kNumTopk, int kNumScaleupRanks>
+__device__ __forceinline__ int count_forward_entries_per_scaleup_rank(const int* list, const int& first,
+                                                                      const int& stride, const int& num_entries,
+                                                                      const int& lane_idx) {
+    EP_STATIC_ASSERT(kNumScaleupRanks <= 32, "One lane per scale-up rank");
+    int count = 0;
+    for (int base = 0; base < num_entries; base += 32) {
+        unsigned mask = 0;
+        if (base + lane_idx < num_entries) {
+            const auto entry = list + (first + stride * (base + lane_idx)) * kNumForwardMetadataDims + 2;
+            #pragma unroll
+            for (int k = 0; k < kNumTopk; ++ k) {
+                const auto r = __ldg(entry + k);
+                mask |= r >= 0 ? (1u << r) : 0u;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < kNumScaleupRanks; ++ r) {
+            const int n = __popc(ptx::gather(((mask >> r) & 1u) != 0));
+            count += lane_idx == r ? n : 0;
+        }
+    }
+    return count;
 }
 
 // Iterate the whole forward metadata list and count how many tokens (forward slots) this channel
@@ -168,10 +206,20 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // Proxy warp hand-off rings — placed in `smem[]` right after the TMA buffers.
     const auto proxy_ring_layout = ProxyRingLayout(
         kNumForwardWarps, kProxyRingDepth, tma_buffer_layout.get_buffer_end_ptr());
+
+    constexpr bool kSuHelp = kCombineSuHelp and kAllowMultipleReduction and
+        kNumScaleupWarps == kNumChannelsPerSM and kNumScaleupRanks <= 32 and
+        not (kNumChannelsPerSM == 4 or kNumChannelsPerSM == 8);
+    int* const help_cursor = static_cast<int*>(proxy_ring_layout.get_end_ptr());
+    int* const help_done = help_cursor + kNumForwardWarps;
+    int* const help_num_local = help_done + kNumForwardWarps;
+
     for (int f = thread_idx; f < kNumForwardWarps; f += kNumThreads) {
         *proxy_ring_layout.get_head(f) = 0;
         *proxy_ring_layout.get_tail(f) = 0;
         *proxy_ring_layout.get_done(f) = 0;
+        if constexpr (kSuHelp)
+            help_cursor[f] = 0, help_done[f] = 0;
     }
     __syncthreads();
 
@@ -489,6 +537,123 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         // Update for the unissued ones
         update_tails(true);
+
+        if constexpr (kSuHelp) {
+            constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
+            constexpr int kNumSlotsPerChannel = kNumMaxTokensPerChannel;
+            const int* const forward_list = token_metadata_at_forward +
+                channel_idx * ((kForwardListTop + 1) * kNumForwardMetadataDims);
+            const auto recv_buffer = scaleout_recv_buffer
+                .get_channel_buffer<kNumSlotsPerChannel>(channel_idx)
+                .get_rank_buffer(scaleout_rank_idx);
+            const auto forward_scaleup_buffer = layout::BufferLayout<false>(
+                token_layout, kNumTokensInScaleupLayout, kNumScaleoutRanks * kNumMaxTokensPerRank, buffer);
+            int* const cursor = help_cursor + warp_idx;
+
+            const auto take_position = [&]() {
+                int position = 0;
+                if (lane_idx == 0)
+                    position = atomicAdd(cursor, 1);
+                return __shfl_sync(0xffffffffu, position, 0);
+            };
+
+            const int num_local = count_forward_fifo_entries<kNumForwardMetadataDims, kForwardListTop + 1>(
+                forward_list, kForwardListTop, -1, lane_idx);
+            int position = take_position();
+            if (position < num_local) {
+                const int num_remote = count_forward_fifo_entries<kNumForwardMetadataDims, kForwardListTop + 1>(
+                    forward_list, 0, 1, lane_idx);
+                int num_tokens_recv = count_forward_entries_per_scaleup_rank<kNumForwardMetadataDims, kNumTopk, kNumScaleupRanks>(
+                    forward_list, 0, 1, num_remote, lane_idx);
+                int cached_scaleup_tail = 0, num_positions_counted = 0;
+                for (; position < num_local; position = take_position()) {
+                    num_tokens_recv += count_forward_entries_per_scaleup_rank<kNumForwardMetadataDims, kNumTopk, kNumScaleupRanks>(
+                        forward_list, kForwardListTop - num_positions_counted, -1, position - num_positions_counted, lane_idx);
+                    num_positions_counted = position + 1;
+
+                    const auto entry = forward_list + (kForwardListTop - position) * kNumForwardMetadataDims;
+                    const auto src_token_global_idx = __ldg(entry);
+                    const auto stored_src_scaleup_rank_idx = lane_idx < kNumTopk ? __ldg(entry + 2 + lane_idx) : -1;
+                    const auto stored_src_slot_idx = lane_idx < kNumTopk ? __ldg(entry + 2 + kNumTopk + lane_idx) : -1;
+                    if constexpr (kDebugChecks & kDebugCheckTokenSync)
+                        EP_DEVICE_ASSERT(src_token_global_idx / (kNumMaxTokensPerRank * kNumScaleupRanks) == scaleout_rank_idx);
+
+                    const auto scaleup_mask = ptx::reduce_or(
+                        stored_src_scaleup_rank_idx >= 0 ? (1u << stored_src_scaleup_rank_idx) : 0u);
+                    const bool needed = lane_idx < kNumScaleupRanks and ((scaleup_mask >> lane_idx) & 1u);
+                    comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                        if (ptx::all(not needed or num_tokens_recv < cached_scaleup_tail))
+                            return true;
+                        cached_scaleup_tail = lane_idx < kNumScaleupRanks ?
+                            ptx::ld_acquire_sys(workspace_layout.get_channel_scaleup_tail_ptr(channel_idx, lane_idx)) : 0;
+                        if (is_last_check and lane_idx < kNumScaleupRanks) {
+                            printf("DeepEP combine (scale-up helper wait) timeout, scale-out: %d/%d, scale-up: %d/%d, "
+                                   "channel: %d, lane: %d, position: %d/%d, recv: %d, tail: %d (wait=%d)\n",
+                                   scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
+                                   channel_idx, lane_idx, position, num_local, num_tokens_recv,
+                                   cached_scaleup_tail, needed);
+                        }
+                        return false;
+                    });
+                    num_tokens_recv += needed;
+
+                    auto reduce_valid_mask = ptx::gather(
+                        ptx::deduplicate(stored_src_scaleup_rank_idx, lane_idx) and stored_src_scaleup_rank_idx >= 0);
+                    int stored_src_buffer_idx = 0;
+                    if constexpr (kUseScaleupRankLayout) {
+                        stored_src_buffer_idx =
+                            stored_src_scaleup_rank_idx * forward_scaleup_buffer.num_max_tokens_per_rank + stored_src_slot_idx;
+                    } else {
+                        const auto src_slot_idx = scaleout_rank_idx * kNumMaxTokensPerRank +
+                            src_token_global_idx % kNumMaxTokensPerRank;
+                        stored_src_buffer_idx = stored_src_slot_idx == -1 ? -1 :
+                            lane_idx * forward_scaleup_buffer.num_max_tokens_per_rank + src_slot_idx;
+                    }
+                    int topk_slot_idx[kNumTokensInScaleupLayout];
+                    compute_topk_slots(
+                        topk_slot_idx, reduce_valid_mask,
+                        [=](const int& idx) {
+                            return ptx::exchange(stored_src_buffer_idx, idx);
+                        }
+                    );
+                    constexpr int kUnrollFactor = get_max_unroll_factor<kHiddenVec, 4>();
+                    combine_reduce<kHiddenVec, kUnrollFactor, math::constexpr_ceil_div(kNumTopk, kNumScaleoutRanks)>(
+                        lane_idx, topk_slot_idx, static_cast<combine_vec_t*>(tma_buffer.get_base_ptr()),
+                        /* Get source base */ [=](const int& slot_idx) {
+                            return static_cast<combine_vec_t*>(
+                                forward_scaleup_buffer.get_token_buffer(slot_idx, true).get_base_ptr());
+                        },
+                        /* Wait buffer release */ [=]() {
+                            ptx::tma_store_wait();
+                            __syncwarp();
+                        }
+                    );
+
+                    stored_src_buffer_idx = ptx::exchange(
+                        stored_src_buffer_idx, ptx::get_master_lane_idx(ptx::match(stored_src_scaleup_rank_idx)));
+                    if (stored_src_scaleup_rank_idx >= 0) {
+                        tma_buffer.get_topk_weights_ptr()[lane_idx] =
+                            forward_scaleup_buffer.get_token_buffer(stored_src_buffer_idx, true)
+                                .get_topk_weights_ptr()[lane_idx];
+                    }
+                    ptx::tma_store_fence();
+                    __syncwarp();
+
+                    if (ptx::elect_one_sync()) {
+                        ptx::tma_store_1d(recv_buffer.get_token_buffer(position).get_base_ptr(),
+                                          tma_buffer.get_base_ptr(), token_layout.get_num_bytes<false>());
+                        ptx::tma_store_commit();
+                    }
+                    __syncwarp();
+                }
+                ptx::tma_store_wait();
+                __syncwarp();
+            }
+
+            if (ptx::elect_one_sync())
+                ptx::st_release_cta(help_done + warp_idx, 1);
+            __syncwarp();
+        }
     } else if (warp_idx < kNumDataWarps) {
         const auto forward_warp_idx = warp_idx - kNumScaleupWarps;
         const auto channel_idx = sm_idx * kNumChannelsPerSM + forward_warp_idx;
@@ -620,11 +785,44 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // Replay the dispatch
         constexpr int kForwardListTop = kNumScaleoutRanks * kNumMaxTokensPerChannel;
         int stored_num_tokens_recv[kNumScaleupRanksPerLane] = {}, stored_cached_scaleup_tail[kNumScaleupRanksPerLane] = {};
+
+        [[maybe_unused]] int num_local_positions_counted = 0;
+        if constexpr (kSuHelp) {
+            const int num_local_tokens = count_forward_fifo_entries<kNumForwardMetadataDims, kForwardListTop + 1>(
+                token_metadata_at_forward, kForwardListTop, -1, lane_idx);
+            if (lane_idx == 0)
+                help_num_local[forward_warp_idx] = num_local_tokens;
+            __syncwarp();
+        }
+
         for (int i = 0, step = 1; ; i += step) {
-            auto src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
-            if (src_token_global_idx < 0 and step > 0) {
-                i = kForwardListTop, step = -1;
+            int src_token_global_idx;
+            if constexpr (kSuHelp) {
+                if (step > 0) {
+                    src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                    if (src_token_global_idx < 0)
+                        step = -1;
+                }
+                if (step < 0) {
+                    int position = 0;
+                    if (lane_idx == 0)
+                        position = atomicAdd(help_cursor + forward_warp_idx, 1);
+                    position = min(__shfl_sync(0xffffffffu, position, 0), help_num_local[forward_warp_idx]);
+
+                    stored_num_tokens_recv[0] += count_forward_entries_per_scaleup_rank<kNumForwardMetadataDims, kNumTopk, kNumScaleupRanks>(
+                        token_metadata_at_forward, kForwardListTop - num_local_positions_counted, -1,
+                        position - num_local_positions_counted, lane_idx);
+                    num_local_positions_counted = position + 1;
+
+                    i = kForwardListTop - position;
+                    src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                }
+            } else {
                 src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                if (src_token_global_idx < 0 and step > 0) {
+                    i = kForwardListTop, step = -1;
+                    src_token_global_idx = __ldg(token_metadata_at_forward + i * kNumForwardMetadataDims);
+                }
             }
             const auto src_rank_idx = src_token_global_idx / kNumMaxTokensPerRank;
             const auto src_scaleout_rank_idx = src_rank_idx / kNumScaleupRanks;
@@ -783,7 +981,9 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                 // Assign send and receive buffers
                 // NOTES: as we only have 1 destination, we will use "send" as "recv" for local transfer
-                const int recv_slot = slot_of_per_channel[src_scaleout_rank_idx];
+                int recv_slot = slot_of_per_channel[src_scaleout_rank_idx];
+                if constexpr (kSuHelp)
+                    recv_slot = step < 0 ? num_local_positions_counted - 1 : recv_slot;
                 const auto recv_token_buffer = scaleout_recv_buffer
                     .get_rank_buffer(scaleout_rank_idx)
                     .get_token_buffer(recv_slot);
@@ -821,6 +1021,18 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             ptx::st_release_cta(proxy_ring_layout.get_done(forward_warp_idx), 1);
         }
         __syncwarp();
+
+        if constexpr (kSuHelp) {
+            comm::timeout_while<kNumTimeoutCycles>([&](const bool& is_last_check) {
+                if (ptx::ld_acquire_cta(help_done + forward_warp_idx) != 0)
+                    return true;
+                if (is_last_check and ptx::elect_one_sync())
+                    printf("DeepEP combine (scale-up helper done) timeout, scale-out: %d, scale-up: %d, channel: %d\n",
+                           scaleout_rank_idx, scaleup_rank_idx, channel_idx);
+                return false;
+            });
+            __syncwarp();
+        }
 
         // Clean scaleup tails
         #pragma unroll

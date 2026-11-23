@@ -24,6 +24,7 @@ static_assert(sizeof(ProxyPutDesc) == 24, "ProxyPutDesc must be tightly packed (
 
 inline constexpr int kProxyRingDepthDefault = 20;
 inline constexpr int kProxyControlWordsPerForwardWarp = 3;   // head, tail, done
+inline constexpr int kCombineHelperWordsPerForwardWarp = 3;
 
 // Shared-memory layout for the proxy warp hand-off rings
 // (n = num_forward_warps):
