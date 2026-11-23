@@ -70,6 +70,10 @@ __device__ __forceinline__ longlong4_t make_longlong4_t(
 #define EP_DEBUG_CHECKS 0
 #endif
 
+#ifndef EP_DEVICE_ARCH
+#define EP_DEVICE_ARCH 0
+#endif
+
 namespace deep_ep {
 
 #ifndef DISABLE_SM90_FEATURES
@@ -92,6 +96,8 @@ struct DebugCheckName {
 };
 constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}, {"token_integrity", kDebugCheckTokens},
                                               {"token_sync", kDebugCheckTokenSync}};
+
+constexpr int kDeviceArch = EP_DEVICE_ARCH;
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };
