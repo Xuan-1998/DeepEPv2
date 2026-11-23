@@ -34,6 +34,7 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxParts = 64;
 
     static constexpr int64_t kNumBarrierSignalBytes = 16;
+    static constexpr int64_t kNumEntryFlagBytes = 16;
 
     __forceinline__ __device__ __host__
     WorkspaceLayout(void* workspace,
@@ -87,6 +88,9 @@ struct WorkspaceLayout {
 
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
+
+        // Dispatch entry flag
+        num_bytes += kNumEntryFlagBytes;
 
         return num_bytes;
     }
@@ -185,6 +189,10 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    __forceinline__ __device__ __host__ int* get_dispatch_entry_flag_ptr() const {
+        return get_agrs_session_signal_ptr(0) + kNumMaxRanks;
     }
 };
 
