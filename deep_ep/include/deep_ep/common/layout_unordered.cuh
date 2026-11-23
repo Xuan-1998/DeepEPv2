@@ -85,6 +85,21 @@ struct BufferLayoutUnordered : BufferLayout<kWithMBarrier> {
     }
 };
 
+// `WorkspaceLayout` followed by the unordered dispatch's entry flag
+struct WorkspaceLayoutUnordered : WorkspaceLayout {
+    static constexpr int64_t kNumEntryFlagBytes = 16;
+
+    using WorkspaceLayout::WorkspaceLayout;
+
+    static int64_t get_num_bytes() {
+        return WorkspaceLayout::get_num_bytes() + kNumEntryFlagBytes;
+    }
+
+    __forceinline__ __device__ __host__ int* get_dispatch_entry_flag_ptr() const {
+        return get_agrs_session_signal_ptr(0) + kNumMaxRanks;
+    }
+};
+
 }  // namespace deep_ep::elastic::layout
 
 namespace deep_ep::elastic {

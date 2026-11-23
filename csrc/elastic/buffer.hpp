@@ -117,7 +117,7 @@ public:
 
         // Workspace is aligned to 2 MB so that it sits cleanly at the front of the GPU segment
         const auto num_workspace_bytes = math::align<int64_t>(
-            layout::WorkspaceLayout::get_num_bytes(), symmetric::kNumAlignmentBytes);
+            layout::WorkspaceLayoutUnordered::get_num_bytes(), symmetric::kNumAlignmentBytes);
 
         // Create NCCL symmetric memory context
         // Symmetric memory layout: [[[Workspace] GPU buffer] CPU buffer]
