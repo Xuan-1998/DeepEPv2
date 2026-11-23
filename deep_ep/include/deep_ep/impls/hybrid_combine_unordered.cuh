@@ -25,6 +25,29 @@
 
 namespace deep_ep::elastic {
 
+constexpr int kCombineRampTokens = 2;
+constexpr int kCombineRampPuts = 4;
+
+template <int kBatchSize, bool kPutRamp>
+__device__ __forceinline__ int combine_put_tokens(const int& num_puts_issued) {
+    if constexpr (kPutRamp) {
+        EP_STATIC_ASSERT(kCombineRampTokens < kBatchSize, "The ramp puts must be smaller than a batch");
+        return num_puts_issued < kCombineRampPuts ? kCombineRampTokens : kBatchSize;
+    }
+    return kBatchSize;
+}
+
+template <int kBatchSize, bool kPutRamp>
+__device__ __forceinline__ int combine_num_puts(const int& num_tokens) {
+    if constexpr (kPutRamp) {
+        constexpr int kNumRampTokens = kCombineRampTokens * kCombineRampPuts;
+        if (num_tokens <= kNumRampTokens)
+            return math::ceil_div(num_tokens, kCombineRampTokens);
+        return kCombineRampPuts + math::ceil_div(num_tokens - kNumRampTokens, kBatchSize);
+    }
+    return math::ceil_div(num_tokens, kBatchSize);
+}
+
 // Iterate the whole forward metadata list and count how many tokens (forward slots) this channel
 // will send to each scale-out destination. Warp-wide: each lane scans a stride, then the per-lane
 // tallies are summed.
@@ -179,6 +202,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     const auto [qp_idx, sharing_mode] =
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+    constexpr bool kOwnQPs = kNumSMs < kNumQPs;
 
     // Flush the previous kernel's puts before this kernel writes `buffer`. Flush all the contexts, as
     // the previous kernel can use a different QP count. SM 0 does not flush, as in the hybrid barrier:
@@ -510,6 +534,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
         int batch_count[kNumScaleoutRanks] = {};
         int batch_start_slot[kNumScaleoutRanks];
+        int num_puts_issued[kNumScaleoutRanks] = {};
 
         ProxyPutDesc* const my_ring = proxy_ring_layout.get_ring(forward_warp_idx);
         unsigned& my_head = *proxy_ring_layout.get_head(forward_warp_idx);
@@ -557,6 +582,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             ptx::st_release_cta(&my_head, my_head + 1);
 
             batch_count[dst] = 0;
+            ++ num_puts_issued[dst];
         };
 
         // Update per Channel/ScaleOutRank batch metadata and GIN PUT when threshold met
@@ -568,7 +594,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             // A destination whose tokens are all handled will get no more, so forward its batch
             // now instead of waiting for it to fill.
             const bool dst_exhausted = (-- num_slots_remaining_per_dst[dst] == 0);
-            if (batch_count[dst] == kBatchSize or dst_exhausted)
+            if (batch_count[dst] == combine_put_tokens<kBatchSize, kOwnQPs>(num_puts_issued[dst]) or dst_exhausted)
                 issue_batched_rdma(dst);
 
             // All tokens for every destination are used: tell the proxy immediately so it can
@@ -857,7 +883,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             #pragma unroll
             for (int r = 0; r < kNumScaleoutRanks; ++ r)
                 sm_num_expected_arrivals +=
-                    math::ceil_div(ptx::reduce_add(local_expected_count_per_rank[r]), kBatchSize);
+                    combine_num_puts<kBatchSize, kOwnQPs>(ptx::reduce_add(local_expected_count_per_rank[r]));
         }
         __syncwarp();
 
