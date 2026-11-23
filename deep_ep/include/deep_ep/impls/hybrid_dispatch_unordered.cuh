@@ -1335,15 +1335,38 @@ hybrid_unordered_dispatch_impl(
             const auto recv_buffer = scaleout_recv_buffer.get_rank_buffer(recv_scaleout_rank_idx);
             const bool is_local = recv_scaleout_rank_idx == scaleout_rank_idx;
 
+            constexpr bool kSelectFwdBuffers = kNumChannelsPerSM > 4;
             const layout::TokenLayout fwd_bufs[2] = {tma_buffer, tma_buffer_alt};
             ptx::mbarrier* const fwd_mbs[2] = {mbarrier_ptr, mbarrier_ptr_alt};
             ptx::arrival_phase* const fwd_phases[2] = {&phase, &phase_alt};
+            const auto fwd_buf = [&](const int& b) -> const layout::TokenLayout& {
+                if constexpr (kSelectFwdBuffers)
+                    return b ? tma_buffer_alt : tma_buffer;
+                else
+                    return fwd_bufs[b];
+            };
+            const auto fwd_mb = [&](const int& b) -> ptx::mbarrier* {
+                if constexpr (kSelectFwdBuffers)
+                    return b ? mbarrier_ptr_alt : mbarrier_ptr;
+                else
+                    return fwd_mbs[b];
+            };
+            const auto fwd_wait = [&](const int& b) {
+                if constexpr (kSelectFwdBuffers) {
+                    if (b)
+                        ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr_alt, phase_alt);
+                    else
+                        ptx::mbarrier_wait_and_flip_phase(mbarrier_ptr, phase);
+                } else {
+                    ptx::mbarrier_wait_and_flip_phase(fwd_mbs[b], *fwd_phases[b]);
+                }
+            };
             const auto issue_fwd_load = [&](const int& b, const int& slot) {
                 const auto tb = recv_buffer.get_token_buffer(slot);
                 if (ptx::elect_one_sync()) {
-                    ptx::tma_load_1d(fwd_bufs[b].get_base_ptr(), tb.get_base_ptr(),
-                                     fwd_mbs[b], scaleout_token_layout.get_num_bytes<false>());
-                    ptx::mbarrier_arrive_and_set_tx(fwd_mbs[b], scaleout_token_layout.get_num_bytes<false>());
+                    ptx::tma_load_1d(fwd_buf(b).get_base_ptr(), tb.get_base_ptr(),
+                                     fwd_mb(b), scaleout_token_layout.get_num_bytes<false>());
+                    ptx::mbarrier_arrive_and_set_tx(fwd_mb(b), scaleout_token_layout.get_num_bytes<false>());
                 }
                 __syncwarp();
             };
@@ -1474,11 +1497,11 @@ hybrid_unordered_dispatch_impl(
 
                 for (int slot_idx = start_slot_idx; slot_idx < fwd_end_slot_idx; ++ slot_idx) {
                     const int cur = (slot_idx - start_slot_idx) & 1;
-                    const auto& tma_buffer = fwd_bufs[kDoubleBufferForward ? cur : 0];
+                    const layout::TokenLayout& tma_buffer = fwd_buf(kDoubleBufferForward ? cur : 0);
 
                     if constexpr (kDoubleBufferForward) {
                         if (ptx::elect_one_sync())
-                            ptx::mbarrier_wait_and_flip_phase(fwd_mbs[cur], *fwd_phases[cur]);
+                            fwd_wait(cur);
                         __syncwarp();
 
                         if (slot_idx + 1 < fwd_end_slot_idx) {
@@ -1493,7 +1516,7 @@ hybrid_unordered_dispatch_impl(
                             issue_fwd_load(0, slot_idx);
                         }
                         if (ptx::elect_one_sync())
-                            ptx::mbarrier_wait_and_flip_phase(fwd_mbs[0], *fwd_phases[0]);
+                            fwd_wait(0);
                         __syncwarp();
                     }
 
@@ -1512,12 +1535,12 @@ hybrid_unordered_dispatch_impl(
 
                 for (int slot_idx = start_slot_idx; slot_idx < end_slot_idx; ++ slot_idx) {
                     const int cur = (slot_idx - start_slot_idx) & 1;
-                    const auto& tma_buffer = fwd_bufs[kDoubleBufferForward ? cur : 0];
+                    const layout::TokenLayout& tma_buffer = fwd_buf(kDoubleBufferForward ? cur : 0);
 
                     if constexpr (kDoubleBufferForward) {
                         // Wait for this slot's load to complete.
                         if (ptx::elect_one_sync())
-                            ptx::mbarrier_wait_and_flip_phase(fwd_mbs[cur], *fwd_phases[cur]);
+                            fwd_wait(cur);
                         __syncwarp();
 
                         if (slot_idx + 1 < end_slot_idx) {
@@ -1531,7 +1554,7 @@ hybrid_unordered_dispatch_impl(
                         __syncwarp();
                         issue_fwd_load(0, slot_idx);
                         if (ptx::elect_one_sync())
-                            ptx::mbarrier_wait_and_flip_phase(fwd_mbs[0], *fwd_phases[0]);
+                            fwd_wait(0);
                         __syncwarp();
                     }
 
