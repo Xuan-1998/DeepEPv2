@@ -15,7 +15,11 @@
 #include <vector>
 #include <optional>
 
+<<<<<<< c81a983
 #include <deep_ep/common/gin_resource_alloc.cuh>
+=======
+#include <deep_ep/common/gin_resource_alloc_unordered.cuh>
+>>>>>>> 9f86f31
 
 #include <nccl.h>
 #include <nccl_device.h>
@@ -91,8 +95,13 @@ public:
     // RDMA service level, passed to NCCL as the GIN traffic class
     int sl_idx;
     int num_allocated_qps;
+<<<<<<< c81a983
     // Zero-initialized: the GIN block never writes it on a single NVLink domain
     elastic::gin_alloc::GinResourceConfig gin_config{};
+=======
+    bool use_unordered_hybrid_kernel;
+    elastic::gin_alloc::GinResourceConfig gin_config_unordered = {};
+>>>>>>> 9f86f31
 
     // Buffer size
     int64_t num_gpu_bytes;

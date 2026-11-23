@@ -83,15 +83,22 @@ constexpr bool kEnableSM90Features = false;
 constexpr int kDebugChecks = EP_DEBUG_CHECKS;
 constexpr int kDebugCheckGinQueue = 1 << 0;
 constexpr bool kReportGinQueue = (kDebugChecks & kDebugCheckGinQueue) != 0;
+<<<<<<< c81a983
 constexpr int kDebugCheckTokens = 1 << 1;   // Scan each token in the dispatch and combine epilogues
 constexpr int kDebugCheckTokenSync = 1 << 2;   // Check the GIN signals at the entry of the unordered kernels
+=======
+>>>>>>> 9f86f31
 
 struct DebugCheckName {
     const char* name;
     int bit;
 };
+<<<<<<< c81a983
 constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}, {"token_integrity", kDebugCheckTokens},
                                               {"token_sync", kDebugCheckTokenSync}};
+=======
+constexpr DebugCheckName kDebugCheckNames[] = {{"queue", kDebugCheckGinQueue}};
+>>>>>>> 9f86f31
 
 template <int kNumBits> struct int_with_bits;
 template <> struct int_with_bits<8>  { using type = int8_t;  };

@@ -11,6 +11,7 @@
 //
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+<<<<<<< c81a983
 #include <deep_ep/common/comm.cuh>
 #include <deep_ep/common/diag_gin.cuh>
 #include <deep_ep/common/layout.cuh>
@@ -18,6 +19,15 @@
 #include <deep_ep/common/ptx.cuh>
 #include <deep_ep/impls/combine_utils.cuh>
 #include <deep_ep/impls/proxy_ring.cuh>
+=======
+#include <deep_ep/common/comm_unordered.cuh>
+#include <deep_ep/common/layout.cuh>
+#include <deep_ep/common/layout_unordered.cuh>
+#include <deep_ep/common/math.cuh>
+#include <deep_ep/common/ptx.cuh>
+#include <deep_ep/impls/combine_utils.cuh>
+#include <deep_ep/impls/proxy_ring_unordered.cuh>
+>>>>>>> 9f86f31
 
 namespace deep_ep::elastic {
 
@@ -29,7 +39,10 @@ template <bool kUseExpandedLayout, bool kAllowMultipleReduction,
           int kNumMaxTokensPerRank,
           int kNumExperts, int kNumTopk,
           int kNumQPs, int64_t kNumTimeoutCycles,
+<<<<<<< c81a983
           int kDebugChecks,
+=======
+>>>>>>> 9f86f31
           int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks, 32),
           int kNumScaleupUpdateInterval = 3,
           int kBatchSize = 12,
@@ -123,6 +136,7 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         (warp_idx % kNumChannelsPerSM) :
         (lane_idx < kNumForwardWarps ? lane_idx : 0);
     const auto [qp_idx, sharing_mode] =
+<<<<<<< c81a983
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
     const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
 
@@ -142,6 +156,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
     comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
                       kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
+=======
+        comm::unordered::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, gin_channel_in_sm);
+    const auto gin = handle::NCCLGin(nccl_dev_comm, nccl_window, qp_idx, sharing_mode);
+
+    // Global parallel barriers for scale-out subteam and scale-up subteam
+    // NOTES: this barrier needs a grid sync, as there are channel scale-up tail cleaning before
+    comm::unordered::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks,
+                                 kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles, comm::kHybridCombineTag0, false, true, true>(
+>>>>>>> 9f86f31
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx, thread_idx);
 
     // Adjust register count at certain cases
@@ -407,7 +430,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
         // unique among all channels sharing this warp's QP, regardless of which of
         // `get_qp_mode`'s branches picked the mapping.
         const auto signal_id = static_cast<ncclGinSignal_t>(
+<<<<<<< c81a983
             comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
+=======
+            comm::unordered::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
+>>>>>>> 9f86f31
 
         // Adjust registers
         if constexpr (kAdjustRegisters)
@@ -458,7 +485,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            "channel: %d, forward warp: %d, dst: %d, head: %u, tail: %u, depth: %d\n",
                            scaleout_rank_idx, scaleup_rank_idx, channel_idx, forward_warp_idx,
                            dst, my_head, ring_tail, kProxyRingDepth);
+<<<<<<< c81a983
                     comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+=======
+                    comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+>>>>>>> 9f86f31
                 }
                 return false;
             });
@@ -786,8 +817,13 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             const auto shadow_ptr = gin.gin.getSignalShadowPtr(signal_id);
             const auto target = (*shadow_ptr += static_cast<uint64_t>(num_expected_arrivals));
             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
+<<<<<<< c81a983
                 const auto signal = gin.gin.readSignal(signal_id, comm::kNumSignalBits, cuda::memory_order_acquire);
                 if (comm::signal_delta(signal, target) >= 0)
+=======
+                const auto signal = gin.gin.readSignal(signal_id, comm::unordered::kNumSignalBits, cuda::memory_order_acquire);
+                if (comm::unordered::signal_delta(signal, target) >= 0)
+>>>>>>> 9f86f31
                     return true;
 
                 if (is_last_check) {
@@ -795,7 +831,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                            "channel: %d, signal: %lu, target: %lu\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
                            channel_idx, signal, target);
+<<<<<<< c81a983
                     comm::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+=======
+                    comm::unordered::report_gin_queue(gin.gin, scaleout_rank_idx, scaleup_rank_idx);
+>>>>>>> 9f86f31
                 }
                 return false;
             });
@@ -836,9 +876,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                 #pragma unroll
                 for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx) {
                     ring_signal_id[forward_warp_idx] = static_cast<ncclGinSignal_t>(
+<<<<<<< c81a983
                         comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
                     const auto [qp, mode] =
                         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
+=======
+                        comm::unordered::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx));
+                    const auto [qp, mode] =
+                        comm::unordered::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, forward_warp_idx);
+>>>>>>> 9f86f31
                     new (&gin_ctx[forward_warp_idx]) handle::NCCLGin(nccl_dev_comm, nccl_window, qp, mode);
                 }
 
@@ -879,6 +925,14 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     if (gin_put_ops == 0)
                         __nanosleep(1000);
                 }
+<<<<<<< c81a983
+=======
+
+                #pragma unroll
+                for (int forward_warp_idx = 0; forward_warp_idx < kNumForwardWarps; ++ forward_warp_idx)
+                    comm::unordered::flush_with_timeout<kNumTimeoutCycles>(
+                        gin_ctx[forward_warp_idx].gin, ncclCoopThread());
+>>>>>>> 9f86f31
             }
             __syncwarp();
         } else {
@@ -888,7 +942,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
             if (lane_idx < kNumForwardWarps) {
                 const auto channel_idx = sm_idx * kNumChannelsPerSM + lane_idx;
                 const auto signal_id = static_cast<ncclGinSignal_t>(
+<<<<<<< c81a983
                     comm::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, lane_idx));
+=======
+                    comm::unordered::get_qp_signal_id<kNumSMs, kNumQPs, kNumChannelsPerSM, true>(sm_idx, lane_idx));
+>>>>>>> 9f86f31
 
                 ProxyPutDesc* const ring = proxy_ring_layout.get_ring(lane_idx);
                 unsigned tail = 0;
@@ -919,6 +977,11 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
                     ptx::st_release_cta(proxy_ring_layout.get_tail(lane_idx), tail + 1);
                     ++ tail;
                 }
+<<<<<<< c81a983
+=======
+
+                comm::unordered::flush_with_timeout<kNumTimeoutCycles>(gin.gin, ncclCoopThread());
+>>>>>>> 9f86f31
             }
         }
     }

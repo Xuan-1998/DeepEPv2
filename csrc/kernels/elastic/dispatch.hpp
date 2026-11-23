@@ -20,7 +20,11 @@
 
 #include "../../jit/compiler.hpp"
 #include "../../jit/launch_runtime.hpp"
+<<<<<<< c81a983
 #include "kernel_select.hpp"
+=======
+#include "dispatch_unordered.hpp"
+>>>>>>> 9f86f31
 
 namespace deep_ep::elastic {
 
@@ -72,6 +76,7 @@ public:
         void* buffer;
         void* workspace; void* mapped_host_workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
+        std::optional<UnorderedDispatchExtendedArgs> unordered;
 
         jit::LaunchArgs launch_args;
     };
@@ -91,7 +96,11 @@ public:
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles);
+<<<<<<< c81a983
         } else if (args.use_ordered_kernel) {
+=======
+        } else if (not args.unordered.has_value()) {
+>>>>>>> 9f86f31
             header_name = "hybrid_dispatch";
             func_name = fmt::format("hybrid_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
@@ -105,12 +114,21 @@ public:
                 args.num_qps, args.num_timeout_cycles);
         } else {
             header_name = "hybrid_dispatch_unordered";
+<<<<<<< c81a983
             func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
                 args.do_cpu_sync,
                 args.reuse_slot_indices,
                 args.allow_multiple_reduction,
                 args.do_expand,
                 args.double_buffer_forward,
+=======
+            func_name = fmt::format("hybrid_unordered_dispatch_impl<{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}>",
+                args.do_cpu_sync,
+                args.reuse_slot_indices,
+                args.unordered->allow_multiple_reduction,
+                args.unordered->do_expand,
+                args.unordered->double_buffer_forward,
+>>>>>>> 9f86f31
                 args.launch_args.grid_dim.first,
                 args.num_notify_warps, args.num_scaleout_warps, args.num_forward_warps,
                 args.num_scaleout_ranks, args.num_scaleup_ranks,
@@ -118,8 +136,12 @@ public:
                 args.num_max_tokens_per_rank,
                 args.num_experts, args.num_topk, args.expert_alignment,
                 args.num_qps, args.num_timeout_cycles,
+<<<<<<< c81a983
                 args.gin_indexed_signals_cnt,
                 args.debug_checks);
+=======
+                args.unordered->gin_indexed_signals_cnt);
+>>>>>>> 9f86f31
         }
 
         return fmt::format(R"(
@@ -150,7 +172,11 @@ static void __instantiate_kernel() {{
                 args.buffer,
                 args.workspace, args.mapped_host_workspace,
                 args.scaleup_rank_idx));
+<<<<<<< c81a983
         } else if (args.use_ordered_kernel) {
+=======
+        } else if (not args.unordered.has_value()) {
+>>>>>>> 9f86f31
             EP_CUDA_UNIFIED_CHECK(jit::launch_kernel(
                 kernel, config,
                 args.x, args.sf, args.topk_idx, args.topk_weights,
@@ -179,7 +205,11 @@ static void __instantiate_kernel() {{
                 args.num_unaligned_recv_tokens_per_expert,
                 args.dst_buffer_slot_idx,
                 args.token_metadata_at_forward,
+<<<<<<< c81a983
                 args.token_map_at_dispatch,
+=======
+                args.unordered->token_map_at_dispatch,
+>>>>>>> 9f86f31
                 args.num_tokens,
                 args.sf_token_stride, args.sf_hidden_stride,
                 args.nccl_dev_comm, args.nccl_window,
@@ -228,6 +258,7 @@ static void launch_dispatch(void* x, void* sf,
                             const int& num_qps, const int64_t& num_timeout_cycles,
                             const bool& cached_mode,
                             const bool& do_cpu_sync,
+<<<<<<< c81a983
                             // Double-buffer the forward warp's TMA loads. Only enabled when compute
                             // overlap is off; overlap runs keep the original single-buffer path.
                             const bool& double_buffer_forward,
@@ -238,6 +269,10 @@ static void launch_dispatch(void* x, void* sf,
                             // this handle feeds; direct dispatch ignores it.
                             const bool& do_expand,
                             const at::cuda::CUDAStream& stream) {
+=======
+                            const at::cuda::CUDAStream& stream,
+                            const UnorderedDispatchExtendedArgs* unordered = nullptr) {
+>>>>>>> 9f86f31
     // Cached mode does not support expert token counting
     if (cached_mode)
         EP_HOST_ASSERT(cumulative_local_expert_recv_stats == nullptr);
@@ -304,6 +339,7 @@ static void launch_dispatch(void* x, void* sf,
         .buffer = buffer,
         .workspace = workspace, .mapped_host_workspace = mapped_host_workspace,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .unordered = unordered ? std::make_optional(*unordered) : std::nullopt,
         // NOTES: make cluster dim 2 to overlap with clustered computation kernels
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 2 - (num_sms % 2), true)};
     const auto code = DispatchRuntime::generate(args);

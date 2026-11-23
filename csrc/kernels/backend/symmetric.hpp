@@ -5,9 +5,9 @@
 
 #include <vector>
 #include <unistd.h>
-#include <sys/syscall.h>
 #include <deep_ep/common/exception.cuh>
 #include <deep_ep/common/math.cuh>
+#include <deep_ep/common/syscall.cuh>
 
 #include "../../utils/lazy_driver.hpp"
 

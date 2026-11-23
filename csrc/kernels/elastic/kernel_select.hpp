@@ -19,6 +19,7 @@
 
 namespace deep_ep::elastic {
 
+<<<<<<< c81a983
 // `EP_HYBRID_KERNEL` selects the hybrid (scale-out) dispatch/combine kernel pair at
 // JIT-generation time:
 //
@@ -41,10 +42,22 @@ static bool use_ordered_hybrid_kernel() {
         if (value.empty() or value == "unordered") {
             result = false;
         } else if (value == "ordered") {
+=======
+// `EP_HYBRID_KERNEL` selects the hybrid (scale-out) kernels: "ordered" (default) assumes in-order
+// delivery and uses GIN strong signals, "unordered" does not and uses GIN weak signals
+inline bool use_unordered_hybrid_kernel() {
+    static const bool unordered = [] {
+        const auto value = get_env<std::string>("EP_HYBRID_KERNEL");
+        bool result = false;
+        if (value.empty() or value == "ordered") {
+            result = false;
+        } else if (value == "unordered") {
+>>>>>>> 9f86f31
             result = true;
         } else {
             EP_HOST_ASSERT(false and "EP_HYBRID_KERNEL must be `ordered` or `unordered`");
         }
+<<<<<<< c81a983
         printf("DeepEP hybrid kernel selection: %s\n", result ? "ordered" : "unordered");
         return result;
     }();
@@ -56,6 +69,13 @@ static bool use_ordered_hybrid_kernel() {
 static int get_debug_check_mask() {
     static const int mask = get_debug_checks();
     return mask;
+=======
+        if (get_env<int>("EP_BUFFER_DEBUG"))
+            printf("DeepEP hybrid kernel selection: %s\n", result ? "unordered" : "ordered");
+        return result;
+    }();
+    return unordered;
+>>>>>>> 9f86f31
 }
 
 } // namespace deep_ep::elastic

@@ -266,6 +266,7 @@ void dispatch(void* packed_recv_x,
               int* mask_buffer,
               int* cumulative_local_expert_recv_stats,
               int64_t* dispatch_wait_recv_cost_stats,
+              const float* x_global_scale,
               void* rdma_recv_x,
               int* rdma_recv_count,
               void* rdma_x,
@@ -283,10 +284,16 @@ void dispatch(void* packed_recv_x,
               bool use_fp8,
               bool round_scale,
               bool use_ue8m0,
+              bool use_nvfp4,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
-              int phases);
+              int phases,
+              bool use_prequantized_nvfp4 = false,
+              const void* x_scales = nullptr,
+              const float* per_token_scale = nullptr,
+              float* packed_recv_per_token_scale = nullptr,
+              bool swizzle_scales = false);
 
 void combine(void* combined_x,
              void* rdma_recv_x,
@@ -313,7 +320,10 @@ void combine(void* combined_x,
              int num_device_sms,
              cudaStream_t stream,
              int phases,
-             bool zero_copy);
+             bool zero_copy,
+             bool overlap,
+             uint32_t* src_signals,
+             uint32_t src_signal_expect_value);
 
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 
