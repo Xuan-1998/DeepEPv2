@@ -79,12 +79,23 @@ __device__ __host__ __forceinline__ int num_sub_parts_at(const int& part_tokens)
     }
 }
 
-template <int kNumSubParts>
+template <int kNumSubParts, bool kHalving = false>
 __device__ __host__ __forceinline__ int sub_part_size_at(const int& part_tokens, const int& sub) {
     if constexpr (kNumSubParts <= 1) {
         return part_tokens;
     } else {
         const int num_subs = num_sub_parts_at<kNumSubParts>(part_tokens);
+        if constexpr (kHalving) {
+            const int spare = part_tokens - num_subs;
+            const int total = (1 << num_subs) - 1;
+            int assigned = 0, mine = 0;
+            for (int s = 0; s < num_subs; ++ s) {
+                const int v = spare * (1 << (num_subs - 1 - s)) / total;
+                assigned += v;
+                mine = s == sub ? v : mine;
+            }
+            return 1 + mine + (sub == 0 ? spare - assigned : 0);
+        }
         const int base = part_tokens / num_subs;
         const int rem = part_tokens - base * num_subs;
         return base + (sub < rem ? 1 : 0);
@@ -351,9 +362,29 @@ hybrid_unordered_dispatch_impl(
         return part_offset_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(part);
     };
     using Tail = FinerTailSplit<kNumParts, kBatchSize, kNumMaxTokensPerChannel, kNumSubParts>;
+    constexpr bool kShapeFirstPart = kNumParts >= 2 and
+        part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
+    const auto num_subs_of = [&](const int& part_idx) {
+        if constexpr (Tail::kActive)
+            return Tail::num_subs(part_idx);
+        return num_sub_parts_at<kNumSubParts>(part_size(part_idx));
+    };
+    const auto sub_size_of = [&](const int& part_idx, const int& sub_idx) {
+        if (kShapeFirstPart and part_idx == 0)
+            return sub_part_size_at<kNumSubParts, true>(part_size(0), num_subs_of(0) - 1 - sub_idx);
+        if constexpr (Tail::kActive)
+            return Tail::sub_size(part_idx, sub_idx);
+        return sub_part_size_at<kNumSubParts>(part_size(part_idx), sub_idx);
+    };
     // First slot of sub-part `sub_idx` within part `part_idx` (slots inside a sub-part are
     // filled contiguously from here; its in-band header lives in this slot's header word).
     const auto sub_slot = [&](const int& part_idx, const int& sub_idx) {
+        if (kShapeFirstPart and part_idx == 0) {
+            int off = 0;
+            for (int s = 0; s < sub_idx; ++ s)
+                off += sub_size_of(0, s);
+            return part_first_slot(0) + off;
+        }
         if constexpr (Tail::kActive)
             return part_first_slot(part_idx) + Tail::sub_offset(part_idx, sub_idx);
         return part_first_slot(part_idx) +
@@ -421,7 +452,7 @@ hybrid_unordered_dispatch_impl(
                     .get_rank_buffer(src_rank);
                 #pragma unroll
                 for (int k = 0; k < kNumParts; ++ k) {
-                    for (int s = 0; s < (Tail::kActive ? Tail::num_subs(k) : num_sub_parts_at<kNumSubParts>(part_size(k))); ++ s)
+                    for (int s = 0; s < num_subs_of(k); ++ s)
                         *src_buffer.get_token_buffer(sub_slot(k, s)).get_hdr_ptr() = 0;
                 }
             }
@@ -769,14 +800,12 @@ hybrid_unordered_dispatch_impl(
         const bool is_remote_dst = lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx;
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
-            return Tail::kActive ? Tail::sub_size(p, stored_flushed_subs)
-                                 : sub_part_size_at<kNumSubParts>(part_size(p), stored_flushed_subs);
+            return sub_size_of(p, stored_flushed_subs);
         };
         const auto is_last_sub_put = [&]() {
             if (stored_flushed_parts != kNumParts - 1)
                 return false;
-            return stored_flushed_subs + 1 >=
-                (Tail::kActive ? Tail::num_subs(kNumParts - 1) : num_sub_parts_at<kNumSubParts>(part_size(kNumParts - 1)));
+            return stored_flushed_subs + 1 >= num_subs_of(kNumParts - 1);
         };
         const auto flush_part = [&](const int& up_to, const bool& is_final) __attribute__((always_inline)) {
             if (lane_idx >= kNumScaleoutRanks or lane_idx == scaleout_rank_idx)
@@ -796,7 +825,7 @@ hybrid_unordered_dispatch_impl(
                 lane_idx, 0,
                 ncclGin_SignalAdd{part_signal_id(part_idx), 1ull});
             coalesce_flushed = up_to;
-            if (sub_idx + 1 >= (Tail::kActive ? Tail::num_subs(part_idx) : num_sub_parts_at<kNumSubParts>(part_size(part_idx)))) {
+            if (sub_idx + 1 >= num_subs_of(part_idx)) {
                 stored_flushed_subs = 0;
                 stored_flushed_parts += 1;
             } else {
@@ -1204,7 +1233,7 @@ hybrid_unordered_dispatch_impl(
                     const int64_t landed = ptx::exchange(
                         comm::signal_delta(gin.gin.readSignal(part_signal_id(k)), rx_part_base[k]), 0);
 
-                    const int num_subs = Tail::kActive ? Tail::num_subs(k) : num_sub_parts_at<kNumSubParts>(part_size(k));
+                    const int num_subs = num_subs_of(k);
                     int sub_count[Tail::kNumMaxSubParts];
                     bool sub_more[Tail::kNumMaxSubParts];
                     bool sub_valid[Tail::kNumMaxSubParts];
@@ -1630,7 +1659,7 @@ hybrid_unordered_dispatch_impl(
         int64_t drain_base = 0;
         #pragma unroll
         for (int k = 0; k < kNumParts; ++ k) {
-            const int num_subs_k = Tail::kActive ? Tail::num_subs(k) : num_sub_parts_at<kNumSubParts>(part_size(k));
+            const int num_subs_k = num_subs_of(k);
             const int my_subs_k = stored_terminal_part > k  ? num_subs_k
                                 : stored_terminal_part == k ? stored_terminal_sub + 1
                                                             : 0;
