@@ -27,6 +27,7 @@ namespace deep_ep::elastic {
 
 constexpr int kCombineRampTokens = 2;
 constexpr int kCombineRampPuts = 4;
+constexpr int kCombineProxyEagerPuts = 7;
 
 template <int kBatchSize, bool kPutRamp>
 __device__ __forceinline__ int combine_put_tokens(const int& num_puts_issued) {
@@ -1159,8 +1160,15 @@ hybrid_unordered_combine_impl(nv_bfloat16* x,
 
                 // Wait for one descriptor per forward warp, then send them all under one
                 // doorbell. A floor, not a cap. Exempt in the tail, which would wait forever.
-                const bool drain_now = total_pending > 0 and
-                                       (total_pending >= kNumForwardWarps or any_ring_finished);
+                bool drain_now = total_pending > 0 and
+                                 (total_pending >= kNumForwardWarps or any_ring_finished);
+                if constexpr (kOwnQPs) {
+                    unsigned num_puts_issued = 0;
+                    #pragma unroll
+                    for (int f = 0; f < kNumForwardWarps; ++ f)
+                        num_puts_issued += tail[f];
+                    drain_now |= total_pending > 0 and num_puts_issued < static_cast<unsigned>(kCombineProxyEagerPuts);
+                }
 
                 const auto issue_put = [&](const ProxyPutDesc& d, const int& ring_idx,
                                            const bool& ring_doorbell) {
