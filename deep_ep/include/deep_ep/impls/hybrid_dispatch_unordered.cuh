@@ -103,6 +103,30 @@ __device__ __host__ __forceinline__ int sub_part_offset_at(const int& part_token
     }
 }
 
+// The same number of sub-parts in rising sizes: one token each, the rest split 1 : 2 : 4 ...,
+// so the first put of a full part leaves after about a third of its tokens instead of half.
+template <int kNumSubParts>
+__device__ __host__ __forceinline__ int rising_sub_part_size_at(const int& part_tokens, const int& sub) {
+    const int num_subs = num_sub_parts_at<kNumSubParts>(part_tokens);
+    const int spare = part_tokens - num_subs;
+    const int total = (1 << num_subs) - 1;
+    int assigned = 0, size = 0;
+    for (int s = 0; s < num_subs; ++ s) {
+        const int share = spare * (1 << s) / total;
+        assigned += share;
+        size = s == sub ? share : size;
+    }
+    return 1 + size + (sub == num_subs - 1 ? spare - assigned : 0);
+}
+
+template <int kNumSubParts>
+__device__ __host__ __forceinline__ int rising_sub_part_offset_at(const int& part_tokens, const int& sub) {
+    int off = 0;
+    for (int s = 0; s < sub; ++ s)
+        off += rising_sub_part_size_at<kNumSubParts>(part_tokens, s);
+    return off;
+}
+
 template <int kNumParts, int kBatchSize, int kNumMaxTokensPerChannel>
 __device__ __host__ __forceinline__ constexpr int part_size_at(const int& part) {
     constexpr int kFirst = kBatchSize / 3 > 4 ? kBatchSize / 3 : 4;
@@ -248,9 +272,13 @@ hybrid_unordered_dispatch_impl(
     const auto part_first_slot = [&](const int& part) {
         return part_offset_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(part);
     };
+    constexpr bool kRisingFirstPart = kNumParts >= 2 and kNumScaleoutRanks <= 4 and
+        part_size_at<kNumParts, kBatchSize, kNumMaxTokensPerChannel>(0) == kBatchSize;
     // First slot of sub-part `sub_idx` within part `part_idx` (slots inside a sub-part are
     // filled contiguously from here; its in-band header lives in this slot's header word).
     const auto sub_slot = [&](const int& part_idx, const int& sub_idx) {
+        if (kRisingFirstPart and part_idx == 0)
+            return part_first_slot(0) + rising_sub_part_offset_at<kNumSubParts>(part_size(0), sub_idx);
         return part_first_slot(part_idx) +
             sub_part_offset_at<kNumSubParts>(part_size(part_idx), sub_idx);
     };
@@ -563,6 +591,8 @@ hybrid_unordered_dispatch_impl(
         int stored_flushed_subs = 0;
         const auto cur_sub_size = [&]() {
             const int p = stored_flushed_parts < kNumParts ? stored_flushed_parts : kNumParts - 1;
+            if (kRisingFirstPart and p == 0)
+                return rising_sub_part_size_at<kNumSubParts>(part_size(0), stored_flushed_subs);
             return sub_part_size_at<kNumSubParts>(part_size(p), stored_flushed_subs);
         };
         const auto is_last_sub_put = [&]() {
