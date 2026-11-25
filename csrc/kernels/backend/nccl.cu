@@ -164,6 +164,7 @@ void NCCLSymmetricMemoryContext::create_dev_comm(jit::NoRefPtr& out, const bool&
             "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
             "such as `allow_hybrid_mode=0` (disable direct RDMA kernels) in multi-plane network.");
 
+        // Direct mode and the ordered hybrid kernels give each QP its own exclusive GIN context
         reqs.ginContextCount = num_allocated_qps;
         reqs.ginExclusiveContexts = true;
         reqs.ginQueueDepth = kGinQPDepth;
